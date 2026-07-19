@@ -11,8 +11,8 @@ from pydantic import BaseModel, Field
 from pdf2image import convert_from_path
 
 from tools.actual_mcp import find_or_create_transaction
-from tools.pocketbase_client import save_receipt
-from graph.cache import get_ocr, set_ocr, get_parsed, set_parsed
+from tools.pocketbase_client import save_receipt, check_receipt_exists
+from graph.cache import get_ocr, set_ocr, get_parsed, set_parsed, _file_hash
 
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF
@@ -36,6 +36,16 @@ class ParsedReceipt(BaseModel):
     total: float = Field(description="Total amount of the receipt")
     payee: str = Field(description="Name of the store or payee")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
+
+def skip_if_processed(state: ReceiptState):
+    """Check PocketBase source_hash to skip already-processed files."""
+    file_path = state.get("file_path", "")
+    if file_path:
+        file_hash = _file_hash(file_path)
+        if check_receipt_exists(file_hash):
+            print(f"⏭️  Already processed in PocketBase (hash {file_hash[:12]}...): {file_path}")
+            return {"status": "already_processed"}
+    return {}
 
 def extract_ocr_node(state: ReceiptState):
     """Extract raw text from the PDF using Gemini Vision"""
@@ -312,6 +322,43 @@ async def create_actual_transaction_node(state: ReceiptState):
             
     return {"actual_tx_id": final_id}
 
+async def tag_actual_transaction_node(state: ReceiptState):
+    """Append #receipt to the matched/created transaction's notes in Actual Budget."""
+    tx_id = state.get("actual_tx_id")
+    if not tx_id or tx_id == "unknown_id":
+        return {}
+
+    parsed = state.get("parsed_data", {})
+    notes = "Items:\n"
+    for item in parsed.get("items", []):
+        notes += f"- {item['description']}: ${item['amount']}\n"
+    notes += "#receipt"
+
+    try:
+        print(f"Tagging transaction {tx_id} with #receipt...")
+        server_params = StdioServerParameters(
+            command="node",
+            args=["wrapper.js"],
+            env=os.environ.copy()
+        )
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                mcp_tools = await load_mcp_tools(session)
+                tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+                if tx_tool:
+                    await tx_tool.ainvoke({"args": [
+                        "update", tx_id,
+                        "--data", json.dumps({"notes": notes})
+                    ]})
+                    print(f"✅ Tagged transaction {tx_id}")
+    except Exception as e:
+        if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
+            print("Ignored MCP shutdown error, tag succeeded.")
+        else:
+            print(f"⚠️ Failed to tag transaction (non-fatal): {e}")
+    return {}
+
 def save_pocketbase_node(state: ReceiptState):
     """Save the receipt and items to PocketBase"""
     try:
@@ -328,12 +375,19 @@ def save_pocketbase_node(state: ReceiptState):
         lines = parsed.get("items", [])
         source_ref = state.get("gdrive_path", "")
         image_paths = state.get("image_paths", [])
+        file_path = state.get("file_path", "")
+        source_hash = _file_hash(file_path) if file_path else ""
         
-        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, image_paths)
+        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, source_hash, image_paths)
         
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "error": f"PocketBase save failed: {str(e)}"}
+
+def router_after_dedup(state: ReceiptState):
+    if state.get("status") == "already_processed":
+        return "skip"
+    return "continue"
 
 def router_check_error(state: ReceiptState):
     if state.get("status") == "error":
@@ -359,20 +413,24 @@ from langgraph.checkpoint.memory import MemorySaver
 # Build Graph
 workflow = StateGraph(ReceiptState)
 
+workflow.add_node("dedup_check", skip_if_processed)
 workflow.add_node("extract_ocr", extract_ocr_node)
 workflow.add_node("parse_receipt", parse_receipt_node)
 workflow.add_node("search_actual", search_actual_transaction_node)
 workflow.add_node("human_approval", human_approval_node)
 workflow.add_node("create_actual", create_actual_transaction_node)
+workflow.add_node("tag_actual", tag_actual_transaction_node)
 workflow.add_node("save_pocketbase", save_pocketbase_node)
 
-workflow.set_entry_point("extract_ocr")
+workflow.set_entry_point("dedup_check")
 
+workflow.add_conditional_edges("dedup_check", router_after_dedup, {"skip": END, "continue": "extract_ocr"})
 workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "parse_receipt"})
 workflow.add_conditional_edges("parse_receipt", router_check_error, {"error": END, "continue": "search_actual"})
-workflow.add_conditional_edges("search_actual", router_after_search, {"error": END, "human_approval": "human_approval", "save_pocketbase": "save_pocketbase"})
-workflow.add_conditional_edges("human_approval", router_after_human, {"create_actual": "create_actual", "save_pocketbase": "save_pocketbase", "skip": END})
-workflow.add_conditional_edges("create_actual", router_check_error, {"error": END, "continue": "save_pocketbase"})
+workflow.add_conditional_edges("search_actual", router_after_search, {"error": END, "human_approval": "human_approval", "save_pocketbase": "tag_actual"})
+workflow.add_conditional_edges("human_approval", router_after_human, {"create_actual": "create_actual", "save_pocketbase": "tag_actual", "skip": END})
+workflow.add_conditional_edges("create_actual", router_check_error, {"error": END, "continue": "tag_actual"})
+workflow.add_edge("tag_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", END)
 
 memory = MemorySaver()

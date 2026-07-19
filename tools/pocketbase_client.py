@@ -15,7 +15,7 @@ def get_pb_client():
 
 from pocketbase.models.file_upload import FileUpload
 
-def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, image_paths=None):
+def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None):
     """
     transaction_id: The original 36 char UUID from actual budget
     lines: list of extracted items
@@ -23,6 +23,7 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, imag
     source_ref: gdrive path/filename
     amount: total amount
     payee: store name
+    source_hash: SHA-256 hash of the source file for dedup
     image_paths: optional list of local paths to jpeg images
     """
     client = get_pb_client()
@@ -35,7 +36,8 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, imag
         "amount": amount,
         "payee": payee,
         "source": "gdrive",
-        "source_ref": source_ref
+        "source_ref": source_ref,
+        "source_hash": source_hash
     }
     
     if image_paths:
@@ -46,25 +48,33 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, imag
         data["image"] = FileUpload(*uploads)
     
     try:
-        # Check if exists by source_ref
-        records = client.collection("receipts").get_list(1, 1, query_params={"filter": f"source_ref='{source_ref}'"})
-        if records.items:
-            # If exists, update
-            pb_id = records.items[0].id
-            return client.collection("receipts").update(pb_id, data)
+        # Try to find existing record by source_hash first, then by tx_id
+        existing = None
+        for filter_key, filter_val in [("source_hash", source_hash), ("tx_id", transaction_id)]:
+            if not filter_val:
+                continue
+            try:
+                records = client.collection("receipts").get_list(1, 1, query_params={"filter": f"{filter_key}='{filter_val}'"})
+                if records.items:
+                    existing = records.items[0]
+                    break
+            except Exception:
+                pass
+
+        if existing:
+            return client.collection("receipts").update(existing.id, data)
         else:
-            # If not exists, create
             return client.collection("receipts").create(data)
     except Exception as e:
         raise Exception(f"Failed to upsert to pocketbase: {e}")
 
-def check_receipt_exists(source_ref):
+def check_receipt_exists(source_hash):
     """
-    Returns True if a receipt with the given source_ref already exists in PocketBase.
+    Returns True if a receipt with the given source_hash already exists in PocketBase.
     """
     client = get_pb_client()
     try:
-        records = client.collection("receipts").get_list(1, 1, query_params={"filter": f"source_ref='{source_ref}'"})
+        records = client.collection("receipts").get_list(1, 1, query_params={"filter": f"source_hash='{source_hash}'"})
         return len(records.items) > 0
     except Exception:
         return False

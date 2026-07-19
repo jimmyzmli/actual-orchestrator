@@ -95,18 +95,21 @@ def main():
         gdrive_source_ref = f"{gdrive_path}/{filename}"
         
         try:
-            from tools.pocketbase_client import check_receipt_exists
-            if check_receipt_exists(gdrive_source_ref):
-                print(f"Skipping {gdrive_source_ref}: already processed in PocketBase.")
-                continue
-
-            # We can also check if the PDF is already downloaded to save time
+            # Download if needed (cheap — rclone skips if already present)
             local_path = os.path.join(tmpdir, filename)
             if not os.path.exists(local_path):
                 local_path = download_file(gdrive_path, filename, tmpdir)
             else:
                 print(f"Using already downloaded file: {local_path}")
-                
+
+            # Dedup by file content hash
+            from graph.cache import _file_hash
+            from tools.pocketbase_client import check_receipt_exists
+            file_hash = _file_hash(local_path)
+            if check_receipt_exists(file_hash):
+                print(f"Skipping {gdrive_source_ref}: already processed in PocketBase (hash {file_hash[:12]}...).")
+                continue
+
             res = process_receipt(local_path, gdrive_source_ref)
             if res and res.get("status") == "paused":
                 paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"]))
