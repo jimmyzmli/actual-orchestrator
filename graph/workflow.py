@@ -205,7 +205,7 @@ async def search_actual_transaction_node(state: ReceiptState):
                 - Notes to append: {notes}
                 
                 Task:
-                1. Use actual_query to search transactions within +/- 1 day of {date} for this exact amount (convert to cents, expenses are negative!).
+                1. Use actual_query to search transactions within +/- 1 day of {date} for this exact amount (convert to cents, expenses are negative!). Make sure to filter for on budget transactions by including "account.offbudget": false in the filter.
                 2. If found, return its ID. If multiple match, pick the first one.
                 3. If NOT found, use actual_accounts to list accounts. Pick the most logical account for this payee (e.g. Chequing or Credit Card, avoid off-budget).
                 
@@ -328,12 +328,6 @@ async def tag_actual_transaction_node(state: ReceiptState):
     if not tx_id or tx_id == "unknown_id":
         return {}
 
-    parsed = state.get("parsed_data", {})
-    notes = "Items:\n"
-    for item in parsed.get("items", []):
-        notes += f"- {item['description']}: ${item['amount']}\n"
-    notes += "#receipt"
-
     try:
         print(f"Tagging transaction {tx_id} with #receipt...")
         server_params = StdioServerParameters(
@@ -344,12 +338,34 @@ async def tag_actual_transaction_node(state: ReceiptState):
         async with stdio_client(server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                
+                existing_notes = ""
+                try:
+                    res = await session.call_tool("actual_query", {"args": [
+                        "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), "--select", "id,notes", "--format", "json"
+                    ]})
+                    if res.content and len(res.content) > 0:
+                        query_data = json.loads(res.content[0].text)
+                        if query_data and len(query_data) > 0:
+                            existing_notes = query_data[0].get("notes") or ""
+                except Exception as e:
+                    print(f"Failed to fetch existing notes: {e}")
+                
+                if "#receipt" not in existing_notes:
+                    if existing_notes.strip():
+                        new_notes = existing_notes + " #receipt"
+                    else:
+                        new_notes = "#receipt"
+                else:
+                    print(f"Transaction {tx_id} already has #receipt tag.")
+                    return {}
+
                 mcp_tools = await load_mcp_tools(session)
                 tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
                 if tx_tool:
                     await tx_tool.ainvoke({"args": [
                         "update", tx_id,
-                        "--data", json.dumps({"notes": notes})
+                        "--data", json.dumps({"notes": new_notes})
                     ]})
                     print(f"✅ Tagged transaction {tx_id}")
     except Exception as e:

@@ -28,7 +28,8 @@ async def _find_or_create_transaction_async(date: str, amount: float, payee: str
                 end_date = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
                 
                 filter_json = json.dumps({
-                    "date": {"$gte": start_date, "$lte": end_date}
+                    "date": {"$gte": start_date, "$lte": end_date},
+                    "account.offbudget": False
                 })
                 query_args = ["run", "--table", "transactions", "--filter", filter_json, "--format", "json"]
                 
