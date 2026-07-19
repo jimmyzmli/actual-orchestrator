@@ -1,0 +1,10 @@
+langgraph
+langchain
+langchain-openai
+mcp
+pdf2image
+pytesseract
+pocketbase
+python-dotenv
+pydantic
+langchain-google-genai
