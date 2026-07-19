@@ -85,7 +85,7 @@ def main():
         
     print(f"Found {len(receipts)} receipts to process.")
     # Use a persistent local directory for testing and caching
-    tmpdir = os.path.join(os.getcwd(), "tmp_receipts")
+    tmpdir = os.path.join(os.getcwd(), "cache")
     os.makedirs(tmpdir, exist_ok=True)
     
     paused_receipts = []
@@ -121,7 +121,15 @@ def main():
         print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_receipts)} receipts)\n{'='*50}")
         for ref, local_path, cfg, st in paused_receipts:
             print(f"\nReviewing: {ref}")
-            print(f"File: file://{local_path}")
+            import urllib.parse
+            encoded_path = urllib.parse.quote(local_path)
+            print(f"File: 'file://{encoded_path}'")
+            
+            parsed = st.values.get("parsed_data")
+            if parsed:
+                print(f"Parsed Date:   {parsed.get('date')}")
+                print(f"Parsed Payee:  {parsed.get('payee')}")
+                print(f"Parsed Amount: ${parsed.get('total')}")
             
             proposed = st.values.get("proposed_transaction")
             if proposed:

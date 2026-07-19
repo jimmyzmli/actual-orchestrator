@@ -8,3 +8,4 @@ pocketbase
 python-dotenv
 pydantic
 langchain-google-genai
+redis

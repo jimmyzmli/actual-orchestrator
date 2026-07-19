@@ -1,7 +1,6 @@
 import os
 import json
 import base64
-from io import BytesIO
 from typing import TypedDict, Dict, Any, List
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -13,6 +12,7 @@ from pdf2image import convert_from_path
 
 from tools.actual_mcp import find_or_create_transaction
 from tools.pocketbase_client import save_receipt
+from graph.cache import get_ocr, set_ocr, get_parsed, set_parsed
 
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF
@@ -40,22 +40,24 @@ class ParsedReceipt(BaseModel):
 def extract_ocr_node(state: ReceiptState):
     """Extract raw text from the PDF using Gemini Vision"""
     try:
-        cache_file = f"{state['file_path']}.ocr.txt"
-        if os.path.exists(cache_file):
-            print("Using cached OCR text...")
-            
-            images = convert_from_path(state["file_path"])
-            image_paths = []
-            for idx, img in enumerate(images):
-                img_path = f"{state['file_path']}_page_{idx}.jpg"
-                if not os.path.exists(img_path):
-                    img.save(img_path, format="JPEG")
-                image_paths.append(img_path)
-                
-            with open(cache_file, "r") as f:
-                return {"ocr_text": f.read(), "image_paths": image_paths}
+        file_path = state["file_path"]
 
-        print(f"Extracting OCR with Gemini Vision for {state['file_path']}...")
+        # Always need page images for PocketBase upload
+        images = convert_from_path(file_path)
+        image_paths = []
+        for idx, img in enumerate(images):
+            img_path = f"{file_path}_page_{idx}.jpg"
+            if not os.path.exists(img_path):
+                img.save(img_path, format="JPEG")
+            image_paths.append(img_path)
+
+        # Check Redis cache
+        cached = get_ocr(file_path)
+        if cached is not None:
+            print("Using cached OCR text (Redis)...")
+            return {"ocr_text": cached, "image_paths": image_paths}
+
+        print(f"Extracting OCR with Gemini Vision for {file_path}...")
         
         # Respect Gemini's 15 Requests Per Minute (RPM) free tier rate limit
         import time
@@ -67,24 +69,13 @@ def extract_ocr_node(state: ReceiptState):
             temperature=0
         )
         
-        images = convert_from_path(state["file_path"])
-        
         content = [
             {"type": "text", "text": "Extract all the text from this receipt accurately, line by line. Output ONLY the raw text without any markdown formatting or extra commentary."}
         ]
         
-        image_paths = []
-        for idx, img in enumerate(images):
-            # Save to disk
-            img_path = f"{state['file_path']}_page_{idx}.jpg"
-            img.save(img_path, format="JPEG")
-            image_paths.append(img_path)
-            
-            # Add to prompt
-            buffered = BytesIO()
-            img.save(buffered, format="JPEG")
-            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-            
+        for img_path in image_paths:
+            with open(img_path, "rb") as f:
+                img_str = base64.b64encode(f.read()).decode("utf-8")
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}
@@ -101,8 +92,7 @@ def extract_ocr_node(state: ReceiptState):
         elif not isinstance(ocr_text, str):
             ocr_text = str(ocr_text)
             
-        with open(cache_file, "w") as f:
-            f.write(ocr_text)
+        set_ocr(file_path, ocr_text)
             
         return {"ocr_text": ocr_text, "image_paths": image_paths}
     except Exception as e:
@@ -113,12 +103,14 @@ def parse_receipt_node(state: ReceiptState):
     try:
         if not state.get("ocr_text"):
             return {"status": "error", "error": "No OCR text found"}
-            
-        cache_file = f"{state['file_path']}.parsed.json"
-        if os.path.exists(cache_file):
-            print("Using cached parsed data...")
-            with open(cache_file, "r") as f:
-                return {"parsed_data": json.load(f)}
+
+        file_path = state["file_path"]
+
+        # Check Redis cache
+        cached = get_parsed(file_path)
+        if cached is not None:
+            print("Using cached parsed data (Redis)...")
+            return {"parsed_data": cached}
 
         print(f"Parsing receipt with DeepSeek...")
         
@@ -141,8 +133,7 @@ def parse_receipt_node(state: ReceiptState):
         result = chain.invoke({"ocr_text": state["ocr_text"]})
         
         parsed_dict = result.dict()
-        with open(cache_file, "w") as f:
-            json.dump(parsed_dict, f)
+        set_parsed(file_path, parsed_dict)
             
         return {"parsed_data": parsed_dict}
     except Exception as e:
