@@ -121,3 +121,22 @@ def check_receipt_exists(source_hash, _cached_hashes=None):
         return len(records.items) > 0
     except Exception:
         return False
+
+def delete_receipt_by_hash(source_hash):
+    """
+    Looks up a receipt by source_hash and deletes it if it exists.
+    Returns True if a record was deleted, False otherwise.
+    """
+    client = get_pb_client()
+    try:
+        records = client.collection("receipts").get_list(1, 1, query_params={
+            "filter": f"source_hash='{source_hash}'",
+            "fields": "id",
+            "skipTotal": "true",
+        })
+        if records.items:
+            client.collection("receipts").delete(records.items[0].id)
+            return True
+    except Exception as e:
+        print(f"Error deleting from pocketbase: {e}")
+    return False

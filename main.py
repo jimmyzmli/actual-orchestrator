@@ -619,6 +619,50 @@ def purge_cache_command(ids: list[str]):
                     
     print(f"Purged {deleted_local} local cache files for specified IDs.")
 
+def flag_source_command(filename: str):
+    gdrive_path = os.environ.get("RECEIPT_GDRIVE_PATH")
+    non_receipt_path = os.environ.get("NON_RECEIPT_GDRIVE_PATH")
+    
+    if not gdrive_path:
+        print("RECEIPT_GDRIVE_PATH not set in .env")
+        return
+    if not non_receipt_path:
+        print("NON_RECEIPT_GDRIVE_PATH not set in .env")
+        return
+        
+    tmpdir = os.path.join(os.getcwd(), "cache")
+    os.makedirs(tmpdir, exist_ok=True)
+    
+    local_path = os.path.join(tmpdir, filename)
+    if not os.path.exists(local_path):
+        try:
+            local_path = download_file(gdrive_path, filename, tmpdir)
+        except Exception as e:
+            print(f"Failed to download file {filename} from {gdrive_path}: {e}")
+            return
+            
+    from graph.cache import _file_hash
+    try:
+        file_hash = _file_hash(local_path)
+    except Exception as e:
+        print(f"Failed to compute hash for {local_path}: {e}")
+        return
+        
+    from tools.pocketbase_client import delete_receipt_by_hash
+    deleted = delete_receipt_by_hash(file_hash)
+    if deleted:
+        print(f"Deleted PocketBase record with hash {file_hash}")
+    else:
+        print(f"No PocketBase record found with hash {file_hash}")
+        
+    source_ref = f"{gdrive_path}/{filename}"
+    print(f"Moving {source_ref} to {non_receipt_path}...")
+    try:
+        subprocess.check_call(["rclone", "move", source_ref, non_receipt_path])
+        print("Move completed.")
+    except Exception as e:
+        print(f"Failed to move file using rclone: {e}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
     subparsers = parser.add_subparsers(dest="command")
@@ -640,6 +684,13 @@ if __name__ == "__main__":
     cache_purge_parser = cache_subparsers.add_parser("purge", help="Remove cache for specific entry IDs")
     cache_purge_parser.add_argument("ids", nargs="+", help="List of cache entry IDs (hashes) to purge")
 
+    # `source` subcommand
+    source_parser = subparsers.add_parser("source", help="Manage source files")
+    source_subparsers = source_parser.add_subparsers(dest="source_command")
+    
+    source_flag_parser = source_subparsers.add_parser("flag", help="Flag a file as not a receipt, delete from PB, move to non-receipts folder")
+    source_flag_parser.add_argument("filename", help="File name relative to RECEIPT_GDRIVE_PATH")
+
     args = parser.parse_args()
 
     if args.command == "validate":
@@ -656,5 +707,10 @@ if __name__ == "__main__":
             purge_cache_command(args.ids)
         else:
             cache_parser.print_help()
+    elif args.command == "source":
+        if args.source_command == "flag":
+            flag_source_command(args.filename)
+        else:
+            source_parser.print_help()
     else:
         main()
