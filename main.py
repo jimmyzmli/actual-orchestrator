@@ -155,6 +155,69 @@ def main():
             print("Done.\n")
     else:
         print("\nAll receipts processed successfully! No manual reviews needed.")
+        
+    import asyncio
+    asyncio.run(run_final_validation())
+
+async def run_final_validation():
+    print(f"\n\n{'='*50}\nFINAL VALIDATION\n{'='*50}")
+    # 1. Pull PB tx ids
+    pb_tx_ids = set()
+    from tools.pocketbase_client import get_pb_client
+    try:
+        client = get_pb_client()
+        records = client.collection("receipts").get_full_list(query_params={"fields": "tx_id"})
+        for r in records:
+            if hasattr(r, 'tx_id') and r.tx_id and r.tx_id != "unknown_id":
+                pb_tx_ids.add(r.tx_id)
+    except Exception as e:
+        print(f"Failed to pull from PocketBase: {e}")
+        return
+
+    # 2. Pull Actual Budget tx ids
+    actual_tx_ids = set()
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    import os, json
+    
+    server_params = StdioServerParameters(
+        command="node",
+        args=["wrapper.js"],
+        env=os.environ.copy()
+    )
+    try:
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                res = await session.call_tool("actual_query", {"args": [
+                    "run", "--table", "transactions", 
+                    "--filter", json.dumps({"notes": {"$like": "%#receipt%"}}), 
+                    "--select", "id", "--format", "json"
+                ]})
+                if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
+                    data = json.loads(res.content[0].text)
+                    if isinstance(data, list):
+                        for tx in data:
+                            actual_tx_ids.add(tx.get("id"))
+    except Exception as e:
+        print(f"Failed to pull from Actual Budget: {e}")
+        return
+
+    # 3. Find mismatches
+    in_pb_not_actual = pb_tx_ids - actual_tx_ids
+    in_actual_not_pb = actual_tx_ids - pb_tx_ids
+    
+    if not in_pb_not_actual and not in_actual_not_pb:
+        print("✅ Validation passed. All receipts perfectly synced.")
+    else:
+        if in_pb_not_actual:
+            print(f"⚠️ {len(in_pb_not_actual)} receipts in PocketBase are MISSING the #receipt tag in Actual Budget:")
+            for tx in in_pb_not_actual:
+                print(f"  - {tx}")
+        if in_actual_not_pb:
+            print(f"⚠️ {len(in_actual_not_pb)} transactions in Actual Budget have #receipt tag but are MISSING in PocketBase:")
+            for tx in in_actual_not_pb:
+                print(f"  - {tx}")
 
 if __name__ == "__main__":
     main()
