@@ -656,35 +656,105 @@ async def tag_actual_transaction_node(state: ReceiptState):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 
+                # Fetch initial transaction
+                target_tx_id = tx_id
                 existing_notes = ""
+                is_parent = False
+                is_child = False
+                parent_id = None
+                
                 try:
                     res = await session.call_tool("actual_query", {"args": [
-                        "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), "--select", "id,notes", "--format", "json"
+                        "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), 
+                        "--select", "id,notes,is_parent,is_child,parent_id", "--format", "json"
                     ]})
                     if res.content and len(res.content) > 0:
                         query_data = json.loads(res.content[0].text)
                         if query_data and len(query_data) > 0:
-                            existing_notes = query_data[0].get("notes") or ""
+                            tx_data = query_data[0]
+                            existing_notes = tx_data.get("notes") or ""
+                            is_parent = tx_data.get("is_parent")
+                            is_child = tx_data.get("is_child")
+                            parent_id = tx_data.get("parent_id")
                 except Exception as e:
-                    print(f"Failed to fetch existing notes: {e}")
+                    print(f"Failed to fetch transaction details: {e}")
+                    
+                # If it's a child, resolve to parent
+                if is_child and parent_id:
+                    print(f"Matched child transaction. Resolving to parent {parent_id}")
+                    target_tx_id = parent_id
+                    is_parent = True
+                    # Fetch parent notes
+                    try:
+                        res = await session.call_tool("actual_query", {"args": [
+                            "run", "--table", "transactions", "--filter", json.dumps({"id": target_tx_id}), 
+                            "--select", "id,notes", "--format", "json"
+                        ]})
+                        if res.content and len(res.content) > 0:
+                            query_data = json.loads(res.content[0].text)
+                            if query_data and len(query_data) > 0:
+                                existing_notes = query_data[0].get("notes") or ""
+                    except Exception as e:
+                        print(f"Failed to fetch parent notes: {e}")
                 
+                # Build enriched notes
+                parsed = state.get("parsed_data")
+                enriched_notes = ""
+                if parsed:
+                    enriched_notes += f"Receipt: {parsed.get('payee', 'Unknown')} ${parsed.get('total', 0):.2f} on {parsed.get('date', 'Unknown')}\n"
+                    items = parsed.get("items", [])
+                    if items:
+                        enriched_notes += "Items:\n"
+                        for item in items:
+                            enriched_notes += f"- {item.get('description', '')}: ${item.get('amount', 0):.2f}\n"
+                
+                # If it's a split parent, fetch children for breakdown
+                if is_parent:
+                    try:
+                        res = await session.call_tool("actual_query", {"args": [
+                            "run", "--table", "transactions", "--filter", json.dumps({"parent_id": target_tx_id}), 
+                            "--select", "amount,category.name", "--format", "json"
+                        ]})
+                        if res.content and len(res.content) > 0:
+                            children = json.loads(res.content[0].text)
+                            if children:
+                                enriched_notes += "Split breakdown:\n"
+                                for child in children:
+                                    cat_name = child.get("category.name") or "Uncategorized"
+                                    # Amount is negative for expenses
+                                    amt = abs(child.get("amount", 0)) / 100
+                                    enriched_notes += f"- {cat_name}: ${amt:.2f}\n"
+                    except Exception as e:
+                        print(f"Failed to fetch child transactions: {e}")
+                
+                # Append #receipt
+                enriched_notes += "#receipt"
+                
+                # Prepend existing notes if present and #receipt not already there
                 if "#receipt" not in existing_notes:
                     if existing_notes.strip():
-                        new_notes = existing_notes + " #receipt"
+                        new_notes = f"{existing_notes.strip()}\n\n{enriched_notes}"
                     else:
-                        new_notes = "#receipt"
+                        new_notes = enriched_notes
                 else:
-                    print(f"Transaction {tx_id} already has #receipt tag.")
+                    print(f"Transaction {target_tx_id} already has #receipt tag.")
+                    # Return potentially updated tx_id if we resolved to parent
+                    if target_tx_id != tx_id:
+                        return {"actual_tx_id": target_tx_id}
                     return {}
 
                 mcp_tools = await load_mcp_tools(session)
                 tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
                 if tx_tool:
                     await tx_tool.ainvoke({"args": [
-                        "update", tx_id,
+                        "update", target_tx_id,
                         "--data", json.dumps({"notes": new_notes})
                     ]})
-                    print(f"✅ Tagged transaction {tx_id}")
+                    print(f"✅ Tagged transaction {target_tx_id} with enriched notes")
+                    
+                if target_tx_id != tx_id:
+                    return {"actual_tx_id": target_tx_id}
+                    
     except Exception as e:
         if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
             print("Ignored MCP shutdown error, tag succeeded.")

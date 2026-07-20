@@ -205,6 +205,8 @@ async def run_final_validation(fix=False):
 
     # 2. Pull Actual Budget tx ids (transactions with #receipt in notes)
     actual_tx_ids = set()
+    resolved_pb_tx_ids = set()
+    pb_id_map = {} # old_tx_id -> resolved_parent_tx_id
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
     
@@ -215,6 +217,27 @@ async def run_final_validation(fix=False):
             async with stdio_client(server_params) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
+                    
+                    # Resolve PB ids to parents if they are children
+                    for tx_id in pb_tx_ids:
+                        resolved_id = tx_id
+                        try:
+                            res = await session.call_tool("actual_query", {"args": [
+                                "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}),
+                                "--select", "id,is_child,parent_id", "--format", "json"
+                            ]})
+                            if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
+                                query_data = json.loads(res.content[0].text)
+                                if isinstance(query_data, list) and len(query_data) > 0:
+                                    tx = query_data[0]
+                                    if tx.get("is_child") and tx.get("parent_id"):
+                                        resolved_id = tx.get("parent_id")
+                        except Exception as e:
+                            print(f"Failed to resolve PB tx {tx_id}: {e}")
+                        
+                        pb_id_map[tx_id] = resolved_id
+                        resolved_pb_tx_ids.add(resolved_id)
+                        
                     res = await session.call_tool("actual_query", {"args": [
                         "run", "--table", "transactions", 
                         "--filter", json.dumps({"notes": {"$like": "%#receipt%"}}), 
@@ -240,8 +263,8 @@ async def run_final_validation(fix=False):
                 return
 
     # 3. Find mismatches
-    in_pb_not_actual = pb_tx_ids - actual_tx_ids
-    in_actual_not_pb = actual_tx_ids - pb_tx_ids
+    in_pb_not_actual = resolved_pb_tx_ids - actual_tx_ids
+    in_actual_not_pb = actual_tx_ids - resolved_pb_tx_ids
     
     if not in_pb_not_actual and not in_actual_not_pb:
         print("✅ Validation passed. All receipts perfectly synced.")
@@ -262,6 +285,21 @@ async def run_final_validation(fix=False):
     # ── Fix Phase ──
     print(f"\n{'─'*50}\nApplying fixes...\n{'─'*50}")
 
+    # Fix PocketBase records that point to child transactions
+    if pb_id_map:
+        for old_tx_id, new_tx_id in pb_id_map.items():
+            if old_tx_id != new_tx_id:
+                pb_id = pb_records.get(old_tx_id)
+                if pb_id:
+                    try:
+                        client.collection("receipts").update(pb_id, {"tx_id": new_tx_id})
+                        print(f"  ✅ Updated PocketBase record {pb_id} to point to parent tx {new_tx_id} (was child {old_tx_id})")
+                        # Update the in_pb_not_actual tracking so we can still delete if needed
+                        if old_tx_id in pb_records:
+                            pb_records[new_tx_id] = pb_records.pop(old_tx_id)
+                    except Exception as e:
+                        print(f"  ❌ Failed to update PB record {pb_id}: {e}")
+
     # Fix 1 & 3: For tx_ids in PB but not in Actual's #receipt list,
     # check if the tx actually exists in Actual. If yes → add #receipt. If no → delete PB record.
     if in_pb_not_actual:
@@ -281,20 +319,46 @@ async def run_final_validation(fix=False):
                                 res = await session.call_tool("actual_query", {"args": [
                                     "run", "--table", "transactions",
                                     "--filter", json.dumps({"id": tx_id}),
-                                    "--select", "id,notes", "--format", "json"
+                                    "--select", "id,notes,is_parent", "--format", "json"
                                 ]})
                                 tx_exists = False
                                 existing_notes = ""
+                                is_parent = False
                                 if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
                                     query_data = json.loads(res.content[0].text)
                                     if isinstance(query_data, list) and len(query_data) > 0:
                                         tx_exists = True
                                         existing_notes = query_data[0].get("notes") or ""
+                                        is_parent = query_data[0].get("is_parent")
 
                                 if tx_exists:
                                     # Fix 3: tx exists but missing #receipt → add it
                                     if "#receipt" not in existing_notes:
-                                        new_notes = (existing_notes + " #receipt").strip() if existing_notes.strip() else "#receipt"
+                                        enriched_notes = ""
+                                        if is_parent:
+                                            try:
+                                                c_res = await session.call_tool("actual_query", {"args": [
+                                                    "run", "--table", "transactions", "--filter", json.dumps({"parent_id": tx_id}), 
+                                                    "--select", "amount,category.name", "--format", "json"
+                                                ]})
+                                                if c_res.content and len(c_res.content) > 0:
+                                                    children = json.loads(c_res.content[0].text)
+                                                    if children:
+                                                        enriched_notes += "Split breakdown:\n"
+                                                        for child in children:
+                                                            cat_name = child.get("category.name") or "Uncategorized"
+                                                            amt = abs(child.get("amount", 0)) / 100
+                                                            enriched_notes += f"- {cat_name}: ${amt:.2f}\n"
+                                            except Exception as e:
+                                                print(f"Failed to fetch child transactions: {e}")
+                                                
+                                        enriched_notes += "#receipt"
+                                        
+                                        if existing_notes.strip():
+                                            new_notes = f"{existing_notes.strip()}\n\n{enriched_notes}"
+                                        else:
+                                            new_notes = enriched_notes
+                                            
                                         if tx_tool:
                                             await tx_tool.ainvoke({"args": [
                                                 "update", tx_id,
@@ -305,12 +369,13 @@ async def run_final_validation(fix=False):
                                         print(f"  ℹ️  tx {tx_id} already has #receipt (query race?)")
                                 else:
                                     # Fix 2: tx not found in Actual → delete PB record
-                                    pb_id = pb_records[tx_id]
-                                    try:
-                                        client.collection("receipts").delete(pb_id)
-                                        print(f"  🗑️  Deleted PocketBase record {pb_id} (tx {tx_id} not in Actual)")
-                                    except Exception as e:
-                                        print(f"  ❌ Failed to delete PB record {pb_id}: {e}")
+                                    pb_id = pb_records.get(tx_id)
+                                    if pb_id:
+                                        try:
+                                            client.collection("receipts").delete(pb_id)
+                                            print(f"  🗑️  Deleted PocketBase record {pb_id} (tx {tx_id} not in Actual)")
+                                        except Exception as e:
+                                            print(f"  ❌ Failed to delete PB record {pb_id}: {e}")
                             except Exception as e:
                                 if "database is locked" in str(e).lower() or "sqlite" in str(e).lower():
                                     raise  # re-raise to trigger retry
