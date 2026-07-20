@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from graph.workflow import receipt_processor
+from graph.workflow import workflow
 
 def fetch_unprocessed_receipts(gdrive_path: str):
     """
@@ -60,16 +60,24 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
     print(f"\n--- Starting processing for {gdrive_source_ref} ---")
     
     async def run_flow():
-        # Step 1: Initial invocation
-        result = await receipt_processor.ainvoke(state, config)
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        from graph.workflow import workflow
+        import os
         
-        # Step 2: Check if interrupted
-        current_state = receipt_processor.get_state(config)
-        if "human_approval" in current_state.next:
-            print(f"⚠️ Transaction needs manual review. Pausing and deferring to end of batch.")
-            return {"status": "paused", "config": config, "state": current_state}
+        os.makedirs("data", exist_ok=True)
+        async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
+            receipt_processor = workflow.compile(checkpointer=memory, interrupt_before=["human_approval"])
             
-        return {"status": "finished"}
+            # Step 1: Initial invocation
+            result = await receipt_processor.ainvoke(state, config)
+            
+            # Step 2: Check if interrupted
+            current_state = await receipt_processor.aget_state(config)
+            if current_state.next and "human_approval" in current_state.next:
+                print(f"⚠️ Transaction needs manual review. Pausing and deferring to end of batch.")
+                return {"status": "paused", "config": config, "state": current_state}
+                
+            return {"status": "finished"}
 
     return asyncio.run(run_flow())
 
@@ -652,75 +660,107 @@ def flag_pb_command(pb_id: str):
     except Exception as e:
         print(f"Failed to flag and delete PocketBase record {pb_id}: {e}")
 
-def review_command():
-    import asyncio
+async def areview_command():
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from graph.workflow import workflow
     import urllib.parse
     import re
-    from graph.workflow import receipt_processor, memory
+    import os
     
-    paused_states = []
-    # Find all states that are paused
-    for snap in memory.list(None):
-        if snap.next and "human_approval" in snap.next:
-            paused_states.append(snap)
-            
-    if not paused_states:
-        print("No receipts waiting for manual review.")
-        return
+    os.makedirs("data", exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
+        receipt_processor = workflow.compile(checkpointer=memory, interrupt_before=["human_approval"])
         
-    print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_states)} receipts)\n{'='*50}")
-    for snap in paused_states:
-        cfg = snap.config
-        st = snap
-        ref = cfg["configurable"]["thread_id"]
-        local_path = st.values.get("file_path", "")
-        
-        print(f"\nReviewing: {ref}")
-        if local_path:
-            encoded_path = urllib.parse.quote(local_path)
-            print(f"File: 'file://{encoded_path}'")
-        
-        not_a_receipt = st.values.get("not_a_receipt", False)
-        
-        try:
-            if not_a_receipt:
-                print(f"🚫 Content was classified as NOT a receipt.")
-                print(f"   OCR preview: {(st.values.get('ocr_text') or '')[:200]}...")
-                ans = input("Skip this file? [Y/n] (or enter UUID to force-link to a transaction): ").strip().lower()
-                if ans in ("", "y", "yes"):
-                    asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": False}))
-                    print("Skipped.\n")
-                    # Advance state
-                    asyncio.run(receipt_processor.ainvoke(None, cfg))
-                    continue
-            else:
-                parsed = st.values.get("parsed_data")
-                if parsed:
-                    print(f"Parsed Date:   {parsed.get('date')}")
-                    print(f"Parsed Payee:  {parsed.get('payee')}")
-                    print(f"Parsed Amount: ${parsed.get('total')}")
+        # Collect all unique thread IDs
+        thread_ids = set()
+        async for chk in memory.alist(None):
+            thread_id = chk.config.get("configurable", {}).get("thread_id")
+            if thread_id:
+                thread_ids.add(thread_id)
                 
-                proposed = st.values.get("proposed_transaction")
-                if proposed:
-                    print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
-                    print(f"{proposed}")
-                    ans = input("Do you want to create this transaction? [y/N] (or enter UUID to override): ").strip().lower()
+        paused_states = []
+        for thread_id in thread_ids:
+            cfg = {"configurable": {"thread_id": thread_id}}
+            snap = await receipt_processor.aget_state(cfg)
+            if snap.next and "human_approval" in snap.next:
+                paused_states.append(snap)
+                
+        if not paused_states:
+            print("No receipts waiting for manual review.")
+            return
+            
+        print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_states)} receipts)\n{'='*50}")
+        for snap in paused_states:
+            cfg = snap.config
+            st = snap
+            ref = cfg["configurable"]["thread_id"]
+            local_path = st.values.get("file_path", "")
+            
+            print(f"\nReviewing: {ref}")
+            if local_path:
+                encoded_path = urllib.parse.quote(local_path)
+                print(f"File: 'file://{encoded_path}'")
+            
+            not_a_receipt = st.values.get("not_a_receipt", False)
+            
+            try:
+                ans = ""
+                if not_a_receipt:
+                    print(f"🚫 Content was classified as NOT a receipt.")
+                    print(f"   OCR preview: {(st.values.get('ocr_text') or '')[:200]}...")
+                    ans = input("Action (s=skip, m=move, d=delete, UUID=link): [s] ").strip().lower()
+                    if ans in ("", "s", "skip"):
+                        ans = "s"
                 else:
-                    print(f"⚠️ Agent failed to match or propose a transaction.")
-                    ans = input("Enter a valid transaction UUID to override, or 'n' to skip: ").strip().lower()
-            
-            if re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):
-                asyncio.run(receipt_processor.aupdate_state(cfg, {"actual_tx_id": ans, "human_approved": False}))
-            else:
-                approved = bool(proposed and ans in ("y", "yes"))
-                asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": approved}))
-            
-            print(f"Resuming workflow for {ref}...")
-            asyncio.run(receipt_processor.ainvoke(None, cfg))
-            print("Done.\n")
-        except KeyboardInterrupt:
-            print("\nReview interrupted. State saved, you can resume later.")
-            break
+                    parsed = st.values.get("parsed_data")
+                    if parsed:
+                        print(f"Parsed Date:   {parsed.get('date')}")
+                        print(f"Parsed Payee:  {parsed.get('payee')}")
+                        print(f"Parsed Amount: ${parsed.get('total')}")
+                    
+                    proposed = st.values.get("proposed_transaction")
+                    if proposed:
+                        print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
+                        print(f"{proposed}")
+                        ans = input("Action (c=create, s=skip, m=move, d=delete, UUID=link): [c] ").strip().lower()
+                        if ans in ("", "c", "create", "y", "yes"):
+                            ans = "c"
+                        elif ans in ("s", "skip", "n", "no"):
+                            ans = "s"
+                    else:
+                        print(f"⚠️ Agent failed to match or propose a transaction.")
+                        ans = input("Action (s=skip, m=move, d=delete, UUID=link): [s] ").strip().lower()
+                        if ans in ("", "s", "skip", "n", "no"):
+                            ans = "s"
+                
+                if ans in ("m", "d"):
+                    filename = ref.split("/")[-1]
+                    flag_source_command(filename, delete=(ans == "d"))
+                    await receipt_processor.aupdate_state(cfg, {"human_approved": False})
+                    await receipt_processor.ainvoke(None, cfg)
+                    print("Done.\n")
+                    continue
+                elif ans == "s":
+                    await receipt_processor.aupdate_state(cfg, {"human_approved": False})
+                    await receipt_processor.ainvoke(None, cfg)
+                    print("Skipped.\n")
+                    continue
+                elif re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):
+                    await receipt_processor.aupdate_state(cfg, {"actual_tx_id": ans, "human_approved": False})
+                else:
+                    approved = (ans == "c")
+                    await receipt_processor.aupdate_state(cfg, {"human_approved": approved})
+                
+                print(f"Resuming workflow for {ref}...")
+                await receipt_processor.ainvoke(None, cfg)
+                print("Done.\n")
+            except KeyboardInterrupt:
+                print("\nReview interrupted. State saved, you can resume later.")
+                break
+
+def review_command():
+    import asyncio
+    asyncio.run(areview_command())
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")

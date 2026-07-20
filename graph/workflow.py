@@ -551,6 +551,9 @@ async def search_actual_transaction_node(state: ReceiptState):
                                             if not (min_allowed <= abs_actual <= max_allowed):
                                                 print(f"❌ VALIDATION FAILED: Actual Budget amount ${abs_actual/100:.2f} is outside the allowed range for parsed receipt amount ${amount:.2f}. Rejecting match.")
                                                 final_id = "unknown_id"
+                                        else:
+                                            print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not found in Actual Budget.")
+                                            final_id = "unknown_id"
                                 except Exception as e:
                                     print(f"Warning: Failed to validate amount: {e}")
                             
@@ -627,6 +630,20 @@ async def create_actual_transaction_node(state: ReceiptState):
                 if match:
                     final_id = match.group(0)
                     print(f"Agent created tx: {final_id}")
+                    
+                    # Validate that the transaction actually exists
+                    query_tool = next((t for t in mcp_tools if t.name == "actual_query"), None)
+                    if query_tool:
+                        try:
+                            q_res = await query_tool.ainvoke({"args": ["run", "--table", "transactions", "--filter", json.dumps({"id": final_id}), "--select", "id", "--format", "json"]})
+                            q_text = q_res[0].get("text", "[]") if isinstance(q_res, list) else getattr(q_res, "text", "[]")
+                            if isinstance(q_text, str):
+                                q_json = json.loads(q_text)
+                                if len(q_json) == 0:
+                                    print(f"❌ VALIDATION FAILED: Agent claimed to create tx {final_id}, but it was not found in Actual Budget.")
+                                    final_id = "unknown_id"
+                        except Exception as e:
+                            print(f"Warning: Failed to validate created tx id: {e}")
                 else:
                     print(f"Agent output didn't contain UUID: {content}")
                     final_id = "unknown_id"
@@ -809,9 +826,3 @@ workflow.add_conditional_edges("human_approval", router_after_human, {"create_ac
 workflow.add_conditional_edges("create_actual", router_check_error, {"error": END, "continue": "tag_actual"})
 workflow.add_edge("tag_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", END)
-
-os.makedirs("data", exist_ok=True)
-_conn = sqlite3.connect("data/checkpoints.sqlite", check_same_thread=False)
-memory = SqliteSaver(_conn)
-memory.setup()
-receipt_processor = workflow.compile(checkpointer=memory, interrupt_before=["human_approval"])
