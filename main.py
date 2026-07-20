@@ -58,6 +58,7 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
     
     # Run graph
     print(f"\n--- Starting processing for {gdrive_source_ref} ---")
+    print(f"file://{local_path}")
     
     async def run_flow():
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -114,8 +115,6 @@ def main():
             local_path = os.path.join(tmpdir, filename)
             if not os.path.exists(local_path):
                 local_path = download_file(gdrive_path, filename, tmpdir)
-            else:
-                print(f"Using already downloaded file: {local_path}")
 
             # Dedup by file content hash (O(1) set lookup, no HTTP)
             from graph.cache import _file_hash
@@ -127,11 +126,13 @@ def main():
             res = process_receipt(local_path, gdrive_source_ref)
             if res and res.get("status") == "paused":
                 paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"]))
+            print(f"--- Finished processing for {gdrive_source_ref} ---\n")
                 
             # Optionally, move the file to a 'Processed' folder in gdrive
             # subprocess.check_call(["rclone", "move", gdrive_source_ref, f"{gdrive_path}/Processed/"])
         except Exception as e:
             print(f"Failed to process {filename}: {e}")
+            print(f"--- Finished processing for {gdrive_source_ref} (Error) ---\n")
 
     if paused_receipts:
         print(f"\n{len(paused_receipts)} receipts require manual review.")
