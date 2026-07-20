@@ -12,6 +12,15 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from pdf2image import convert_from_path
 
+def estimate_tokens(text: str) -> int:
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return len(text) // 4
+
+
 
 from tools.pocketbase_client import save_receipt, check_receipt_exists
 from graph.cache import get_ocr, set_ocr, get_parsed, set_parsed, _file_hash
@@ -45,7 +54,6 @@ class ProposedTransaction(BaseModel):
     amount_cents: int = Field(description="Amount in integer cents (e.g. 1500 for $15.00, or -1500 for an expense). Note: expenses MUST be negative.")
     payee_name: str = Field(description="Name of the payee")
     account_id: str = Field(description="ID of the selected account")
-    notes: str = Field(description="Notes to attach to the transaction")
 
 class TransactionMatchResult(BaseModel):
     matched_id: str | None = Field(description="The UUID of the best matching candidate transaction, if any. Leave null if no good match.")
@@ -161,6 +169,10 @@ def parse_receipt_node(state: ReceiptState):
             ("human", "{ocr_text}")
         ])
         classify_chain = classify_prompt | llm
+        
+        prompt_val = classify_prompt.format_prompt(ocr_text=state["ocr_text"])
+        print(f"  [Token Est] Classify prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+        
         classify_result = classify_chain.invoke({"ocr_text": state["ocr_text"]})
         classification = classify_result.content.strip().upper()
         
@@ -177,6 +189,10 @@ def parse_receipt_node(state: ReceiptState):
         ])
         
         chain = prompt | structured_llm
+        
+        prompt_val = prompt.format_prompt(ocr_text=state["ocr_text"])
+        print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+        
         result = chain.invoke({"ocr_text": state["ocr_text"]})
         
         parsed_dict = result.dict()
@@ -413,6 +429,8 @@ YOUR RESPONSE MUST BE EXACTLY ONE OF:
 
 Do not explain your reasoning. Just output the UUID or NONE."""
 
+    print(f"  [Token Est] Tiebreaker prompt: ~{estimate_tokens(prompt)} tokens")
+
     try:
         result = llm.invoke([HumanMessage(content=prompt)])
         content = result.content.strip()
@@ -463,10 +481,6 @@ async def search_actual_transaction_node(state: ReceiptState):
         payee = parsed["payee"]
         receipt_cents = abs(int(amount * 100))
         
-        notes = "Extracted from receipt. Items:\n"
-        for item in parsed.get("items", []):
-            notes += f"- {item['description']}: ${item['amount']}\n"
-            
         server_params = StdioServerParameters(
             command="node",
             args=["wrapper.js"],
@@ -541,8 +555,10 @@ async def search_actual_transaction_node(state: ReceiptState):
                                 "amount": c.get("amount"),
                                 "payee": c.get("payee.name") or c.get("imported_payee"),
                                 "account": c.get("account.name"),
-                                "notes": c.get("notes")
+                                "notes": (c.get("notes") or "")[:200]
                             })
+                    # Limit to top 10 candidates to save tokens
+                    narrowed_candidates = narrowed_candidates[:10]
                             
                     # Fetch available accounts to propose a new transaction
                     available_accounts = []
@@ -553,7 +569,8 @@ async def search_actual_transaction_node(state: ReceiptState):
                         raw = res.content[0].text if res.content else "[]"
                         all_accounts = json.loads(raw) if isinstance(raw, str) else []
                         available_accounts = [
-                            a for a in all_accounts
+                            {"id": a["id"], "name": a["name"]}
+                            for a in all_accounts
                             if not a.get("closed", False) and not a.get("offbudget", False)
                         ]
                     except Exception as e:
@@ -572,7 +589,6 @@ We have a new parsed receipt:
 - Date: {date}
 - Amount: ${amount}
 - Payee: {payee}
-- Notes to append: {notes}
 
 Here are the deterministically filtered candidate transactions from the bank (within +/- 7 days and amount +/- 30%):
 {json.dumps(narrowed_candidates, indent=2) if narrowed_candidates else "[]"}
@@ -591,10 +607,11 @@ Task:
     "date": "YYYY-MM-DD",
     "amount_cents": -1500,  // Note: expenses MUST be negative
     "payee_name": "string",
-    "account_id": "string",
-    "notes": "string"
+    "account_id": "string"
   }} // or null if matched_id is provided
 }}"""
+                    
+                    print(f"  [Token Est] Fallback agent prompt: ~{estimate_tokens(prompt_text)} tokens")
                     
                     try:
                         result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
@@ -664,7 +681,7 @@ async def create_actual_transaction_node(state: ReceiptState):
                 {proposed_tx}
                 
                 Task:
-                1. Create a new transaction using actual_transactions with the provided date, amount_cents, payee_name, account_id, and notes.
+                1. Create a new transaction using actual_transactions with the provided date, amount_cents, payee_name, and account_id.
                 2. After creation, you MUST re-query actual_query to get the final transaction ID of the transaction you just created.
                 
                 IMPORTANT: YOUR FINAL MESSAGE MUST BE EXACTLY THE 36-CHARACTER TRANSACTION UUID. Do not say "The ID is...". Just output the UUID string.
@@ -774,15 +791,6 @@ async def tag_actual_transaction_node(state: ReceiptState):
                                 for t in txs:
                                     if t.get("id") == target_tx_id:
                                         existing_notes = t.get("notes") or ""
-                                        children = t.get("subtransactions", [])
-                                        if children:
-                                            breakdown = "\nSplit breakdown:\n"
-                                            for child in children:
-                                                cat_name = child.get("category.name") or "Uncategorized"
-                                                amt = abs(child.get("amount", 0)) / 100
-                                                breakdown += f"- {cat_name}: ${amt:.2f}\n"
-                                            if "Split breakdown:" not in existing_notes:
-                                                existing_notes += breakdown
                                         break
                     except Exception as e:
                         print(f"Failed to fetch parent notes: {e}")
