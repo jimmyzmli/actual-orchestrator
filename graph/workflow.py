@@ -50,18 +50,22 @@ def skip_if_processed(state: ReceiptState):
     return {}
 
 def extract_ocr_node(state: ReceiptState):
-    """Extract raw text from the PDF using Gemini Vision"""
+    """Extract raw text from the PDF or image using Gemini Vision"""
     try:
         file_path = state["file_path"]
 
-        # Always need page images for PocketBase upload
-        images = convert_from_path(file_path)
+        # If it's a PDF, we need page images for PocketBase upload and Gemini
         image_paths = []
-        for idx, img in enumerate(images):
-            img_path = f"{file_path}_page_{idx}.jpg"
-            if not os.path.exists(img_path):
-                img.save(img_path, format="JPEG")
-            image_paths.append(img_path)
+        if file_path.lower().endswith(".pdf"):
+            images = convert_from_path(file_path)
+            for idx, img in enumerate(images):
+                img_path = f"{file_path}_page_{idx}.jpg"
+                if not os.path.exists(img_path):
+                    img.save(img_path, format="JPEG")
+                image_paths.append(img_path)
+        else:
+            # It's already an image (jpg/jpeg/png)
+            image_paths.append(file_path)
 
         # Check Redis cache
         cached = get_ocr(file_path)
@@ -88,9 +92,13 @@ def extract_ocr_node(state: ReceiptState):
         for img_path in image_paths:
             with open(img_path, "rb") as f:
                 img_str = base64.b64encode(f.read()).decode("utf-8")
+            
+            ext = img_path.lower().split(".")[-1]
+            mime_type = "image/png" if ext == "png" else "image/jpeg"
+            
             content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{img_str}"}
+                "image_url": {"url": f"data:{mime_type};base64,{img_str}"}
             })
             
         messages = [

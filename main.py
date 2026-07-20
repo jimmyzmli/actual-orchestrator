@@ -20,9 +20,9 @@ def fetch_unprocessed_receipts(gdrive_path: str):
         # rclone lsjson gdrive:Receipts
         result = subprocess.check_output(["rclone", "lsjson", gdrive_path], text=True)
         files = json.loads(result)
-        # Filter for files (not dirs) and PDFs
-        pdfs = [f for f in files if not f.get("IsDir") and f.get("Name", "").lower().endswith(".pdf")]
-        return pdfs
+        # Filter for files (not dirs) and PDFs/Images
+        receipt_files = [f for f in files if not f.get("IsDir") and f.get("Name", "").lower().endswith((".pdf", ".jpg", ".jpeg", ".png"))]
+        return receipt_files
     except subprocess.CalledProcessError as e:
         print(f"Error fetching from rclone: {e}")
         return []
