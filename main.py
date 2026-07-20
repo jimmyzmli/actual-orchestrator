@@ -3,6 +3,7 @@ import sys
 import json
 import subprocess
 import tempfile
+import argparse
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -164,49 +165,67 @@ def main():
     import asyncio
     asyncio.run(run_final_validation())
 
-async def run_final_validation():
-    print(f"\n\n{'='*50}\nFINAL VALIDATION\n{'='*50}")
-    # 1. Pull PB tx ids
-    pb_tx_ids = set()
-    from tools.pocketbase_client import get_pb_client
-    try:
-        client = get_pb_client()
-        records = client.collection("receipts").get_full_list(query_params={"fields": "tx_id"})
-        for r in records:
-            if hasattr(r, 'tx_id') and r.tx_id and r.tx_id != "unknown_id":
-                pb_tx_ids.add(r.tx_id)
-    except Exception as e:
-        print(f"Failed to pull from PocketBase: {e}")
-        return
-
-    # 2. Pull Actual Budget tx ids
-    actual_tx_ids = set()
-    from mcp import ClientSession, StdioServerParameters
-    from mcp.client.stdio import stdio_client
-    import os, json
-    
-    server_params = StdioServerParameters(
+async def _get_mcp_session():
+    """Create and return MCP server params for Actual Budget."""
+    from mcp import StdioServerParameters
+    return StdioServerParameters(
         command="node",
         args=["wrapper.js"],
         env=os.environ.copy()
     )
+
+async def run_final_validation(fix=False):
+    print(f"\n\n{'='*50}\nFINAL VALIDATION{' (with --fix)' if fix else ''}\n{'='*50}")
+    # 1. Pull PB records (need tx_id and record id for deletion)
+    pb_records = {}  # tx_id -> pb record id
+    from tools.pocketbase_client import get_pb_client
     try:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                res = await session.call_tool("actual_query", {"args": [
-                    "run", "--table", "transactions", 
-                    "--filter", json.dumps({"notes": {"$like": "%#receipt%"}}), 
-                    "--select", "id", "--format", "json"
-                ]})
-                if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
-                    data = json.loads(res.content[0].text)
-                    if isinstance(data, list):
-                        for tx in data:
-                            actual_tx_ids.add(tx.get("id"))
+        client = get_pb_client()
+        records = client.collection("receipts").get_full_list(query_params={"fields": "id,tx_id"})
+        for r in records:
+            if hasattr(r, 'tx_id') and r.tx_id and r.tx_id != "unknown_id":
+                pb_records[r.tx_id] = r.id
     except Exception as e:
-        print(f"Failed to pull from Actual Budget: {e}")
+        print(f"Failed to pull from PocketBase: {e}")
         return
+
+    pb_tx_ids = set(pb_records.keys())
+
+    # 2. Pull Actual Budget tx ids (transactions with #receipt in notes)
+    actual_tx_ids = set()
+    from mcp import ClientSession
+    from mcp.client.stdio import stdio_client
+    
+    server_params = await _get_mcp_session()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    res = await session.call_tool("actual_query", {"args": [
+                        "run", "--table", "transactions", 
+                        "--filter", json.dumps({"notes": {"$like": "%#receipt%"}}), 
+                        "--select", "id", "--format", "json"
+                    ]})
+                    if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
+                        data = json.loads(res.content[0].text)
+                        if isinstance(data, list):
+                            for tx in data:
+                                actual_tx_ids.add(tx.get("id"))
+            break  # success
+        except Exception as e:
+            if "database is locked" in str(e).lower() or "sqlite" in str(e).lower():
+                import asyncio
+                wait = 2 ** attempt
+                print(f"⏳ Actual Budget DB busy, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait)
+            elif "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
+                print("Ignored MCP shutdown error during query.")
+                break
+            else:
+                print(f"Failed to pull from Actual Budget: {e}")
+                return
 
     # 3. Find mismatches
     in_pb_not_actual = pb_tx_ids - actual_tx_ids
@@ -214,15 +233,247 @@ async def run_final_validation():
     
     if not in_pb_not_actual and not in_actual_not_pb:
         print("✅ Validation passed. All receipts perfectly synced.")
-    else:
-        if in_pb_not_actual:
-            print(f"⚠️ {len(in_pb_not_actual)} receipts in PocketBase are MISSING the #receipt tag in Actual Budget:")
-            for tx in in_pb_not_actual:
-                print(f"  - {tx}")
-        if in_actual_not_pb:
-            print(f"⚠️ {len(in_actual_not_pb)} transactions in Actual Budget have #receipt tag but are MISSING in PocketBase:")
-            for tx in in_actual_not_pb:
-                print(f"  - {tx}")
+        return
+
+    if in_pb_not_actual:
+        print(f"⚠️ {len(in_pb_not_actual)} receipts in PocketBase but tx is MISSING #receipt in Actual Budget:")
+        for tx in in_pb_not_actual:
+            print(f"  - {tx}")
+    if in_actual_not_pb:
+        print(f"⚠️ {len(in_actual_not_pb)} transactions in Actual Budget have #receipt tag but are MISSING in PocketBase:")
+        for tx in in_actual_not_pb:
+            print(f"  - {tx}")
+
+    if not fix:
+        return
+
+    # ── Fix Phase ──
+    print(f"\n{'─'*50}\nApplying fixes...\n{'─'*50}")
+
+    # Fix 1 & 3: For tx_ids in PB but not in Actual's #receipt list,
+    # check if the tx actually exists in Actual. If yes → add #receipt. If no → delete PB record.
+    if in_pb_not_actual:
+        print(f"\n🔧 Checking {len(in_pb_not_actual)} PocketBase records against Actual Budget...")
+        for attempt in range(max_retries):
+            try:
+                async with stdio_client(server_params) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        from langchain_mcp_adapters.tools import load_mcp_tools
+                        mcp_tools = await load_mcp_tools(session)
+                        tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+
+                        for tx_id in in_pb_not_actual:
+                            # Query Actual to see if the tx exists at all
+                            try:
+                                res = await session.call_tool("actual_query", {"args": [
+                                    "run", "--table", "transactions",
+                                    "--filter", json.dumps({"id": tx_id}),
+                                    "--select", "id,notes", "--format", "json"
+                                ]})
+                                tx_exists = False
+                                existing_notes = ""
+                                if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
+                                    query_data = json.loads(res.content[0].text)
+                                    if isinstance(query_data, list) and len(query_data) > 0:
+                                        tx_exists = True
+                                        existing_notes = query_data[0].get("notes") or ""
+
+                                if tx_exists:
+                                    # Fix 3: tx exists but missing #receipt → add it
+                                    if "#receipt" not in existing_notes:
+                                        new_notes = (existing_notes + " #receipt").strip() if existing_notes.strip() else "#receipt"
+                                        if tx_tool:
+                                            await tx_tool.ainvoke({"args": [
+                                                "update", tx_id,
+                                                "--data", json.dumps({"notes": new_notes})
+                                            ]})
+                                        print(f"  ✅ Added #receipt to tx {tx_id}")
+                                    else:
+                                        print(f"  ℹ️  tx {tx_id} already has #receipt (query race?)")
+                                else:
+                                    # Fix 2: tx not found in Actual → delete PB record
+                                    pb_id = pb_records[tx_id]
+                                    try:
+                                        client.collection("receipts").delete(pb_id)
+                                        print(f"  🗑️  Deleted PocketBase record {pb_id} (tx {tx_id} not in Actual)")
+                                    except Exception as e:
+                                        print(f"  ❌ Failed to delete PB record {pb_id}: {e}")
+                            except Exception as e:
+                                if "database is locked" in str(e).lower() or "sqlite" in str(e).lower():
+                                    raise  # re-raise to trigger retry
+                                print(f"  ❌ Error checking tx {tx_id}: {e}")
+                break  # success
+            except Exception as e:
+                if "database is locked" in str(e).lower() or "sqlite" in str(e).lower():
+                    import asyncio
+                    wait = 2 ** attempt
+                    print(f"⏳ Actual Budget DB busy, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                elif "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
+                    print("Ignored MCP shutdown error (fixes were applied).")
+                    break
+                else:
+                    print(f"❌ Failed during fix phase: {e}")
+                    break
+
+    # Fix 1: For tx_ids in Actual with #receipt but not in PB → remove #receipt
+    if in_actual_not_pb:
+        print(f"\n🔧 Removing #receipt from {len(in_actual_not_pb)} transactions not in PocketBase...")
+        for attempt in range(max_retries):
+            try:
+                async with stdio_client(server_params) as (read, write):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        from langchain_mcp_adapters.tools import load_mcp_tools
+                        mcp_tools = await load_mcp_tools(session)
+                        tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+
+                        for tx_id in in_actual_not_pb:
+                            try:
+                                # Fetch current notes
+                                res = await session.call_tool("actual_query", {"args": [
+                                    "run", "--table", "transactions",
+                                    "--filter", json.dumps({"id": tx_id}),
+                                    "--select", "id,notes", "--format", "json"
+                                ]})
+                                if res.content and len(res.content) > 0 and hasattr(res.content[0], 'text'):
+                                    query_data = json.loads(res.content[0].text)
+                                    if isinstance(query_data, list) and len(query_data) > 0:
+                                        existing_notes = query_data[0].get("notes") or ""
+                                        new_notes = existing_notes.replace("#receipt", "").strip()
+                                        if tx_tool:
+                                            await tx_tool.ainvoke({"args": [
+                                                "update", tx_id,
+                                                "--data", json.dumps({"notes": new_notes})
+                                            ]})
+                                        print(f"  ✅ Removed #receipt from tx {tx_id}")
+                            except Exception as e:
+                                if "database is locked" in str(e).lower() or "sqlite" in str(e).lower():
+                                    raise
+                                print(f"  ❌ Error fixing tx {tx_id}: {e}")
+                break  # success
+            except Exception as e:
+                if "database is locked" in str(e).lower() or "sqlite" in str(e).lower():
+                    import asyncio
+                    wait = 2 ** attempt
+                    print(f"⏳ Actual Budget DB busy, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                elif "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
+                    print("Ignored MCP shutdown error (fixes were applied).")
+                    break
+                else:
+                    print(f"❌ Failed during fix phase: {e}")
+                    break
+
+    print(f"\n{'─'*50}\nFix phase complete.")
+
+def dump_cache_command(dump_path: str):
+    import os, json, re, shutil
+    from graph.cache import _get_client, _file_hash
+    
+    os.makedirs(dump_path, exist_ok=True)
+    
+    # clear existing files in dump_path
+    for filename in os.listdir(dump_path):
+        filepath = os.path.join(dump_path, filename)
+        if os.path.isfile(filepath):
+            os.unlink(filepath)
+            
+    client = _get_client()
+    
+    # Build hash to name mapping from local cache dir
+    hash_to_name = {}
+    local_cache_dir = os.path.join(os.getcwd(), "cache")
+    if os.path.exists(local_cache_dir):
+        for filename in os.listdir(local_cache_dir):
+            file_path = os.path.join(local_cache_dir, filename)
+            if os.path.isfile(file_path):
+                try:
+                    file_hash = _file_hash(file_path)
+                    hash_to_name[file_hash] = filename
+                except Exception:
+                    pass
+                
+    # Also fetch from PocketBase as fallback
+    try:
+        from tools.pocketbase_client import get_pb_client
+        pb_client = get_pb_client()
+        page = 1
+        per_page = 500
+        while True:
+            records = pb_client.collection("receipts").get_list(page, per_page, query_params={
+                "fields": "source_hash,source_ref",
+                "skipTotal": "true",
+            })
+            for r in records.items:
+                h = getattr(r, "source_hash", None)
+                ref = getattr(r, "source_ref", None)
+                if h and ref and h not in hash_to_name:
+                    hash_to_name[h] = ref.split('/')[-1]
+            if len(records.items) < per_page:
+                break
+            page += 1
+    except Exception as e:
+        pass
+        
+    keys = client.keys("receipt:*:ocr")
+    for key in keys:
+        file_hash = key.split(":")[1]
+        
+        ocr_text = client.get(key)
+        parsed_text = client.get(f"receipt:{file_hash}:parsed")
+        
+        original_name = hash_to_name.get(file_hash, f"unknown_{file_hash[:8]}")
+        # Make safe filename, swap extension to .txt
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', original_name)
+        safe_name = os.path.splitext(safe_name)[0] + '.txt'
+            
+        # prepend source as per user request (e.g. gdrive_)
+        if not safe_name.startswith("gdrive_"):
+            safe_name = f"gdrive_{safe_name}"
+            
+        out_filepath = os.path.join(dump_path, safe_name)
+        
+        with open(out_filepath, "w") as out:
+            out.write("=== Raw OCR Text (Model: gemini-3.1-flash-lite) ===\n")
+            out.write(ocr_text or "")
+            out.write("\n\n=== Parsed JSON (Model: deepseek-v4-flash) ===\n")
+            if parsed_text:
+                try:
+                    parsed_obj = json.loads(parsed_text)
+                    out.write(json.dumps(parsed_obj, indent=2))
+                except:
+                    out.write(parsed_text)
+            else:
+                out.write("None")
+                
+    print(f"Dumped {len(keys)} cache entries to {dump_path}")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Receipt processing pipeline")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # `validate` subcommand
+    validate_parser = subparsers.add_parser("validate", help="Run final validation between PocketBase and Actual Budget")
+    validate_parser.add_argument("--fix", action="store_true", help="Attempt to fix mismatches automatically")
+
+    # `cache` subcommand
+    cache_parser = subparsers.add_parser("cache", help="Manage the Redis cache")
+    cache_subparsers = cache_parser.add_subparsers(dest="cache_command")
+    
+    cache_dump_parser = cache_subparsers.add_parser("dump", help="Dump Redis nodecache to a directory")
+    cache_dump_parser.add_argument("path", help="Directory path to dump the cache files")
+
+    args = parser.parse_args()
+
+    if args.command == "validate":
+        import asyncio
+        asyncio.run(run_final_validation(fix=args.fix))
+    elif args.command == "cache":
+        if args.cache_command == "dump":
+            dump_cache_command(args.path)
+        else:
+            cache_parser.print_help()
+    else:
+        main()
