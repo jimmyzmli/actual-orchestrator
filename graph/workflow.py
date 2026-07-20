@@ -659,7 +659,6 @@ async def tag_actual_transaction_node(state: ReceiptState):
                 # Fetch initial transaction
                 target_tx_id = tx_id
                 existing_notes = ""
-                is_parent = False
                 is_child = False
                 parent_id = None
                 
@@ -673,7 +672,6 @@ async def tag_actual_transaction_node(state: ReceiptState):
                         if query_data and len(query_data) > 0:
                             tx_data = query_data[0]
                             existing_notes = tx_data.get("notes") or ""
-                            is_parent = tx_data.get("is_parent")
                             is_child = tx_data.get("is_child")
                             parent_id = tx_data.get("parent_id")
                 except Exception as e:
@@ -683,7 +681,6 @@ async def tag_actual_transaction_node(state: ReceiptState):
                 if is_child and parent_id:
                     print(f"Matched child transaction. Resolving to parent {parent_id}")
                     target_tx_id = parent_id
-                    is_parent = True
                     # Fetch parent notes
                     try:
                         res = await session.call_tool("actual_query", {"args": [
@@ -697,45 +694,12 @@ async def tag_actual_transaction_node(state: ReceiptState):
                     except Exception as e:
                         print(f"Failed to fetch parent notes: {e}")
                 
-                # Build enriched notes
-                parsed = state.get("parsed_data")
-                enriched_notes = ""
-                if parsed:
-                    enriched_notes += f"Receipt: {parsed.get('payee', 'Unknown')} ${parsed.get('total', 0):.2f} on {parsed.get('date', 'Unknown')}\n"
-                    items = parsed.get("items", [])
-                    if items:
-                        enriched_notes += "Items:\n"
-                        for item in items:
-                            enriched_notes += f"- {item.get('description', '')}: ${item.get('amount', 0):.2f}\n"
-                
-                # If it's a split parent, fetch children for breakdown
-                if is_parent:
-                    try:
-                        res = await session.call_tool("actual_query", {"args": [
-                            "run", "--table", "transactions", "--filter", json.dumps({"parent_id": target_tx_id}), 
-                            "--select", "amount,category.name", "--format", "json"
-                        ]})
-                        if res.content and len(res.content) > 0:
-                            children = json.loads(res.content[0].text)
-                            if children:
-                                enriched_notes += "Split breakdown:\n"
-                                for child in children:
-                                    cat_name = child.get("category.name") or "Uncategorized"
-                                    # Amount is negative for expenses
-                                    amt = abs(child.get("amount", 0)) / 100
-                                    enriched_notes += f"- {cat_name}: ${amt:.2f}\n"
-                    except Exception as e:
-                        print(f"Failed to fetch child transactions: {e}")
-                
-                # Append #receipt
-                enriched_notes += "#receipt"
-                
-                # Prepend existing notes if present and #receipt not already there
+                # Append #receipt to existing notes
                 if "#receipt" not in existing_notes:
                     if existing_notes.strip():
-                        new_notes = f"{existing_notes.strip()}\n\n{enriched_notes}"
+                        new_notes = f"{existing_notes.strip()} #receipt"
                     else:
-                        new_notes = enriched_notes
+                        new_notes = "#receipt"
                 else:
                     print(f"Transaction {target_tx_id} already has #receipt tag.")
                     # Return potentially updated tx_id if we resolved to parent
@@ -750,7 +714,7 @@ async def tag_actual_transaction_node(state: ReceiptState):
                         "update", target_tx_id,
                         "--data", json.dumps({"notes": new_notes})
                     ]})
-                    print(f"✅ Tagged transaction {target_tx_id} with enriched notes")
+                    print(f"✅ Tagged transaction {target_tx_id} with #receipt")
                     
                 if target_tx_id != tx_id:
                     return {"actual_tx_id": target_tx_id}
