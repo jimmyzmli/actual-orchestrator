@@ -144,7 +144,8 @@ def main():
         import asyncio
         asyncio.run(run_final_validation())
     except KeyboardInterrupt:
-        print("\nProcess interrupted by user. Exiting gracefully.")
+        print("\nProcess interrupted by user. Exiting immediately to prevent background tasks.")
+        os._exit(1)
 
 async def _get_mcp_session():
     """Create and return MCP server params for Actual Budget."""
@@ -725,8 +726,8 @@ async def areview_command():
                 await receipt_processor.ainvoke(None, cfg)
                 print("Done.\n")
             except KeyboardInterrupt:
-                print("\nReview interrupted. State saved, you can resume later.")
-                break
+                print("\nReview interrupted. State saved. Exiting immediately.")
+                os._exit(1)
 
 def review_command():
     import asyncio
@@ -796,4 +797,5 @@ if __name__ == "__main__":
         else:
             main()
     except KeyboardInterrupt:
-        print("\nProcess interrupted by user. Exiting gracefully.")
+        print("\nProcess interrupted by user. Exiting immediately to prevent background tasks.")
+        os._exit(1)
