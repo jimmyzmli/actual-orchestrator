@@ -87,6 +87,12 @@ def main():
     # Use a persistent local directory for testing and caching
     tmpdir = os.path.join(os.getcwd(), "cache")
     os.makedirs(tmpdir, exist_ok=True)
+
+    # Batch-fetch all known source_hashes from PocketBase in one sweep
+    # so the per-file dedup check is an O(1) set lookup, not an HTTP call.
+    from tools.pocketbase_client import fetch_all_source_hashes
+    known_hashes = fetch_all_source_hashes()
+    print(f"Loaded {len(known_hashes)} existing receipt hashes from PocketBase.")
     
     paused_receipts = []
     
@@ -102,11 +108,10 @@ def main():
             else:
                 print(f"Using already downloaded file: {local_path}")
 
-            # Dedup by file content hash
+            # Dedup by file content hash (O(1) set lookup, no HTTP)
             from graph.cache import _file_hash
-            from tools.pocketbase_client import check_receipt_exists
             file_hash = _file_hash(local_path)
-            if check_receipt_exists(file_hash):
+            if file_hash in known_hashes:
                 print(f"Skipping {gdrive_source_ref}: already processed in PocketBase (hash {file_hash[:12]}...).")
                 continue
 
