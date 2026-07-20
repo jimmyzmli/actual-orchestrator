@@ -134,20 +134,32 @@ def main():
             encoded_path = urllib.parse.quote(local_path)
             print(f"File: 'file://{encoded_path}'")
             
-            parsed = st.values.get("parsed_data")
-            if parsed:
-                print(f"Parsed Date:   {parsed.get('date')}")
-                print(f"Parsed Payee:  {parsed.get('payee')}")
-                print(f"Parsed Amount: ${parsed.get('total')}")
+            not_a_receipt = st.values.get("not_a_receipt", False)
             
-            proposed = st.values.get("proposed_transaction")
-            if proposed:
-                print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
-                print(f"{proposed}")
-                ans = input("Do you want to create this transaction? [y/N] (or enter UUID to override): ").strip().lower()
+            if not_a_receipt:
+                print(f"🚫 Content was classified as NOT a receipt.")
+                print(f"   OCR preview: {(st.values.get('ocr_text') or '')[:200]}...")
+                ans = input("Skip this file? [Y/n] (or enter UUID to force-link to a transaction): ").strip().lower()
+                if ans in ("", "y", "yes"):
+                    # User confirms skip — just end this workflow
+                    asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": False}))
+                    print("Skipped.\n")
+                    continue
             else:
-                print(f"⚠️ Agent failed to match or propose a transaction.")
-                ans = input("Enter a valid transaction UUID to override, or 'n' to skip: ").strip().lower()
+                parsed = st.values.get("parsed_data")
+                if parsed:
+                    print(f"Parsed Date:   {parsed.get('date')}")
+                    print(f"Parsed Payee:  {parsed.get('payee')}")
+                    print(f"Parsed Amount: ${parsed.get('total')}")
+                
+                proposed = st.values.get("proposed_transaction")
+                if proposed:
+                    print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
+                    print(f"{proposed}")
+                    ans = input("Do you want to create this transaction? [y/N] (or enter UUID to override): ").strip().lower()
+                else:
+                    print(f"⚠️ Agent failed to match or propose a transaction.")
+                    ans = input("Enter a valid transaction UUID to override, or 'n' to skip: ").strip().lower()
             
             import re
             if re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):

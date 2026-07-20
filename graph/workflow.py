@@ -27,6 +27,7 @@ class ReceiptState(TypedDict, total=False):
     image_paths: List[str] # Paths to extracted JPEG images
     proposed_transaction: str # JSON string of proposed transaction if not found
     human_approved: bool
+    not_a_receipt: bool   # True if content was classified as not a receipt
 
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -119,7 +120,8 @@ def extract_ocr_node(state: ReceiptState):
         return {"status": "error", "error": f"OCR failed: {str(e)}"}
 
 def parse_receipt_node(state: ReceiptState):
-    """Parse the OCR text using DeepSeek"""
+    """Parse the OCR text using DeepSeek. First classifies whether the content
+    is actually a receipt; if not, flags it for human review."""
     try:
         if not state.get("ocr_text"):
             return {"status": "error", "error": "No OCR text found"}
@@ -142,6 +144,20 @@ def parse_receipt_node(state: ReceiptState):
             max_tokens=1024
         )
         
+        # ── Step 1: Classify whether this is actually a receipt ──
+        classify_prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt or invoice (something with items bought and a total amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
+            ("human", "{ocr_text}")
+        ])
+        classify_chain = classify_prompt | llm
+        classify_result = classify_chain.invoke({"ocr_text": state["ocr_text"]})
+        classification = classify_result.content.strip().upper()
+        
+        if "NOT_RECEIPT" in classification:
+            print(f"⚠️  Content classified as NOT a receipt. Flagging for human review.")
+            return {"not_a_receipt": True}
+        
+        # ── Step 2: Structured extraction (only if it IS a receipt) ──
         structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
         
         prompt = ChatPromptTemplate.from_messages([
@@ -711,6 +727,14 @@ def router_check_error(state: ReceiptState):
         return "error"
     return "continue"
 
+def router_after_parse(state: ReceiptState):
+    """Route after parse_receipt: non-receipts go to human review."""
+    if state.get("status") == "error":
+        return "error"
+    if state.get("not_a_receipt"):
+        return "human_approval"
+    return "continue"
+
 def router_after_search(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
@@ -743,7 +767,7 @@ workflow.set_entry_point("dedup_check")
 
 workflow.add_conditional_edges("dedup_check", router_after_dedup, {"skip": END, "continue": "extract_ocr"})
 workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "parse_receipt"})
-workflow.add_conditional_edges("parse_receipt", router_check_error, {"error": END, "continue": "search_actual"})
+workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_actual"})
 workflow.add_conditional_edges("search_actual", router_after_search, {"error": END, "human_approval": "human_approval", "save_pocketbase": "tag_actual"})
 workflow.add_conditional_edges("human_approval", router_after_human, {"create_actual": "create_actual", "save_pocketbase": "tag_actual", "skip": END})
 workflow.add_conditional_edges("create_actual", router_check_error, {"error": END, "continue": "tag_actual"})
