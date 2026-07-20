@@ -513,6 +513,9 @@ def dump_cache_command(dump_path: str):
         out_filepath = os.path.join(dump_path, safe_name)
         
         with open(out_filepath, "w") as out:
+            out.write("=== Metadata ===\n")
+            out.write(f"ID: {file_hash}\n")
+            out.write(f"Original File: {original_name}\n\n")
             out.write("=== Raw OCR Text (Model: gemini-3.1-flash-lite) ===\n")
             out.write(ocr_text or "")
             out.write("\n\n=== Parsed JSON (Model: deepseek-v4-flash) ===\n")
@@ -526,6 +529,95 @@ def dump_cache_command(dump_path: str):
                 out.write("None")
                 
     print(f"Dumped {len(keys)} cache entries to {dump_path}")
+
+def prune_cache_command():
+    from tools.pocketbase_client import fetch_all_source_hashes
+    from graph.cache import _get_client
+    import os
+    
+    known_hashes = fetch_all_source_hashes()
+    client = _get_client()
+    
+    deleted_redis = 0
+    for file_hash in known_hashes:
+        keys = client.keys(f"receipt:{file_hash}:*")
+        if keys:
+            client.delete(*keys)
+            deleted_redis += len(keys)
+            
+    print(f"Pruned {deleted_redis} Redis cache entries for already processed receipts.")
+    
+    local_cache_dir = os.path.join(os.getcwd(), "cache")
+    deleted_local = 0
+    if os.path.exists(local_cache_dir):
+        from graph.cache import _file_hash
+        for filename in os.listdir(local_cache_dir):
+            file_path = os.path.join(local_cache_dir, filename)
+            if os.path.isfile(file_path):
+                try:
+                    fhash = _file_hash(file_path)
+                    if fhash in known_hashes:
+                        os.unlink(file_path)
+                        deleted_local += 1
+                except Exception:
+                    pass
+    
+    print(f"Pruned {deleted_local} local cache files for already processed receipts.")
+
+def clear_cache_command():
+    from graph.cache import _get_client
+    import os, shutil
+    
+    client = _get_client()
+    keys = client.keys("receipt:*")
+    if keys:
+        client.delete(*keys)
+        print(f"Cleared {len(keys)} entries from Redis cache.")
+    else:
+        print("Redis cache is already empty.")
+    
+    local_cache_dir = os.path.join(os.getcwd(), "cache")
+    if os.path.exists(local_cache_dir):
+        shutil.rmtree(local_cache_dir)
+        print(f"Cleared local file cache at {local_cache_dir}")
+    else:
+        print("Local cache is already empty.")
+
+def purge_cache_command(ids: list[str]):
+    from graph.cache import _get_client, _file_hash
+    import os
+    
+    if not ids:
+        print("No IDs provided to purge.")
+        return
+        
+    client = _get_client()
+    ids_set = set(ids)
+    
+    deleted_redis = 0
+    for file_hash in ids_set:
+        keys = client.keys(f"receipt:{file_hash}:*")
+        if keys:
+            client.delete(*keys)
+            deleted_redis += len(keys)
+            
+    print(f"Purged {deleted_redis} Redis cache entries for {len(ids_set)} specified IDs.")
+    
+    local_cache_dir = os.path.join(os.getcwd(), "cache")
+    deleted_local = 0
+    if os.path.exists(local_cache_dir):
+        for filename in os.listdir(local_cache_dir):
+            file_path = os.path.join(local_cache_dir, filename)
+            if os.path.isfile(file_path):
+                try:
+                    fhash = _file_hash(file_path)
+                    if fhash in ids_set:
+                        os.unlink(file_path)
+                        deleted_local += 1
+                except Exception:
+                    pass
+                    
+    print(f"Purged {deleted_local} local cache files for specified IDs.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
@@ -542,6 +634,12 @@ if __name__ == "__main__":
     cache_dump_parser = cache_subparsers.add_parser("dump", help="Dump Redis nodecache to a directory")
     cache_dump_parser.add_argument("path", help="Directory path to dump the cache files")
 
+    cache_prune_parser = cache_subparsers.add_parser("prune", help="Remove cache for entries that exist in Pocketbase")
+    cache_clear_parser = cache_subparsers.add_parser("clear", help="Remove all cache used by the application")
+    
+    cache_purge_parser = cache_subparsers.add_parser("purge", help="Remove cache for specific entry IDs")
+    cache_purge_parser.add_argument("ids", nargs="+", help="List of cache entry IDs (hashes) to purge")
+
     args = parser.parse_args()
 
     if args.command == "validate":
@@ -550,6 +648,12 @@ if __name__ == "__main__":
     elif args.command == "cache":
         if args.cache_command == "dump":
             dump_cache_command(args.path)
+        elif args.cache_command == "prune":
+            prune_cache_command()
+        elif args.cache_command == "clear":
+            clear_cache_command()
+        elif args.cache_command == "purge":
+            purge_cache_command(args.ids)
         else:
             cache_parser.print_help()
     else:
