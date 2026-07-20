@@ -187,14 +187,15 @@ async def run_final_validation(fix=False):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     
-                    print("Fetching accounts...")
-                    res_accounts = await session.call_tool("actual_accounts", {"args": ["list"]})
+                    print(f"Fetching all transactions across all accounts...")
+                    res_accounts = await session.call_tool("actual_query", {"args": [
+                        "run", "--table", "accounts", "--select", "id", "--format", "json"
+                    ]})
                     if not res_accounts.content:
                         print("No accounts returned from Actual Budget.")
                         return
                     accounts = json.loads(res_accounts.content[0].text)
                     
-                    print(f"Fetching all transactions across {len(accounts)} accounts...")
                     for acc in accounts:
                         res_list = await session.call_tool("actual_transactions", {"args": [
                             "list", "--account", acc["id"],
@@ -246,7 +247,25 @@ async def run_final_validation(fix=False):
                 
     # 4. Find mismatches
     in_pb_not_actual = resolved_pb_tx_ids - actual_tx_ids
-    in_actual_not_pb = actual_tx_ids - resolved_pb_tx_ids
+    
+    in_actual_not_pb = set()
+    for tx_id in actual_tx_ids:
+        if tx_id in resolved_pb_tx_ids:
+            continue
+        # Actual Budget automatically syncs notes between transfer pairs.
+        # If the other side of the transfer is in PocketBase, don't flag this side as dangling.
+        tx = actual_db.get(tx_id)
+        if tx and tx.get("transfer_id"):
+            transfer_partner_id = tx.get("transfer_id")
+            partner_tx = actual_db.get(transfer_partner_id)
+            if partner_tx and partner_tx.get("is_child") and partner_tx.get("parent_id"):
+                resolved_partner_id = partner_tx.get("parent_id")
+            else:
+                resolved_partner_id = transfer_partner_id
+                
+            if resolved_partner_id in resolved_pb_tx_ids:
+                continue
+        in_actual_not_pb.add(tx_id)
     
     if not in_pb_not_actual and not in_actual_not_pb:
         print("✅ Validation passed. All receipts perfectly synced.")
