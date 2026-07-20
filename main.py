@@ -663,6 +663,26 @@ def flag_source_command(filename: str):
     except Exception as e:
         print(f"Failed to move file using rclone: {e}")
 
+def flag_pb_command(pb_id: str):
+    from tools.pocketbase_client import get_pb_client
+    
+    client = get_pb_client()
+    try:
+        record = client.collection("receipts").get_one(pb_id)
+        source_hash = getattr(record, "source_hash", None)
+        
+        if source_hash:
+            # Purge cache for this hash
+            purge_cache_command([source_hash])
+        else:
+            print(f"No source_hash found for PocketBase record {pb_id}")
+        
+        # Delete from pocketbase
+        client.collection("receipts").delete(pb_id)
+        print(f"Deleted PocketBase record {pb_id}")
+    except Exception as e:
+        print(f"Failed to flag and delete PocketBase record {pb_id}: {e}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
     subparsers = parser.add_subparsers(dest="command")
@@ -684,12 +704,15 @@ if __name__ == "__main__":
     cache_purge_parser = cache_subparsers.add_parser("purge", help="Remove cache for specific entry IDs")
     cache_purge_parser.add_argument("ids", nargs="+", help="List of cache entry IDs (hashes) to purge")
 
-    # `source` subcommand
-    source_parser = subparsers.add_parser("source", help="Manage source files")
-    source_subparsers = source_parser.add_subparsers(dest="source_command")
+    # `flag` subcommand
+    flag_parser = subparsers.add_parser("flag", help="Flag a file or pocketbase entry for deletion/cleanup")
+    flag_subparsers = flag_parser.add_subparsers(dest="flag_command")
     
-    source_flag_parser = source_subparsers.add_parser("flag", help="Flag a file as not a receipt, delete from PB, move to non-receipts folder")
-    source_flag_parser.add_argument("filename", help="File name relative to RECEIPT_GDRIVE_PATH")
+    flag_source_parser = flag_subparsers.add_parser("source", help="Flag a source file as not a receipt, delete from PB, move to non-receipts folder")
+    flag_source_parser.add_argument("filename", help="File name relative to RECEIPT_GDRIVE_PATH")
+
+    flag_pb_parser = flag_subparsers.add_parser("pb", help="Flag a pocketbase entry, delete from PB, purge cache")
+    flag_pb_parser.add_argument("pb_id", help="Pocketbase ID")
 
     args = parser.parse_args()
 
@@ -707,10 +730,12 @@ if __name__ == "__main__":
             purge_cache_command(args.ids)
         else:
             cache_parser.print_help()
-    elif args.command == "source":
-        if args.source_command == "flag":
+    elif args.command == "flag":
+        if args.flag_command == "source":
             flag_source_command(args.filename)
+        elif args.flag_command == "pb":
+            flag_pb_command(args.pb_id)
         else:
-            source_parser.print_help()
+            flag_parser.print_help()
     else:
         main()
