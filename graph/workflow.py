@@ -783,7 +783,9 @@ def router_after_human(state: ReceiptState):
         return "create_actual"
     return "skip"
 
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+import sqlite3
+import os
 
 # Build Graph
 workflow = StateGraph(ReceiptState)
@@ -808,5 +810,8 @@ workflow.add_conditional_edges("create_actual", router_check_error, {"error": EN
 workflow.add_edge("tag_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", END)
 
-memory = MemorySaver()
+os.makedirs("data", exist_ok=True)
+_conn = sqlite3.connect("data/checkpoints.sqlite", check_same_thread=False)
+memory = SqliteSaver(_conn)
+memory.setup()
 receipt_processor = workflow.compile(checkpointer=memory, interrupt_before=["human_approval"])

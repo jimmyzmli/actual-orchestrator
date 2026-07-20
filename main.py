@@ -126,56 +126,16 @@ def main():
             print(f"Failed to process {filename}: {e}")
 
     if paused_receipts:
-        import asyncio
-        print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_receipts)} receipts)\n{'='*50}")
-        for ref, local_path, cfg, st in paused_receipts:
-            print(f"\nReviewing: {ref}")
-            import urllib.parse
-            encoded_path = urllib.parse.quote(local_path)
-            print(f"File: 'file://{encoded_path}'")
-            
-            not_a_receipt = st.values.get("not_a_receipt", False)
-            
-            if not_a_receipt:
-                print(f"🚫 Content was classified as NOT a receipt.")
-                print(f"   OCR preview: {(st.values.get('ocr_text') or '')[:200]}...")
-                ans = input("Skip this file? [Y/n] (or enter UUID to force-link to a transaction): ").strip().lower()
-                if ans in ("", "y", "yes"):
-                    # User confirms skip — just end this workflow
-                    asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": False}))
-                    print("Skipped.\n")
-                    continue
-            else:
-                parsed = st.values.get("parsed_data")
-                if parsed:
-                    print(f"Parsed Date:   {parsed.get('date')}")
-                    print(f"Parsed Payee:  {parsed.get('payee')}")
-                    print(f"Parsed Amount: ${parsed.get('total')}")
-                
-                proposed = st.values.get("proposed_transaction")
-                if proposed:
-                    print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
-                    print(f"{proposed}")
-                    ans = input("Do you want to create this transaction? [y/N] (or enter UUID to override): ").strip().lower()
-                else:
-                    print(f"⚠️ Agent failed to match or propose a transaction.")
-                    ans = input("Enter a valid transaction UUID to override, or 'n' to skip: ").strip().lower()
-            
-            import re
-            if re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):
-                asyncio.run(receipt_processor.aupdate_state(cfg, {"actual_tx_id": ans, "human_approved": False}))
-            else:
-                approved = bool(proposed and ans in ("y", "yes"))
-                asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": approved}))
-            
-            print(f"Resuming workflow for {ref}...")
-            asyncio.run(receipt_processor.ainvoke(None, cfg))
-            print("Done.\n")
+        print(f"\n{len(paused_receipts)} receipts require manual review.")
+        print("Run 'python main.py review' to process them.")
     else:
         print("\nAll receipts processed successfully! No manual reviews needed.")
         
-    import asyncio
-    asyncio.run(run_final_validation())
+    try:
+        import asyncio
+        asyncio.run(run_final_validation())
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Exiting gracefully.")
 
 async def _get_mcp_session():
     """Create and return MCP server params for Actual Budget."""
@@ -683,9 +643,82 @@ def flag_pb_command(pb_id: str):
     except Exception as e:
         print(f"Failed to flag and delete PocketBase record {pb_id}: {e}")
 
+def review_command():
+    import asyncio
+    import urllib.parse
+    import re
+    from graph.workflow import receipt_processor, memory
+    
+    paused_states = []
+    # Find all states that are paused
+    for snap in memory.list(None):
+        if snap.next and "human_approval" in snap.next:
+            paused_states.append(snap)
+            
+    if not paused_states:
+        print("No receipts waiting for manual review.")
+        return
+        
+    print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_states)} receipts)\n{'='*50}")
+    for snap in paused_states:
+        cfg = snap.config
+        st = snap
+        ref = cfg["configurable"]["thread_id"]
+        local_path = st.values.get("file_path", "")
+        
+        print(f"\nReviewing: {ref}")
+        if local_path:
+            encoded_path = urllib.parse.quote(local_path)
+            print(f"File: 'file://{encoded_path}'")
+        
+        not_a_receipt = st.values.get("not_a_receipt", False)
+        
+        try:
+            if not_a_receipt:
+                print(f"🚫 Content was classified as NOT a receipt.")
+                print(f"   OCR preview: {(st.values.get('ocr_text') or '')[:200]}...")
+                ans = input("Skip this file? [Y/n] (or enter UUID to force-link to a transaction): ").strip().lower()
+                if ans in ("", "y", "yes"):
+                    asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": False}))
+                    print("Skipped.\n")
+                    # Advance state
+                    asyncio.run(receipt_processor.ainvoke(None, cfg))
+                    continue
+            else:
+                parsed = st.values.get("parsed_data")
+                if parsed:
+                    print(f"Parsed Date:   {parsed.get('date')}")
+                    print(f"Parsed Payee:  {parsed.get('payee')}")
+                    print(f"Parsed Amount: ${parsed.get('total')}")
+                
+                proposed = st.values.get("proposed_transaction")
+                if proposed:
+                    print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
+                    print(f"{proposed}")
+                    ans = input("Do you want to create this transaction? [y/N] (or enter UUID to override): ").strip().lower()
+                else:
+                    print(f"⚠️ Agent failed to match or propose a transaction.")
+                    ans = input("Enter a valid transaction UUID to override, or 'n' to skip: ").strip().lower()
+            
+            if re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):
+                asyncio.run(receipt_processor.aupdate_state(cfg, {"actual_tx_id": ans, "human_approved": False}))
+            else:
+                approved = bool(proposed and ans in ("y", "yes"))
+                asyncio.run(receipt_processor.aupdate_state(cfg, {"human_approved": approved}))
+            
+            print(f"Resuming workflow for {ref}...")
+            asyncio.run(receipt_processor.ainvoke(None, cfg))
+            print("Done.\n")
+        except KeyboardInterrupt:
+            print("\nReview interrupted. State saved, you can resume later.")
+            break
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
     subparsers = parser.add_subparsers(dest="command")
+
+    # `review` subcommand
+    review_parser = subparsers.add_parser("review", help="Review paused receipts")
 
     # `validate` subcommand
     validate_parser = subparsers.add_parser("validate", help="Run final validation between PocketBase and Actual Budget")
@@ -716,26 +749,31 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.command == "validate":
-        import asyncio
-        asyncio.run(run_final_validation(fix=args.fix))
-    elif args.command == "cache":
-        if args.cache_command == "dump":
-            dump_cache_command(args.path)
-        elif args.cache_command == "prune":
-            prune_cache_command()
-        elif args.cache_command == "clear":
-            clear_cache_command()
-        elif args.cache_command == "purge":
-            purge_cache_command(args.ids)
+    try:
+        if args.command == "validate":
+            import asyncio
+            asyncio.run(run_final_validation(fix=args.fix))
+        elif args.command == "review":
+            review_command()
+        elif args.command == "cache":
+            if args.cache_command == "dump":
+                dump_cache_command(args.path)
+            elif args.cache_command == "prune":
+                prune_cache_command()
+            elif args.cache_command == "clear":
+                clear_cache_command()
+            elif args.cache_command == "purge":
+                purge_cache_command(args.ids)
+            else:
+                cache_parser.print_help()
+        elif args.command == "flag":
+            if args.flag_command == "source":
+                flag_source_command(args.filename)
+            elif args.flag_command == "pb":
+                flag_pb_command(args.pb_id)
+            else:
+                flag_parser.print_help()
         else:
-            cache_parser.print_help()
-    elif args.command == "flag":
-        if args.flag_command == "source":
-            flag_source_command(args.filename)
-        elif args.flag_command == "pb":
-            flag_pb_command(args.pb_id)
-        else:
-            flag_parser.print_help()
-    else:
-        main()
+            main()
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user. Exiting gracefully.")
