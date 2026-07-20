@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 from pdf2image import convert_from_path
 
-from tools.actual_mcp import find_or_create_transaction
+
 from tools.pocketbase_client import save_receipt, check_receipt_exists
 from graph.cache import get_ocr, set_ocr, get_parsed, set_parsed, _file_hash
 
@@ -39,6 +39,17 @@ class ParsedReceipt(BaseModel):
     total: float = Field(description="Total amount of the receipt")
     payee: str = Field(description="Name of the store or payee")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
+
+class ProposedTransaction(BaseModel):
+    date: str = Field(description="Date in YYYY-MM-DD format")
+    amount_cents: int = Field(description="Amount in integer cents (e.g. 1500 for $15.00, or -1500 for an expense). Note: expenses MUST be negative.")
+    payee_name: str = Field(description="Name of the payee")
+    account_id: str = Field(description="ID of the selected account")
+    notes: str = Field(description="Notes to attach to the transaction")
+
+class TransactionMatchResult(BaseModel):
+    matched_id: str | None = Field(description="The UUID of the best matching candidate transaction, if any. Leave null if no good match.")
+    proposed_transaction: ProposedTransaction | None = Field(description="If no good match was found, propose a new transaction to create. Leave null if matched_id is provided.")
 
 def skip_if_processed(state: ReceiptState):
     """Check PocketBase source_hash to skip already-processed files."""
@@ -297,12 +308,37 @@ async def _deterministic_search(session, receipt_date: str, receipt_cents: int,
     try:
         res = await session.call_tool("actual_query", {"args": [
             "run", "--table", "transactions",
-            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name",
+            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name,is_child,parent_id",
             "--filter", json.dumps(filter_obj),
             "--format", "json",
         ]})
         raw = res.content[0].text if res.content else "[]"
-        candidates = json.loads(raw) if isinstance(raw, str) else []
+        raw_candidates = json.loads(raw) if isinstance(raw, str) else []
+        
+        # Reconstruct parents from children since actual_query filters parents out
+        parent_map = {}
+        candidates = []
+        for c in raw_candidates:
+            if c.get("is_child") and c.get("parent_id"):
+                pid = c["parent_id"]
+                if pid not in parent_map:
+                    parent_map[pid] = {
+                        "id": pid,
+                        "date": c.get("date"),
+                        "amount": 0,
+                        "payee.name": c.get("payee.name"),
+                        "imported_payee": c.get("imported_payee"),
+                        "notes": c.get("notes") or "",
+                        "account.name": c.get("account.name")
+                    }
+                parent_map[pid]["amount"] += c.get("amount", 0)
+                # Ensure we catch #receipt if it's on any child
+                if "#receipt" in (c.get("notes") or "") and "#receipt" not in parent_map[pid]["notes"]:
+                    parent_map[pid]["notes"] += " #receipt"
+            else:
+                candidates.append(c)
+        candidates.extend(parent_map.values())
+        
     except Exception as e:
         print(f"⚠️ Deterministic query failed: {e}")
         return []
@@ -488,86 +524,98 @@ async def search_actual_transaction_node(state: ReceiptState):
 
                 # ── Step 3: Agent fallback ──
                 if final_id == "unknown_id" and proposed_tx is None:
-                    print("  🔄 Falling back to agent-based search...")
-                    mcp_tools = await load_mcp_tools(session)
-                    search_tools = [t for t in mcp_tools if "actual_query" in t.name or "actual_accounts" in t.name]
+                    print("  🔄 Falling back to LLM structured selection...")
                     
-                    for model_name in ["deepseek-v4-flash", "deepseek-v4-pro"]:
-                        if model_name != "deepseek-v4-flash":
-                            print(f"Retrying agent match with {model_name}...")
+                    # Pre-filter scored candidates by amount to save tokens
+                    expected_amt = receipt_cents
+                    min_allowed = expected_amt * 0.90
+                    max_allowed = expected_amt * 1.30
+                    
+                    narrowed_candidates = []
+                    for c in scored:
+                        actual_amt = abs(c.get("amount", 0))
+                        if min_allowed <= actual_amt <= max_allowed:
+                            narrowed_candidates.append({
+                                "id": c.get("id"),
+                                "date": c.get("date"),
+                                "amount": c.get("amount"),
+                                "payee": c.get("payee.name") or c.get("imported_payee"),
+                                "account": c.get("account.name"),
+                                "notes": c.get("notes")
+                            })
                             
-                        llm = ChatOpenAI(
-                            model=model_name, 
-                            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-                            base_url="https://api.deepseek.com/v1"
-                        )
-                        
-                        agent = create_react_agent(llm, tools=search_tools)
-                        
-                        prompt = f"""
-                        You are a financial assistant connecting to Actual Budget.
-                        We have a new parsed receipt:
-                        - Date: {date}
-                        - Amount: ${amount}
-                        - Payee: {payee}
-                        - Notes to append: {notes}
-                        
-                        Task:
-                        1. Use actual_query to search transactions within +/- 7 days of {date}. Look for an amount between ${amount * 0.90:.2f} and ${amount * 1.30:.2f} (convert to cents, expenses are negative!). Make sure to filter for on budget transactions by including "account.offbudget": false in the filter.
-                        2. If found, verify that the payee or transaction context matches '{payee}'. If it's a good match, return its ID. If multiple match, pick the best one based on Payee similarity.
-                        3. If NOT found, use actual_accounts to list accounts. Pick the most logical account for this payee (e.g. Chequing or Credit Card, avoid off-budget).
-                        
-                        IMPORTANT: 
-                        - If you FOUND it, your final message MUST be EXACTLY the 36-character TRANSACTION UUID.
-                        - If you did NOT find it, your final message MUST be EXACTLY a JSON block containing the proposed transaction: {{"date": "{date}", "amount_cents": <amount in cents>, "payee_name": "{payee}", "account_id": "<selected account id>", "notes": "<notes>"}}. Do not output anything else.
-                        """
-                        
-                        res = await agent.ainvoke({"messages": [HumanMessage(content=prompt)]})
-                        content = res["messages"][-1].content.strip()
-                        
-                        import re
-                        uuid_match = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', content, re.IGNORECASE)
-                        if uuid_match:
-                            final_id = uuid_match.group(0)
-                            print(f"Agent found tx: {final_id}")
-                            
-                            # FUZZY AMOUNT VALIDATION
-                            query_tool = next((t for t in mcp_tools if t.name == "actual_query"), None)
-                            if query_tool:
-                                try:
-                                    q_res = await query_tool.ainvoke({"args": ["run", "--table", "transactions", "--filter", json.dumps({"id": final_id}), "--select", "id,amount", "--format", "json"]})
-                                    q_text = q_res[0].get("text", "[]") if isinstance(q_res, list) else getattr(q_res, "text", "[]")
-                                    if isinstance(q_text, str):
-                                        q_json = json.loads(q_text)
-                                        if len(q_json) > 0:
-                                            actual_amt = q_json[0].get("amount", 0)
-                                            expected_amt = int(amount * 100)
-                                            
-                                            abs_actual = abs(actual_amt)
-                                            abs_expected = abs(expected_amt)
-                                            min_allowed = abs_expected * 0.90
-                                            max_allowed = abs_expected * 1.30
-                                            
-                                            if not (min_allowed <= abs_actual <= max_allowed):
-                                                print(f"❌ VALIDATION FAILED: Actual Budget amount ${abs_actual/100:.2f} is outside the allowed range for parsed receipt amount ${amount:.2f}. Rejecting match.")
-                                                final_id = "unknown_id"
-                                        else:
-                                            print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not found in Actual Budget.")
-                                            final_id = "unknown_id"
-                                except Exception as e:
-                                    print(f"Warning: Failed to validate amount: {e}")
-                            
-                            if final_id != "unknown_id":
-                                break  # Success, exit loop
-                        else:
-                            # Attempt to extract JSON
-                            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                            if json_match:
-                                proposed_tx = json_match.group(0)
-                                print(f"Agent proposed tx: {proposed_tx}")
+                    # Fetch available accounts to propose a new transaction
+                    available_accounts = []
+                    try:
+                        res = await session.call_tool("actual_query", {"args": [
+                            "run", "--table", "accounts", "--select", "id,name,offbudget,closed", "--format", "json"
+                        ]})
+                        raw = res.content[0].text if res.content else "[]"
+                        all_accounts = json.loads(raw) if isinstance(raw, str) else []
+                        available_accounts = [
+                            a for a in all_accounts
+                            if not a.get("closed", False) and not a.get("offbudget", False)
+                        ]
+                    except Exception as e:
+                        print(f"⚠️ Failed to fetch accounts: {e}")
+                    
+                    llm = ChatOpenAI(
+                        model="deepseek-v4-flash", 
+                        api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
+                        base_url="https://api.deepseek.com/v1"
+                    )
+                    
+                    structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode")
+                    
+                    prompt_text = f"""You are a financial assistant connecting to Actual Budget.
+We have a new parsed receipt:
+- Date: {date}
+- Amount: ${amount}
+- Payee: {payee}
+- Notes to append: {notes}
+
+Here are the deterministically filtered candidate transactions from the bank (within +/- 7 days and amount +/- 30%):
+{json.dumps(narrowed_candidates, indent=2) if narrowed_candidates else "[]"}
+
+Here are the available open, on-budget accounts:
+{json.dumps(available_accounts, indent=2) if available_accounts else "[]"}
+
+Task:
+1. Review the provided candidate transactions. If one is a good match based on Payee and Amount similarity, set `matched_id` to its ID.
+2. If NO good match is found in the candidates, you must propose a new transaction by filling out `proposed_transaction`.
+3. For a proposed transaction, pick the most logical account ID from the available accounts based on the payee.
+4. Output EXACTLY a JSON object matching this schema:
+{{
+  "matched_id": "string UUID or null",
+  "proposed_transaction": {{
+    "date": "YYYY-MM-DD",
+    "amount_cents": -1500,  // Note: expenses MUST be negative
+    "payee_name": "string",
+    "account_id": "string",
+    "notes": "string"
+  }} // or null if matched_id is provided
+}}"""
+                    
+                    try:
+                        result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
+                        if result.matched_id:
+                            final_id = result.matched_id
+                            print(f"Agent matched tx: {final_id}")
+                            # Validate that the ID actually exists in the narrowed candidates
+                            matched = next((c for c in narrowed_candidates if c["id"] == final_id), None)
+                            if matched:
+                                print(f"✅ Agent selected valid candidate: {final_id}")
                             else:
-                                print(f"Agent output didn't contain UUID or JSON: {content}")
-                    
+                                print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the narrowed candidates.")
+                                final_id = "unknown_id"
+                        elif result.proposed_transaction:
+                            proposed_tx = json.dumps(result.proposed_transaction.model_dump())
+                            print(f"Agent proposed tx: {proposed_tx}")
+                        else:
+                            print(f"Agent output didn't contain matched_id or proposed_transaction")
+                    except Exception as e:
+                        print(f"Warning: Failed to parse structured output from LLM: {e}")
+                        
     except Exception as e:
         if final_id != "unknown_id" and proposed_tx is None and ("TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e)):
             print("Ignored MCP shutdown error, agent succeeded.")
@@ -635,7 +683,7 @@ async def create_actual_transaction_node(state: ReceiptState):
                     query_tool = next((t for t in mcp_tools if t.name == "actual_query"), None)
                     if query_tool:
                         try:
-                            q_res = await query_tool.ainvoke({"args": ["run", "--table", "transactions", "--filter", json.dumps({"id": final_id}), "--select", "id", "--format", "json"]})
+                            q_res = await query_tool.ainvoke({"args": ["run", "--table", "transactions", "--filter", json.dumps({"$or": [{"id": final_id}, {"parent_id": final_id}]}), "--select", "id", "--format", "json"]})
                             q_text = q_res[0].get("text", "[]") if isinstance(q_res, list) else getattr(q_res, "text", "[]")
                             if isinstance(q_text, str):
                                 q_json = json.loads(q_text)
@@ -682,7 +730,7 @@ async def tag_actual_transaction_node(state: ReceiptState):
                 try:
                     res = await session.call_tool("actual_query", {"args": [
                         "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), 
-                        "--select", "id,notes,is_parent,is_child,parent_id", "--format", "json"
+                        "--select", "id,notes,is_parent,is_child,parent_id,account,date", "--format", "json"
                     ]})
                     if res.content and len(res.content) > 0:
                         query_data = json.loads(res.content[0].text)
@@ -691,6 +739,19 @@ async def tag_actual_transaction_node(state: ReceiptState):
                             existing_notes = tx_data.get("notes") or ""
                             is_child = tx_data.get("is_child")
                             parent_id = tx_data.get("parent_id")
+                        else:
+                            # It might be a parent transaction (actual_query filters them out)
+                            # Try to find its children to get account and date
+                            c_res = await session.call_tool("actual_query", {"args": [
+                                "run", "--table", "transactions", "--filter", json.dumps({"parent_id": tx_id}), 
+                                "--select", "account,date", "--format", "json"
+                            ]})
+                            if c_res.content and len(c_res.content) > 0:
+                                c_data = json.loads(c_res.content[0].text)
+                                if c_data and len(c_data) > 0:
+                                    tx_data = c_data[0]
+                                    is_child = True # Force resolution block
+                                    parent_id = tx_id
                 except Exception as e:
                     print(f"Failed to fetch transaction details: {e}")
                     
@@ -698,16 +759,31 @@ async def tag_actual_transaction_node(state: ReceiptState):
                 if is_child and parent_id:
                     print(f"Matched child transaction. Resolving to parent {parent_id}")
                     target_tx_id = parent_id
-                    # Fetch parent notes
+                    # Fetch parent notes and split breakdown using list API
                     try:
-                        res = await session.call_tool("actual_query", {"args": [
-                            "run", "--table", "transactions", "--filter", json.dumps({"id": target_tx_id}), 
-                            "--select", "id,notes", "--format", "json"
-                        ]})
-                        if res.content and len(res.content) > 0:
-                            query_data = json.loads(res.content[0].text)
-                            if query_data and len(query_data) > 0:
-                                existing_notes = query_data[0].get("notes") or ""
+                        acc = tx_data.get("account")
+                        dt = tx_data.get("date")
+                        if acc and dt:
+                            list_res = await session.call_tool("actual_transactions", {"args": [
+                                "list", "--account", acc,
+                                "--start", dt, "--end", dt,
+                                "--format", "json"
+                            ]})
+                            if list_res.content and len(list_res.content) > 0:
+                                txs = json.loads(list_res.content[0].text)
+                                for t in txs:
+                                    if t.get("id") == target_tx_id:
+                                        existing_notes = t.get("notes") or ""
+                                        children = t.get("subtransactions", [])
+                                        if children:
+                                            breakdown = "\nSplit breakdown:\n"
+                                            for child in children:
+                                                cat_name = child.get("category.name") or "Uncategorized"
+                                                amt = abs(child.get("amount", 0)) / 100
+                                                breakdown += f"- {cat_name}: ${amt:.2f}\n"
+                                            if "Split breakdown:" not in existing_notes:
+                                                existing_notes += breakdown
+                                        break
                     except Exception as e:
                         print(f"Failed to fetch parent notes: {e}")
                 
