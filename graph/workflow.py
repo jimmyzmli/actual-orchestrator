@@ -163,6 +163,9 @@ def parse_receipt_node(state: ReceiptState):
             max_tokens=1024
         )
         
+        from peak_hours import pause_if_peak_hours
+        pause_if_peak_hours("deepseek")
+        
         # ── Step 1: Classify whether this is actually a receipt ──
         classify_prompt = ChatPromptTemplate.from_messages([
             ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record (anything representing a financial transaction with a date and amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
@@ -613,6 +616,9 @@ Task:
                     
                     print(f"  [Token Est] Fallback agent prompt: ~{estimate_tokens(prompt_text)} tokens")
                     
+                    from peak_hours import pause_if_peak_hours
+                    pause_if_peak_hours("deepseek")
+                    
                     try:
                         result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
                         if result.matched_id:
@@ -686,6 +692,9 @@ async def create_actual_transaction_node(state: ReceiptState):
                 
                 IMPORTANT: YOUR FINAL MESSAGE MUST BE EXACTLY THE 36-CHARACTER TRANSACTION UUID. Do not say "The ID is...". Just output the UUID string.
                 """
+                
+                from peak_hours import pause_if_peak_hours
+                pause_if_peak_hours("deepseek")
                 
                 res = await agent.ainvoke({"messages": [HumanMessage(content=prompt)]})
                 content = res["messages"][-1].content.strip()

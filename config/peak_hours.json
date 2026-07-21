@@ -1,0 +1,23 @@
+{
+  "timezone": "America/New_York",
+  "models": {
+    "deepseek": [
+      {
+        "name": "Summer Schedule (EDT)",
+        "is_dst": true,
+        "windows": [
+          {"start": "21:00", "end": "23:59"},
+          {"start": "02:00", "end": "06:00"}
+        ]
+      },
+      {
+        "name": "Winter Schedule (EST)",
+        "is_dst": false,
+        "windows": [
+          {"start": "20:00", "end": "23:00"},
+          {"start": "01:00", "end": "05:00"}
+        ]
+      }
+    ]
+  }
+}

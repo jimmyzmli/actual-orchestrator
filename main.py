@@ -102,6 +102,9 @@ def process_receipt(local_path: str, gdrive_source_ref: str, include_flagged: li
     return asyncio.run(run_flow())
 
 def main(include_flagged: list = None):
+    from peak_hours import print_peak_hours_warning
+    print_peak_hours_warning("deepseek")
+    
     gdrive_path = os.environ.get("RECEIPT_GDRIVE_PATH")
     if not gdrive_path:
         print("RECEIPT_GDRIVE_PATH not set in .env")
@@ -808,11 +811,13 @@ def review_command(review_types: list = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
     parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Re-run flagged receipts of this type (when running default process)")
+    parser.add_argument("--allow-peak-hours", action="store_true", help="Ignore peak hours warning and continue without pausing")
     subparsers = parser.add_subparsers(dest="command")
     
     # `process` subcommand
     process_parser = subparsers.add_parser("process", help="Process receipts (default)")
     process_parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Re-run flagged receipts of this type")
+    process_parser.add_argument("--allow-peak-hours", action="store_true", help="Ignore peak hours warning and continue without pausing")
 
     # `review` subcommand
     review_parser = subparsers.add_parser("review", help="Review paused receipts")
@@ -847,6 +852,9 @@ if __name__ == "__main__":
     flag_pb_parser.add_argument("pb_id", help="Pocketbase ID")
 
     args = parser.parse_args()
+
+    if getattr(args, "allow_peak_hours", False):
+        os.environ["ALLOW_PEAK_HOURS"] = "1"
 
     try:
         cmd = args.command or "process"
