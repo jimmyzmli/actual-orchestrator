@@ -236,7 +236,11 @@ async def run_final_validation(fix=False):
                     if not res_accounts.content:
                         print("No accounts returned from Actual Budget.")
                         return
-                    accounts = json.loads(res_accounts.content[0].text)
+                    try:
+                        accounts = json.loads(res_accounts.content[0].text)
+                    except json.JSONDecodeError:
+                        print(f"❌ Failed to parse accounts JSON. Raw response:\n{res_accounts.content[0].text}")
+                        raise Exception("Invalid JSON from actual-mcp")
                     
                     for acc in accounts:
                         res_list = await session.call_tool("actual_transactions", {"args": [
@@ -259,8 +263,10 @@ async def run_final_validation(fix=False):
                 print(f"⏳ Actual Budget DB busy, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
                 await asyncio.sleep(wait)
             elif "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
-                print("Ignored MCP shutdown error during query.")
-                break
+                import traceback
+                print("❌ Fatal MCP error during query. Aborting validation to prevent data loss.")
+                print(f"Error details:\n{traceback.format_exc()}")
+                return
             else:
                 print(f"Failed to pull from Actual Budget: {e}")
                 return
@@ -324,6 +330,23 @@ async def run_final_validation(fix=False):
 
     if not fix:
         return
+
+    # ── Backup PocketBase before fixing ──
+    try:
+        from datetime import datetime as _dt
+        backup_dir = os.path.join("cache", "pb_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        all_records = client.collection("receipts").get_full_list()
+        backup_data = []
+        for r in all_records:
+            rec = {k: v for k, v in r.__dict__.items() if not k.startswith("_")}
+            backup_data.append(rec)
+        backup_path = os.path.join(backup_dir, f"receipts_{_dt.now().strftime('%Y%m%d_%H%M%S')}.json")
+        with open(backup_path, "w") as f:
+            json.dump(backup_data, f, indent=2, default=str)
+        print(f"💾 Backed up {len(backup_data)} PocketBase records to {backup_path}")
+    except Exception as e:
+        print(f"⚠️ Failed to backup PocketBase: {e}")
 
     # ── Fix Phase ──
     print(f"\n{'─'*50}\nApplying fixes...\n{'─'*50}")
@@ -692,7 +715,7 @@ def flag_pb_command(pb_id: str):
     except Exception as e:
         print(f"Failed to flag and delete PocketBase record {pb_id}: {e}")
 
-async def areview_command(review_types: list = None):
+async def areview_command(review_types: list = None, status_only: bool = False):
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     from graph.workflow import workflow
     import urllib.parse
@@ -732,10 +755,14 @@ async def areview_command(review_types: list = None):
             
         print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_states)} receipts)\n{'='*50}")
         print("Summary:")
-        print(f"  - {not_a_receipt_count} classified as NOT a receipt")
-        print(f"  - {proposed_count} agent proposed a transaction")
-        print(f"  - {unmatched_count} agent failed to match or propose")
+        print(f"  - {not_a_receipt_count} classified as NOT a receipt (not-receipt)")
+        print(f"  - {proposed_count} agent proposed a transaction (no-exact-match)")
+        print(f"  - {unmatched_count} agent failed to match or propose (no-match)")
         print(f"{'='*50}")
+        
+        if status_only:
+            return
+            
         for snap in paused_states:
             cfg = snap.config
             st = snap
@@ -804,9 +831,9 @@ async def areview_command(review_types: list = None):
                 print("\nReview interrupted. State saved. Exiting immediately.")
                 os._exit(1)
 
-def review_command(review_types: list = None):
+def review_command(review_types: list = None, status_only: bool = False):
     import asyncio
-    asyncio.run(areview_command(review_types))
+    asyncio.run(areview_command(review_types, status_only))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
@@ -822,6 +849,7 @@ if __name__ == "__main__":
     # `review` subcommand
     review_parser = subparsers.add_parser("review", help="Review paused receipts")
     review_parser.add_argument("--type", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Specific type(s) of paused receipts to review (default: all)")
+    review_parser.add_argument("--status", action="store_true", help="Only output the number of items to review and exit")
 
     # `validate` subcommand
     validate_parser = subparsers.add_parser("validate", help="Run final validation between PocketBase and Actual Budget")
@@ -863,7 +891,8 @@ if __name__ == "__main__":
             asyncio.run(run_final_validation(fix=args.fix))
         elif cmd == "review":
             review_types = getattr(args, "type", None)
-            review_command(review_types)
+            status_only = getattr(args, "status", False)
+            review_command(review_types, status_only)
         elif cmd == "cache":
             if getattr(args, "cache_command", None) == "dump":
                 dump_cache_command(args.path)
