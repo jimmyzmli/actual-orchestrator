@@ -165,7 +165,7 @@ def parse_receipt_node(state: ReceiptState):
         
         # ── Step 1: Classify whether this is actually a receipt ──
         classify_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt or invoice (something with items bought and a total amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
+            ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record (anything representing a financial transaction with a date and amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
             ("human", "{ocr_text}")
         ])
         classify_chain = classify_prompt | llm
@@ -184,7 +184,7 @@ def parse_receipt_node(state: ReceiptState):
         structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations."),
+            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations."),
             ("human", "Here is the raw OCR text:\n\n{ocr_text}")
         ])
         
