@@ -41,7 +41,7 @@ def download_file(gdrive_path: str, filename: str, dest_dir: str):
     subprocess.check_call(["rclone", "copy", source_path, dest_dir])
     return os.path.join(dest_dir, filename)
 
-def process_receipt(local_path: str, gdrive_source_ref: str):
+def process_receipt(local_path: str, gdrive_source_ref: str, include_flagged: list = None):
     """
     Run the LangGraph workflow for a single receipt.
     """
@@ -69,7 +69,18 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
             # Check if it's already paused from a previous run
             current_state = await receipt_processor.aget_state(config)
             if current_state.next and "human_approval" in current_state.next:
-                return {"status": "already_paused", "config": config, "state": current_state}
+                not_a_receipt = current_state.values.get("not_a_receipt")
+                proposed = not not_a_receipt and current_state.values.get("proposed_transaction")
+                
+                reason = "not-receipt" if not_a_receipt else ("no-exact-match" if proposed else "no-match")
+                
+                if include_flagged and reason in include_flagged:
+                    print(f"⚠️ {gdrive_source_ref} was paused ({reason}), but --include-flagged {reason} is set. Re-running workflow...")
+                    async with memory.conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (gdrive_source_ref,)): pass
+                    async with memory.conn.execute("DELETE FROM writes WHERE thread_id = ?", (gdrive_source_ref,)): pass
+                    await memory.conn.commit()
+                else:
+                    return {"status": "already_paused", "config": config, "state": current_state, "reason": reason}
                 
             print(f"\n--- Starting processing for {gdrive_source_ref} ---")
             print(f"file://{local_path}")
@@ -80,14 +91,17 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
             # Step 2: Check if interrupted
             current_state = await receipt_processor.aget_state(config)
             if current_state.next and "human_approval" in current_state.next:
-                print(f"⚠️ Transaction needs manual review. Pausing and deferring to end of batch.")
-                return {"status": "newly_paused", "config": config, "state": current_state}
+                not_a_receipt = current_state.values.get("not_a_receipt")
+                proposed = not not_a_receipt and current_state.values.get("proposed_transaction")
+                reason = "not-receipt" if not_a_receipt else ("no-exact-match" if proposed else "no-match")
+                print(f"⚠️ Transaction needs manual review ({reason}). Pausing and deferring to end of batch.")
+                return {"status": "newly_paused", "config": config, "state": current_state, "reason": reason}
                 
             return {"status": "finished"}
 
     return asyncio.run(run_flow())
 
-def main():
+def main(include_flagged: list = None):
     gdrive_path = os.environ.get("RECEIPT_GDRIVE_PATH")
     if not gdrive_path:
         print("RECEIPT_GDRIVE_PATH not set in .env")
@@ -129,13 +143,15 @@ def main():
                 print(f"Skipping {gdrive_source_ref}: already processed in PocketBase (hash {file_hash[:12]}...).")
                 continue
 
-            res = process_receipt(local_path, gdrive_source_ref)
+            res = process_receipt(local_path, gdrive_source_ref, include_flagged)
             if res and res.get("status") == "already_paused":
-                print(f"Skipping {gdrive_source_ref}: flagged for manual review ⚠️")
-                paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"]))
+                reason = res.get("reason", "unknown")
+                print(f"Skipping {gdrive_source_ref}: flagged for manual review ({reason}) ⚠️")
+                paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"], reason))
             elif res and res.get("status") == "newly_paused":
-                paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"]))
-                print(f"--- Finished processing for {gdrive_source_ref} (Paused) ---\n")
+                reason = res.get("reason", "unknown")
+                paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"], reason))
+                print(f"--- Finished processing for {gdrive_source_ref} (Paused: {reason}) ---\n")
             elif res and res.get("status") == "finished":
                 print(f"--- Finished processing for {gdrive_source_ref} ---\n")
                 
@@ -149,6 +165,13 @@ def main():
 
     if paused_receipts:
         print(f"\n{len(paused_receipts)} receipts require manual review.")
+        not_receipt_count = sum(1 for p in paused_receipts if p[4] == "not-receipt")
+        no_exact_match_count = sum(1 for p in paused_receipts if p[4] == "no-exact-match")
+        no_match_count = sum(1 for p in paused_receipts if p[4] == "no-match")
+        
+        print(f"  - {not_receipt_count} classified as NOT a receipt (not-receipt)")
+        print(f"  - {no_exact_match_count} agent proposed a transaction (no-exact-match)")
+        print(f"  - {no_match_count} agent failed to match or propose (no-match)")
         print("Run 'python main.py review' to process them.")
         
     if failed_receipts:
@@ -666,7 +689,7 @@ def flag_pb_command(pb_id: str):
     except Exception as e:
         print(f"Failed to flag and delete PocketBase record {pb_id}: {e}")
 
-async def areview_command():
+async def areview_command(review_types: list = None):
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
     from graph.workflow import workflow
     import urllib.parse
@@ -689,7 +712,12 @@ async def areview_command():
             cfg = {"configurable": {"thread_id": thread_id}}
             snap = await receipt_processor.aget_state(cfg)
             if snap.next and "human_approval" in snap.next:
-                paused_states.append(snap)
+                not_a_receipt = snap.values.get("not_a_receipt")
+                proposed = not not_a_receipt and snap.values.get("proposed_transaction")
+                reason = "not-receipt" if not_a_receipt else ("no-exact-match" if proposed else "no-match")
+                
+                if not review_types or reason in review_types:
+                    paused_states.append(snap)
                 
         if not paused_states:
             print("No receipts waiting for manual review.")
@@ -773,16 +801,22 @@ async def areview_command():
                 print("\nReview interrupted. State saved. Exiting immediately.")
                 os._exit(1)
 
-def review_command():
+def review_command(review_types: list = None):
     import asyncio
-    asyncio.run(areview_command())
+    asyncio.run(areview_command(review_types))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
+    parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Re-run flagged receipts of this type (when running default process)")
     subparsers = parser.add_subparsers(dest="command")
+    
+    # `process` subcommand
+    process_parser = subparsers.add_parser("process", help="Process receipts (default)")
+    process_parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Re-run flagged receipts of this type")
 
     # `review` subcommand
     review_parser = subparsers.add_parser("review", help="Review paused receipts")
+    review_parser.add_argument("--type", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Specific type(s) of paused receipts to review (default: all)")
 
     # `validate` subcommand
     validate_parser = subparsers.add_parser("validate", help="Run final validation between PocketBase and Actual Budget")
@@ -815,31 +849,34 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     try:
-        if args.command == "validate":
+        cmd = args.command or "process"
+        if cmd == "validate":
             import asyncio
             asyncio.run(run_final_validation(fix=args.fix))
-        elif args.command == "review":
-            review_command()
-        elif args.command == "cache":
-            if args.cache_command == "dump":
+        elif cmd == "review":
+            review_types = getattr(args, "type", None)
+            review_command(review_types)
+        elif cmd == "cache":
+            if getattr(args, "cache_command", None) == "dump":
                 dump_cache_command(args.path)
-            elif args.cache_command == "prune":
+            elif getattr(args, "cache_command", None) == "prune":
                 prune_cache_command()
-            elif args.cache_command == "clear":
+            elif getattr(args, "cache_command", None) == "clear":
                 clear_cache_command()
-            elif args.cache_command == "purge":
+            elif getattr(args, "cache_command", None) == "purge":
                 purge_cache_command(args.ids)
             else:
                 cache_parser.print_help()
-        elif args.command == "flag":
-            if args.flag_command == "source":
+        elif cmd == "flag":
+            if getattr(args, "flag_command", None) == "source":
                 flag_source_command(args.filename, args.delete)
-            elif args.flag_command == "pb":
+            elif getattr(args, "flag_command", None) == "pb":
                 flag_pb_command(args.pb_id)
             else:
                 flag_parser.print_help()
-        else:
-            main()
+        elif cmd == "process":
+            include_flagged = getattr(args, "include_flagged", None)
+            main(include_flagged=include_flagged)
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Exiting immediately to prevent background tasks.")
         os._exit(1)
