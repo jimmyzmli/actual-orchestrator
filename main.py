@@ -57,9 +57,6 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
     config = {"configurable": {"thread_id": gdrive_source_ref}}
     
     # Run graph
-    print(f"\n--- Starting processing for {gdrive_source_ref} ---")
-    print(f"file://{local_path}")
-    
     async def run_flow():
         from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
         from graph.workflow import workflow
@@ -69,6 +66,14 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
         async with AsyncSqliteSaver.from_conn_string("data/checkpoints.sqlite") as memory:
             receipt_processor = workflow.compile(checkpointer=memory, interrupt_before=["human_approval"])
             
+            # Check if it's already paused from a previous run
+            current_state = await receipt_processor.aget_state(config)
+            if current_state.next and "human_approval" in current_state.next:
+                return {"status": "already_paused", "config": config, "state": current_state}
+                
+            print(f"\n--- Starting processing for {gdrive_source_ref} ---")
+            print(f"file://{local_path}")
+            
             # Step 1: Initial invocation
             result = await receipt_processor.ainvoke(state, config)
             
@@ -76,7 +81,7 @@ def process_receipt(local_path: str, gdrive_source_ref: str):
             current_state = await receipt_processor.aget_state(config)
             if current_state.next and "human_approval" in current_state.next:
                 print(f"⚠️ Transaction needs manual review. Pausing and deferring to end of batch.")
-                return {"status": "paused", "config": config, "state": current_state}
+                return {"status": "newly_paused", "config": config, "state": current_state}
                 
             return {"status": "finished"}
 
@@ -105,6 +110,7 @@ def main():
     print(f"Loaded {len(known_hashes)} existing receipt hashes from PocketBase.")
     
     paused_receipts = []
+    failed_receipts = []
     
     for receipt in receipts:
         filename = receipt["Name"]
@@ -124,19 +130,29 @@ def main():
                 continue
 
             res = process_receipt(local_path, gdrive_source_ref)
-            if res and res.get("status") == "paused":
+            if res and res.get("status") == "already_paused":
+                print(f"Skipping {gdrive_source_ref}: flagged for manual review ⚠️")
                 paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"]))
-            print(f"--- Finished processing for {gdrive_source_ref} ---\n")
+            elif res and res.get("status") == "newly_paused":
+                paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"]))
+                print(f"--- Finished processing for {gdrive_source_ref} (Paused) ---\n")
+            elif res and res.get("status") == "finished":
+                print(f"--- Finished processing for {gdrive_source_ref} ---\n")
                 
             # Optionally, move the file to a 'Processed' folder in gdrive
             # subprocess.check_call(["rclone", "move", gdrive_source_ref, f"{gdrive_path}/Processed/"])
         except Exception as e:
+            print(f"\n--- Starting processing for {gdrive_source_ref} ---")
             print(f"Failed to process {filename}: {e}")
             print(f"--- Finished processing for {gdrive_source_ref} (Error) ---\n")
+            failed_receipts.append(gdrive_source_ref)
 
     if paused_receipts:
         print(f"\n{len(paused_receipts)} receipts require manual review.")
         print("Run 'python main.py review' to process them.")
+        
+    if failed_receipts:
+        print(f"\n⚠️  {len(failed_receipts)} receipts failed due to errors and need to be re-run.")
     else:
         print("\nAll receipts processed successfully! No manual reviews needed.")
         
@@ -159,14 +175,14 @@ async def _get_mcp_session():
 async def run_final_validation(fix=False):
     print(f"\n\n{'='*50}\nFINAL VALIDATION{' (with --fix)' if fix else ''}\n{'='*50}")
     # 1. Pull PB records
-    pb_records = {}  # tx_id -> pb record id
+    pb_records = {}  # tx_id -> list of pb record ids
     from tools.pocketbase_client import get_pb_client
     try:
         client = get_pb_client()
         records = client.collection("receipts").get_full_list(query_params={"fields": "id,tx_id"})
         for r in records:
             if hasattr(r, 'tx_id') and r.tx_id and r.tx_id != "unknown_id":
-                pb_records[r.tx_id] = r.id
+                pb_records.setdefault(r.tx_id, []).append(r.id)
     except Exception as e:
         print(f"Failed to pull from PocketBase: {e}")
         return
@@ -290,15 +306,15 @@ async def run_final_validation(fix=False):
     if pb_id_map:
         for old_tx_id, new_tx_id in pb_id_map.items():
             if old_tx_id != new_tx_id:
-                pb_id = pb_records.get(old_tx_id)
-                if pb_id:
+                pb_ids = pb_records.get(old_tx_id, [])
+                for pb_id in pb_ids:
                     try:
                         client.collection("receipts").update(pb_id, {"tx_id": new_tx_id})
                         print(f"  ✅ Updated PocketBase record {pb_id} to point to parent tx {new_tx_id} (was child {old_tx_id})")
-                        if old_tx_id in pb_records:
-                            pb_records[new_tx_id] = pb_records.pop(old_tx_id)
                     except Exception as e:
                         print(f"  ❌ Failed to update PB record {pb_id}: {e}")
+                if old_tx_id in pb_records:
+                    pb_records.setdefault(new_tx_id, []).extend(pb_records.pop(old_tx_id))
 
     # Fix 1 & 3: For tx_ids in PB but not in Actual's #receipt list,
     # check if the tx actually exists in Actual. If yes → add #receipt. If no → delete PB record.
@@ -343,8 +359,8 @@ async def run_final_validation(fix=False):
                                     print(f"  ✅ Added #receipt to tx {tx_id}")
                             else:
                                 # tx not found in Actual → delete PB record
-                                pb_id = pb_records.get(tx_id)
-                                if pb_id:
+                                pb_ids = pb_records.get(tx_id, [])
+                                for pb_id in pb_ids:
                                     try:
                                         client.collection("receipts").delete(pb_id)
                                         print(f"  🗑️  Deleted PocketBase record {pb_id} (tx {tx_id} not in Actual)")
@@ -679,7 +695,16 @@ async def areview_command():
             print("No receipts waiting for manual review.")
             return
             
+        not_a_receipt_count = sum(1 for s in paused_states if s.values.get("not_a_receipt"))
+        proposed_count = sum(1 for s in paused_states if not s.values.get("not_a_receipt") and s.values.get("proposed_transaction"))
+        unmatched_count = len(paused_states) - not_a_receipt_count - proposed_count
+            
         print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_states)} receipts)\n{'='*50}")
+        print("Summary:")
+        print(f"  - {not_a_receipt_count} classified as NOT a receipt")
+        print(f"  - {proposed_count} agent proposed a transaction")
+        print(f"  - {unmatched_count} agent failed to match or propose")
+        print(f"{'='*50}")
         for snap in paused_states:
             cfg = snap.config
             st = snap
@@ -712,9 +737,9 @@ async def areview_command():
                     if proposed:
                         print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
                         print(f"{proposed}")
-                        ans = input("Action (c=create, s=skip, m=move, d=delete, UUID=link): [c] ").strip().lower()
-                        if ans in ("", "c", "create", "y", "yes"):
-                            ans = "c"
+                        ans = input("Action (y=accept, s=skip, m=move, d=delete, UUID=link): [y] ").strip().lower()
+                        if ans in ("", "y", "yes", "accept", "c", "create"):
+                            ans = "y"
                         elif ans in ("s", "skip", "n", "no"):
                             ans = "s"
                     else:
@@ -738,7 +763,7 @@ async def areview_command():
                 elif re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):
                     await receipt_processor.aupdate_state(cfg, {"actual_tx_id": ans, "human_approved": False})
                 else:
-                    approved = (ans == "c")
+                    approved = (ans == "y")
                     await receipt_processor.aupdate_state(cfg, {"human_approved": approved})
                 
                 print(f"Resuming workflow for {ref}...")

@@ -48,20 +48,17 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
         data["image"] = FileUpload(*uploads)
     
     try:
-        # Try to find existing record by source_hash first, then by tx_id
+        # Try to find existing record by source_hash
         existing = None
-        for filter_key, filter_val in [("source_hash", source_hash), ("tx_id", transaction_id)]:
-            if not filter_val:
-                continue
+        if source_hash:
             try:
                 records = client.collection("receipts").get_list(1, 1, query_params={
-                    "filter": f"{filter_key}='{filter_val}'",
-                    "fields": "id",
+                    "filter": f"source_hash~'{source_hash}'",
+                    "fields": "id,source_hash,source_ref",
                     "skipTotal": "true",
                 })
                 if records.items:
                     existing = records.items[0]
-                    break
             except Exception:
                 pass
 
@@ -97,7 +94,8 @@ def fetch_all_source_hashes():
             if len(records.items) < per_page:
                 break
             page += 1
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ Error fetching source hashes page {page}: {e}")
             break
     return hashes
 
