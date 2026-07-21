@@ -484,15 +484,11 @@ async def search_actual_transaction_node(state: ReceiptState):
         payee = parsed["payee"]
         receipt_cents = abs(int(amount * 100))
         
-        server_params = StdioServerParameters(
-            command="node",
-            args=["wrapper.js"],
-            env=os.environ.copy()
-        )
-        
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        from graph.mcp_client import ActualMCPClient
+        session = await ActualMCPClient.get_session()
+        if True:
+            if True:
+                # dummy block to keep indentation
 
                 # ── Step 1: Deterministic search ──
                 scored = await _deterministic_search(session, date, receipt_cents, payee)
@@ -660,11 +656,8 @@ async def create_actual_transaction_node(state: ReceiptState):
         print("Creating transaction in Actual Budget via Agent...")
         proposed_tx = state.get("proposed_transaction")
         
-        server_params = StdioServerParameters(
-            command="node",
-            args=["wrapper.js"],
-            env=os.environ.copy()
-        )
+        from graph.mcp_client import ActualMCPClient
+        session = await ActualMCPClient.get_session()
         
         llm = ChatOpenAI(
             model="deepseek-v4-flash", 
@@ -672,9 +665,9 @@ async def create_actual_transaction_node(state: ReceiptState):
             base_url="https://api.deepseek.com/v1"
         )
         
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        if True:
+            if True:
+                # dummy block to keep indentation
                 mcp_tools = await load_mcp_tools(session)
                 
                 # Give it create tools!
@@ -738,14 +731,11 @@ async def tag_actual_transaction_node(state: ReceiptState):
 
     try:
         print(f"Tagging transaction {tx_id} with #receipt...")
-        server_params = StdioServerParameters(
-            command="node",
-            args=["wrapper.js"],
-            env=os.environ.copy()
-        )
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        from graph.mcp_client import ActualMCPClient
+        session = await ActualMCPClient.get_session()
+        if True:
+            if True:
+                # dummy block to keep indentation
                 
                 # Fetch initial transaction
                 target_tx_id = tx_id

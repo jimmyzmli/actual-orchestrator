@@ -41,7 +41,7 @@ def download_file(gdrive_path: str, filename: str, dest_dir: str):
     subprocess.check_call(["rclone", "copy", source_path, dest_dir])
     return os.path.join(dest_dir, filename)
 
-def process_receipt(local_path: str, gdrive_source_ref: str, include_flagged: list = None):
+async def process_receipt(local_path: str, gdrive_source_ref: str, include_flagged: list = None):
     """
     Run the LangGraph workflow for a single receipt.
     """
@@ -99,11 +99,14 @@ def process_receipt(local_path: str, gdrive_source_ref: str, include_flagged: li
                 
             return {"status": "finished"}
 
-    return asyncio.run(run_flow())
+    return await run_flow()
 
-def main(include_flagged: list = None):
+async def amain(include_flagged: list = None):
     from peak_hours import print_peak_hours_warning
     print_peak_hours_warning("deepseek")
+    
+    from graph.mcp_client import ActualMCPClient
+    await ActualMCPClient.get_session()
     
     gdrive_path = os.environ.get("RECEIPT_GDRIVE_PATH")
     if not gdrive_path:
@@ -146,7 +149,7 @@ def main(include_flagged: list = None):
                 print(f"Skipping {gdrive_source_ref}: already processed in PocketBase (hash {file_hash[:12]}...).")
                 continue
 
-            res = process_receipt(local_path, gdrive_source_ref, include_flagged)
+            res = await process_receipt(local_path, gdrive_source_ref, include_flagged)
             if res and res.get("status") == "already_paused":
                 reason = res.get("reason", "unknown")
                 print(f"Skipping {gdrive_source_ref}: flagged for manual review ({reason}) ⚠️")
@@ -183,20 +186,15 @@ def main(include_flagged: list = None):
         print("\nAll receipts processed successfully! No manual reviews needed.")
         
     try:
-        import asyncio
-        asyncio.run(run_final_validation())
+        await run_final_validation()
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Exiting immediately to prevent background tasks.")
         os._exit(1)
+    finally:
+        from graph.mcp_client import ActualMCPClient
+        await ActualMCPClient.close_all()
 
-async def _get_mcp_session():
-    """Create and return MCP server params for Actual Budget."""
-    from mcp import StdioServerParameters
-    return StdioServerParameters(
-        command="node",
-        args=["wrapper.js"],
-        env=os.environ.copy()
-    )
+
 
 async def run_final_validation(fix=False):
     print(f"\n\n{'='*50}\nFINAL VALIDATION{' (with --fix)' if fix else ''}\n{'='*50}")
@@ -221,13 +219,14 @@ async def run_final_validation(fix=False):
     from mcp import ClientSession
     from mcp.client.stdio import stdio_client
     
-    server_params = await _get_mcp_session()
+    from graph.mcp_client import ActualMCPClient
+    session = await ActualMCPClient.get_session()
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            async with stdio_client(server_params) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
+            if True:
+                if True:
+                    # dummy block to keep indentation
                     
                     print(f"Fetching all transactions across all accounts...")
                     res_accounts = await session.call_tool("actual_query", {"args": [
@@ -371,9 +370,9 @@ async def run_final_validation(fix=False):
         print(f"\n🔧 Checking {len(in_pb_not_actual)} PocketBase records against Actual Budget...")
         for attempt in range(max_retries):
             try:
-                async with stdio_client(server_params) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
+                session = await ActualMCPClient.get_session()
+                if True:
+                    if True:
                         from langchain_mcp_adapters.tools import load_mcp_tools
                         mcp_tools = await load_mcp_tools(session)
                         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
@@ -434,9 +433,9 @@ async def run_final_validation(fix=False):
         print(f"\n🔧 Removing #receipt from {len(in_actual_not_pb)} transactions not in PocketBase...")
         for attempt in range(max_retries):
             try:
-                async with stdio_client(server_params) as (read, write):
-                    async with ClientSession(read, write) as session:
-                        await session.initialize()
+                session = await ActualMCPClient.get_session()
+                if True:
+                    if True:
                         from langchain_mcp_adapters.tools import load_mcp_tools
                         mcp_tools = await load_mcp_tools(session)
                         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
@@ -830,6 +829,9 @@ async def areview_command(review_types: list = None, status_only: bool = False):
             except KeyboardInterrupt:
                 print("\nReview interrupted. State saved. Exiting immediately.")
                 os._exit(1)
+        
+        from graph.mcp_client import ActualMCPClient
+        await ActualMCPClient.close_all()
 
 def review_command(review_types: list = None, status_only: bool = False):
     import asyncio
@@ -888,7 +890,13 @@ if __name__ == "__main__":
         cmd = args.command or "process"
         if cmd == "validate":
             import asyncio
-            asyncio.run(run_final_validation(fix=args.fix))
+            async def _run_validate():
+                try:
+                    await run_final_validation(fix=args.fix)
+                finally:
+                    from graph.mcp_client import ActualMCPClient
+                    await ActualMCPClient.close_all()
+            asyncio.run(_run_validate())
         elif cmd == "review":
             review_types = getattr(args, "type", None)
             status_only = getattr(args, "status", False)
@@ -913,7 +921,8 @@ if __name__ == "__main__":
                 flag_parser.print_help()
         elif cmd == "process":
             include_flagged = getattr(args, "include_flagged", None)
-            main(include_flagged=include_flagged)
+            import asyncio
+            asyncio.run(amain(include_flagged=include_flagged))
     except KeyboardInterrupt:
         print("\nProcess interrupted by user. Exiting immediately to prevent background tasks.")
         os._exit(1)
