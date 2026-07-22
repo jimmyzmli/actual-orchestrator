@@ -37,6 +37,7 @@ class ReceiptState(TypedDict, total=False):
     proposed_transaction: str # JSON string of proposed transaction if not found
     human_approved: bool
     not_a_receipt: bool   # True if content was classified as not a receipt
+    forex_receipt: bool   # True if currency is not CAD
 
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -46,18 +47,13 @@ class ReceiptItem(BaseModel):
 class ParsedReceipt(BaseModel):
     date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
     total: float = Field(description="Total amount of the receipt")
+    currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. If clearly from Canada or CAD is not explicitly stated otherwise, use CAD.")
     payee: str = Field(description="Name of the store or payee")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
 
-class ProposedTransaction(BaseModel):
-    date: str = Field(description="Date in YYYY-MM-DD format")
-    amount_cents: int = Field(description="Amount in integer cents (e.g. 1500 for $15.00, or -1500 for an expense). Note: expenses MUST be negative.")
-    payee_name: str = Field(description="Name of the payee")
-    account_id: str = Field(description="ID of the selected account")
-
 class TransactionMatchResult(BaseModel):
     matched_id: str | None = Field(description="The UUID of the best matching candidate transaction, if any. Leave null if no good match.")
-    proposed_transaction: ProposedTransaction | None = Field(description="If no good match was found, propose a new transaction to create. Leave null if matched_id is provided.")
+
 
 def skip_if_processed(state: ReceiptState):
     """Check PocketBase source_hash to skip already-processed files."""
@@ -187,7 +183,7 @@ def parse_receipt_node(state: ReceiptState):
         structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
         
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations."),
+            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total', 'currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations."),
             ("human", "Here is the raw OCR text:\n\n{ocr_text}")
         ])
         
@@ -200,8 +196,11 @@ def parse_receipt_node(state: ReceiptState):
         
         parsed_dict = result.dict()
         set_parsed(file_path, parsed_dict)
+        
+        currency = parsed_dict.get("currency", "CAD").upper()
+        forex_receipt = currency != "CAD"
             
-        return {"parsed_data": parsed_dict}
+        return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt}
     except Exception as e:
         return {"status": "error", "error": f"Parsing failed: {str(e)}"}
 
@@ -277,13 +276,13 @@ def score_candidate(receipt_payee: str, receipt_cents: int, receipt_date: str,
     transaction candidate against the parsed receipt.
     
     Weights:
-      - Amount similarity:  0.45
-      - Payee similarity:   0.40
-      - Date proximity:     0.15
+      - Amount similarity:  0.60
+      - Date proximity:     0.30
+      - Payee similarity:   0.10
     """
-    W_AMOUNT = 0.45
-    W_PAYEE  = 0.40
-    W_DATE   = 0.15
+    W_AMOUNT = 0.60
+    W_DATE   = 0.30
+    W_PAYEE  = 0.10
 
     cand_amount = abs(candidate.get("amount", 0))
     amount_score = _amount_similarity(receipt_cents, cand_amount)
@@ -471,7 +470,7 @@ async def search_actual_transaction_node(state: ReceiptState):
     3. Agent fallback for when nothing is found
     """
     final_id = "unknown_id"
-    proposed_tx = None
+    final_id = "unknown_id"
     
     try:
         print("Matching transaction in Actual Budget...")
@@ -536,44 +535,23 @@ async def search_actual_transaction_node(state: ReceiptState):
                             final_id = "unknown_id"
 
                 # ── Step 3: Agent fallback ──
-                if final_id == "unknown_id" and proposed_tx is None:
+                if final_id == "unknown_id":
                     print("  🔄 Falling back to LLM structured selection...")
-                    
-                    # Pre-filter scored candidates by amount to save tokens
-                    expected_amt = receipt_cents
-                    min_allowed = expected_amt * 0.90
-                    max_allowed = expected_amt * 1.30
                     
                     narrowed_candidates = []
                     for c in scored:
-                        actual_amt = abs(c.get("amount", 0))
-                        if min_allowed <= actual_amt <= max_allowed:
-                            narrowed_candidates.append({
-                                "id": c.get("id"),
-                                "date": c.get("date"),
-                                "amount": c.get("amount"),
-                                "payee": c.get("payee.name") or c.get("imported_payee"),
-                                "account": c.get("account.name"),
-                                "notes": (c.get("notes") or "")[:200]
-                            })
+                        narrowed_candidates.append({
+                            "id": c.get("id"),
+                            "date": c.get("date"),
+                            "amount": c.get("amount"),
+                            "payee": c.get("payee.name") or c.get("imported_payee"),
+                            "account": c.get("account.name"),
+                            "notes": (c.get("notes") or "")[:200]
+                        })
                     # Limit to top 10 candidates to save tokens
                     narrowed_candidates = narrowed_candidates[:10]
                             
-                    # Fetch available accounts to propose a new transaction
-                    available_accounts = []
-                    try:
-                        res = await session.call_tool("actual_query", {"args": [
-                            "run", "--table", "accounts", "--select", "id,name,offbudget,closed", "--format", "json"
-                        ]})
-                        raw = res.content[0].text if res.content else "[]"
-                        all_accounts = json.loads(raw) if isinstance(raw, str) else []
-                        available_accounts = [
-                            {"id": a["id"], "name": a["name"]}
-                            for a in all_accounts
-                            if not a.get("closed", False) and not a.get("offbudget", False)
-                        ]
-                    except Exception as e:
-                        print(f"⚠️ Failed to fetch accounts: {e}")
+                    # We don't fetch available accounts anymore since we don't propose transactions
                     
                     llm = ChatOpenAI(
                         model="deepseek-v4-flash", 
@@ -589,25 +567,16 @@ We have a new parsed receipt:
 - Amount: ${amount}
 - Payee: {payee}
 
-Here are the deterministically filtered candidate transactions from the bank (within +/- 7 days and amount +/- 30%):
+Here are the top candidate transactions from the bank (within +/- 7 days):
 {json.dumps(narrowed_candidates, indent=2) if narrowed_candidates else "[]"}
-
-Here are the available open, on-budget accounts:
-{json.dumps(available_accounts, indent=2) if available_accounts else "[]"}
 
 Task:
 1. Review the provided candidate transactions. If one is a good match based on Payee and Amount similarity, set `matched_id` to its ID.
-2. If NO good match is found in the candidates, you must propose a new transaction by filling out `proposed_transaction`.
-3. For a proposed transaction, pick the most logical account ID from the available accounts based on the payee.
+2. Note that the receipt amount and bank amount may differ significantly due to foreign currency conversion or added tips. If the Payee and Date are a very strong match, it is highly likely to be the correct transaction even if the amount differs.
+3. If NO good match is found in the candidates, you must return null for `matched_id`.
 4. Output EXACTLY a JSON object matching this schema:
 {{
-  "matched_id": "string UUID or null",
-  "proposed_transaction": {{
-    "date": "YYYY-MM-DD",
-    "amount_cents": -1500,  // Note: expenses MUST be negative
-    "payee_name": "string",
-    "account_id": "string"
-  }} // or null if matched_id is provided
+  "matched_id": "string UUID or null"
 }}"""
                     
                     print(f"  [Token Est] Fallback agent prompt: ~{estimate_tokens(prompt_text)} tokens")
@@ -627,101 +596,22 @@ Task:
                             else:
                                 print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the narrowed candidates.")
                                 final_id = "unknown_id"
-                        elif result.proposed_transaction:
-                            proposed_tx = json.dumps(result.proposed_transaction.model_dump())
-                            print(f"Agent proposed tx: {proposed_tx}")
                         else:
-                            print(f"Agent output didn't contain matched_id or proposed_transaction")
+                            print(f"Agent output didn't contain matched_id")
                     except Exception as e:
                         print(f"Warning: Failed to parse structured output from LLM: {e}")
                         
     except Exception as e:
-        if final_id != "unknown_id" and proposed_tx is None and ("TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e)):
+        if final_id != "unknown_id" and ("TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e)):
             print("Ignored MCP shutdown error, agent succeeded.")
         else:
             return {"status": "error", "error": f"Actual Budget search failed: {str(e)}"}
             
-    if proposed_tx:
-        return {"proposed_transaction": proposed_tx}
     return {"actual_tx_id": final_id}
 
 def human_approval_node(state: ReceiptState):
     """Placeholder node for human interrupt"""
     return {}
-
-async def create_actual_transaction_node(state: ReceiptState):
-    """Create the transaction in Actual Budget using an Agent"""
-    final_id = "unknown_id"
-    try:
-        print("Creating transaction in Actual Budget via Agent...")
-        proposed_tx = state.get("proposed_transaction")
-        
-        from graph.mcp_client import ActualMCPClient
-        session = await ActualMCPClient.get_session()
-        
-        llm = ChatOpenAI(
-            model="deepseek-v4-flash", 
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-            base_url="https://api.deepseek.com/v1"
-        )
-        
-        if True:
-            if True:
-                # dummy block to keep indentation
-                mcp_tools = await load_mcp_tools(session)
-                
-                # Give it create tools!
-                create_tools = [t for t in mcp_tools if "actual_transactions" in t.name or "actual_query" in t.name]
-                agent = create_react_agent(llm, tools=create_tools)
-                
-                prompt = f"""
-                You are a financial assistant connecting to Actual Budget.
-                Please create the following transaction exactly as specified:
-                {proposed_tx}
-                
-                Task:
-                1. Create a new transaction using actual_transactions with the provided date, amount_cents, payee_name, and account_id.
-                2. After creation, you MUST re-query actual_query to get the final transaction ID of the transaction you just created.
-                
-                IMPORTANT: YOUR FINAL MESSAGE MUST BE EXACTLY THE 36-CHARACTER TRANSACTION UUID. Do not say "The ID is...". Just output the UUID string.
-                """
-                
-                from peak_hours import pause_if_peak_hours
-                pause_if_peak_hours("deepseek")
-                
-                res = await agent.ainvoke({"messages": [HumanMessage(content=prompt)]})
-                content = res["messages"][-1].content.strip()
-                
-                import re
-                match = re.search(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', content, re.IGNORECASE)
-                if match:
-                    final_id = match.group(0)
-                    print(f"Agent created tx: {final_id}")
-                    
-                    # Validate that the transaction actually exists
-                    query_tool = next((t for t in mcp_tools if t.name == "actual_query"), None)
-                    if query_tool:
-                        try:
-                            q_res = await query_tool.ainvoke({"args": ["run", "--table", "transactions", "--filter", json.dumps({"$or": [{"id": final_id}, {"parent_id": final_id}]}), "--select", "id", "--format", "json"]})
-                            q_text = q_res[0].get("text", "[]") if isinstance(q_res, list) else getattr(q_res, "text", "[]")
-                            if isinstance(q_text, str):
-                                q_json = json.loads(q_text)
-                                if len(q_json) == 0:
-                                    print(f"❌ VALIDATION FAILED: Agent claimed to create tx {final_id}, but it was not found in Actual Budget.")
-                                    final_id = "unknown_id"
-                        except Exception as e:
-                            print(f"Warning: Failed to validate created tx id: {e}")
-                else:
-                    print(f"Agent output didn't contain UUID: {content}")
-                    final_id = "unknown_id"
-                    
-    except Exception as e:
-        if final_id != "unknown_id" and ("TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e)):
-            print("Ignored MCP shutdown error, agent succeeded.")
-        else:
-            return {"status": "error", "error": f"Actual Budget creation failed: {str(e)}"}
-            
-    return {"actual_tx_id": final_id}
 
 async def tag_actual_transaction_node(state: ReceiptState):
     """Append #receipt to the matched/created transaction's notes in Actual Budget."""
@@ -872,15 +762,13 @@ def router_after_parse(state: ReceiptState):
 def router_after_search(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
-    if state.get("proposed_transaction") or state.get("actual_tx_id") == "unknown_id":
+    if state.get("actual_tx_id") == "unknown_id" or state.get("forex_receipt"):
         return "human_approval"
     return "save_pocketbase"
 
 def router_after_human(state: ReceiptState):
     if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
         return "save_pocketbase"
-    if state.get("human_approved"):
-        return "create_actual"
     return "skip"
 
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -895,7 +783,6 @@ workflow.add_node("extract_ocr", extract_ocr_node)
 workflow.add_node("parse_receipt", parse_receipt_node)
 workflow.add_node("search_actual", search_actual_transaction_node)
 workflow.add_node("human_approval", human_approval_node)
-workflow.add_node("create_actual", create_actual_transaction_node)
 workflow.add_node("tag_actual", tag_actual_transaction_node)
 workflow.add_node("save_pocketbase", save_pocketbase_node)
 
@@ -905,7 +792,7 @@ workflow.add_conditional_edges("dedup_check", router_after_dedup, {"skip": END, 
 workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "parse_receipt"})
 workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_actual"})
 workflow.add_conditional_edges("search_actual", router_after_search, {"error": END, "human_approval": "human_approval", "save_pocketbase": "tag_actual"})
-workflow.add_conditional_edges("human_approval", router_after_human, {"create_actual": "create_actual", "save_pocketbase": "tag_actual", "skip": END})
-workflow.add_conditional_edges("create_actual", router_check_error, {"error": END, "continue": "tag_actual"})
+workflow.add_conditional_edges("human_approval", router_after_human, {"save_pocketbase": "tag_actual", "skip": END})
 workflow.add_edge("tag_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", END)
+

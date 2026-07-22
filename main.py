@@ -70,9 +70,8 @@ async def process_receipt(local_path: str, gdrive_source_ref: str, include_flagg
             current_state = await receipt_processor.aget_state(config)
             if current_state.next and "human_approval" in current_state.next:
                 not_a_receipt = current_state.values.get("not_a_receipt")
-                proposed = not not_a_receipt and current_state.values.get("proposed_transaction")
-                
-                reason = "not-receipt" if not_a_receipt else ("no-exact-match" if proposed else "no-match")
+                forex_receipt = current_state.values.get("forex_receipt")
+                reason = "not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match")
                 
                 if include_flagged and reason in include_flagged:
                     print(f"⚠️ {gdrive_source_ref} was paused ({reason}), but --include-flagged {reason} is set. Re-running workflow...")
@@ -92,8 +91,8 @@ async def process_receipt(local_path: str, gdrive_source_ref: str, include_flagg
             current_state = await receipt_processor.aget_state(config)
             if current_state.next and "human_approval" in current_state.next:
                 not_a_receipt = current_state.values.get("not_a_receipt")
-                proposed = not not_a_receipt and current_state.values.get("proposed_transaction")
-                reason = "not-receipt" if not_a_receipt else ("no-exact-match" if proposed else "no-match")
+                forex_receipt = current_state.values.get("forex_receipt")
+                reason = "not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match")
                 print(f"⚠️ Transaction needs manual review ({reason}). Pausing and deferring to end of batch.")
                 return {"status": "newly_paused", "config": config, "state": current_state, "reason": reason}
                 
@@ -172,12 +171,10 @@ async def amain(include_flagged: list = None):
     if paused_receipts:
         print(f"\n{len(paused_receipts)} receipts require manual review.")
         not_receipt_count = sum(1 for p in paused_receipts if p[4] == "not-receipt")
-        no_exact_match_count = sum(1 for p in paused_receipts if p[4] == "no-exact-match")
         no_match_count = sum(1 for p in paused_receipts if p[4] == "no-match")
         
         print(f"  - {not_receipt_count} classified as NOT a receipt (not-receipt)")
-        print(f"  - {no_exact_match_count} agent proposed a transaction (no-exact-match)")
-        print(f"  - {no_match_count} agent failed to match or propose (no-match)")
+        print(f"  - {no_match_count} agent failed to match (no-match)")
         print("Run 'python main.py review' to process them.")
         
     if failed_receipts:
@@ -738,8 +735,8 @@ async def areview_command(review_types: list = None, status_only: bool = False):
             snap = await receipt_processor.aget_state(cfg)
             if snap.next and "human_approval" in snap.next:
                 not_a_receipt = snap.values.get("not_a_receipt")
-                proposed = not not_a_receipt and snap.values.get("proposed_transaction")
-                reason = "not-receipt" if not_a_receipt else ("no-exact-match" if proposed else "no-match")
+                forex_receipt = snap.values.get("forex_receipt")
+                reason = "not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match")
                 
                 if not review_types or reason in review_types:
                     paused_states.append(snap)
@@ -749,14 +746,14 @@ async def areview_command(review_types: list = None, status_only: bool = False):
             return
             
         not_a_receipt_count = sum(1 for s in paused_states if s.values.get("not_a_receipt"))
-        proposed_count = sum(1 for s in paused_states if not s.values.get("not_a_receipt") and s.values.get("proposed_transaction"))
-        unmatched_count = len(paused_states) - not_a_receipt_count - proposed_count
+        forex_count = sum(1 for s in paused_states if s.values.get("forex_receipt") and not s.values.get("not_a_receipt"))
+        unmatched_count = len(paused_states) - not_a_receipt_count - forex_count
             
         print(f"\n\n{'='*50}\nINTERACTIVE REVIEW PHASE ({len(paused_states)} receipts)\n{'='*50}")
         print("Summary:")
         print(f"  - {not_a_receipt_count} classified as NOT a receipt (not-receipt)")
-        print(f"  - {proposed_count} agent proposed a transaction (no-exact-match)")
-        print(f"  - {unmatched_count} agent failed to match or propose (no-match)")
+        print(f"  - {forex_count} forex receipts (forex-receipt)")
+        print(f"  - {unmatched_count} agent failed to match (no-match)")
         print(f"{'='*50}")
         
         if status_only:
@@ -788,33 +785,32 @@ async def areview_command(review_types: list = None, status_only: bool = False):
                     if parsed:
                         print(f"Parsed Date:   {parsed.get('date')}")
                         print(f"Parsed Payee:  {parsed.get('payee')}")
-                        print(f"Parsed Amount: ${parsed.get('total')}")
+                        print(f"Parsed Amount: ${parsed.get('total')} {parsed.get('currency', 'CAD')}")
                     
-                    proposed = st.values.get("proposed_transaction")
-                    if proposed:
-                        print(f"⚠️ Transaction NOT found or amount mismatched. Agent proposes:")
-                        print(f"{proposed}")
+                    matched_id = st.values.get("actual_tx_id")
+                    if matched_id and matched_id != "unknown_id":
+                        print(f"⚠️ Forex receipt matched transaction: {matched_id}")
                         ans = input("Action (y=accept, s=skip, m=move, d=delete, UUID=link): [y] ").strip().lower()
-                        if ans in ("", "y", "yes", "accept", "c", "create"):
+                        if ans in ("", "y", "yes", "accept"):
                             ans = "y"
-                        elif ans in ("s", "skip", "n", "no"):
-                            ans = "s"
                     else:
-                        print(f"⚠️ Agent failed to match or propose a transaction.")
+                        print(f"⚠️ Agent failed to match a transaction.")
                         ans = input("Action (s=skip, m=move, d=delete, UUID=link): [s] ").strip().lower()
                         if ans in ("", "s", "skip", "n", "no"):
                             ans = "s"
+                
+                resume_cfg = {"configurable": {"thread_id": ref}}
                 
                 if ans in ("m", "d"):
                     filename = ref.split("/")[-1]
                     flag_source_command(filename, delete=(ans == "d"))
                     await receipt_processor.aupdate_state(cfg, {"human_approved": False})
-                    await receipt_processor.ainvoke(None, cfg)
+                    await receipt_processor.ainvoke(None, resume_cfg)
                     print("Done.\n")
                     continue
                 elif ans == "s":
                     await receipt_processor.aupdate_state(cfg, {"human_approved": False})
-                    await receipt_processor.ainvoke(None, cfg)
+                    await receipt_processor.ainvoke(None, resume_cfg)
                     print("Skipped.\n")
                     continue
                 elif re.match(r'^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$', ans, re.IGNORECASE):
@@ -824,7 +820,7 @@ async def areview_command(review_types: list = None, status_only: bool = False):
                     await receipt_processor.aupdate_state(cfg, {"human_approved": approved})
                 
                 print(f"Resuming workflow for {ref}...")
-                await receipt_processor.ainvoke(None, cfg)
+                await receipt_processor.ainvoke(None, resume_cfg)
                 print("Done.\n")
             except KeyboardInterrupt:
                 print("\nReview interrupted. State saved. Exiting immediately.")
@@ -839,18 +835,18 @@ def review_command(review_types: list = None, status_only: bool = False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Receipt processing pipeline")
-    parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Re-run flagged receipts of this type (when running default process)")
+    parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-match", "forex-receipt"], help="Re-run flagged receipts of this type (when running default process)")
     parser.add_argument("--allow-peak-hours", action="store_true", help="Ignore peak hours warning and continue without pausing")
     subparsers = parser.add_subparsers(dest="command")
     
     # `process` subcommand
     process_parser = subparsers.add_parser("process", help="Process receipts (default)")
-    process_parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Re-run flagged receipts of this type")
+    process_parser.add_argument("--include-flagged", action="append", choices=["not-receipt", "no-match", "forex-receipt"], help="Re-run flagged receipts of this type")
     process_parser.add_argument("--allow-peak-hours", action="store_true", help="Ignore peak hours warning and continue without pausing")
 
     # `review` subcommand
     review_parser = subparsers.add_parser("review", help="Review paused receipts")
-    review_parser.add_argument("--type", action="append", choices=["not-receipt", "no-exact-match", "no-match"], help="Specific type(s) of paused receipts to review (default: all)")
+    review_parser.add_argument("--type", action="append", choices=["not-receipt", "no-match", "forex-receipt"], help="Specific type(s) of paused receipts to review (default: all)")
     review_parser.add_argument("--status", action="store_true", help="Only output the number of items to review and exit")
 
     # `validate` subcommand
