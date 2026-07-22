@@ -204,10 +204,16 @@ async def run_final_validation(fix=False):
     from tools.pocketbase_client import get_pb_client
     try:
         client = get_pb_client()
-        records = client.collection("receipts").get_full_list(query_params={"fields": "id,tx_id"})
+        records = client.collection("receipts").get_full_list(query_params={"fields": "id,tx_id,image,lines,source_ref"})
+        anomalies = []
         for r in records:
             if hasattr(r, 'tx_id') and r.tx_id and r.tx_id != "unknown_id":
                 pb_records.setdefault(r.tx_id, []).append(r.id)
+            
+            lines = getattr(r, "lines", None)
+            image = getattr(r, "image", None)
+            if lines and lines != "[]" and lines != [] and not bool(image):
+                anomalies.append(r)
     except Exception as e:
         print(f"Failed to pull from PocketBase: {e}")
         return
@@ -315,9 +321,17 @@ async def run_final_validation(fix=False):
                 continue
         in_actual_not_pb.add(tx_id)
     
-    if not in_pb_not_actual and not in_actual_not_pb:
-        print("✅ Validation passed. All receipts perfectly synced.")
+    if not in_pb_not_actual and not in_actual_not_pb and not anomalies:
+        print("✅ Validation passed. All receipts perfectly synced and contain images.")
         return
+
+    if anomalies:
+        print(f"⚠️ {len(anomalies)} PocketBase receipts have lines but are missing an image:")
+        for r in anomalies[:5]:
+            print(f"  - {r.id} ({getattr(r, 'source_ref', 'no source')})")
+        if len(anomalies) > 5:
+            print(f"  - ... and {len(anomalies) - 5} more")
+
 
     if in_pb_not_actual:
         print(f"⚠️ {len(in_pb_not_actual)} receipts in PocketBase but tx is MISSING #receipt in Actual Budget:")
@@ -334,7 +348,7 @@ async def run_final_validation(fix=False):
     # ── Backup PocketBase before fixing ──
     try:
         from datetime import datetime as _dt
-        backup_dir = os.path.join("cache", "pb_backups")
+        backup_dir = os.path.join("data", "pb_backups")
         os.makedirs(backup_dir, exist_ok=True)
         all_records = client.collection("receipts").get_full_list()
         backup_data = []
@@ -353,17 +367,78 @@ async def run_final_validation(fix=False):
 
     # Fix PocketBase records that point to child transactions
     if pb_id_map:
+        batch = client.create_batch()
+        updated_any = False
         for old_tx_id, new_tx_id in pb_id_map.items():
             if old_tx_id != new_tx_id:
                 pb_ids = pb_records.get(old_tx_id, [])
                 for pb_id in pb_ids:
-                    try:
-                        client.collection("receipts").update(pb_id, {"tx_id": new_tx_id})
-                        print(f"  ✅ Updated PocketBase record {pb_id} to point to parent tx {new_tx_id} (was child {old_tx_id})")
-                    except Exception as e:
-                        print(f"  ❌ Failed to update PB record {pb_id}: {e}")
+                    batch.collection("receipts").update(pb_id, {"tx_id": new_tx_id})
+                    updated_any = True
+                    print(f"  ✅ Queued update for PocketBase record {pb_id} to point to parent tx {new_tx_id} (was child {old_tx_id})")
                 if old_tx_id in pb_records:
                     pb_records.setdefault(new_tx_id, []).extend(pb_records.pop(old_tx_id))
+        if updated_any:
+            try:
+                batch.send()
+                print("  ✅ Batch updated PocketBase child transactions successfully.")
+            except Exception as e:
+                print(f"  ❌ Failed to batch update PB child transactions: {e}")
+
+    # Fix PocketBase records missing images
+    if anomalies:
+        print(f"\n🔧 Fixing {len(anomalies)} PocketBase receipts missing images using batch API...")
+        from pdf2image import convert_from_path
+        
+        batch = client.create_batch()
+        updated_any_images = False
+        for r in anomalies:
+            source_ref = getattr(r, "source_ref", "")
+            filename = source_ref.split("/")[-1]
+            local_path = os.path.join("cache", filename)
+            
+            if not os.path.exists(local_path):
+                print(f"  ❌ Local file not found for {r.id}: {local_path}")
+                continue
+                
+            image_paths = []
+            if local_path.lower().endswith(".pdf"):
+                images = convert_from_path(local_path)
+                for idx, img in enumerate(images):
+                    img_path = f"{local_path}_page_{idx}.jpg"
+                    if not os.path.exists(img_path):
+                        img.save(img_path, format="JPEG")
+                    image_paths.append(img_path)
+            else:
+                image_paths.append(local_path)
+                
+            if not image_paths:
+                print(f"  ❌ Failed to extract images for {r.id}")
+                continue
+                
+            uploads = []
+            for idx, path in enumerate(image_paths):
+                with open(path, "rb") as f:
+                    uploads.append((f"page_{idx}.jpg", f.read()))
+            
+            # Manually construct request for batch with files
+            batch.requests.append({
+                "method": "PATCH",
+                "url": f"/api/collections/receipts/records/{r.id}",
+                "json": None,
+                "files": {"image": uploads},
+                "headers": None,
+            })
+            updated_any_images = True
+            print(f"  ✅ Queued image upload for PocketBase record {r.id}")
+            
+        if updated_any_images:
+            try:
+                batch.send()
+                print("  ✅ Batch updated PocketBase images successfully.")
+            except Exception as e:
+                print(f"  ❌ Failed to batch update PB images: {e}")
+
 
     # Fix 1 & 3: For tx_ids in PB but not in Actual's #receipt list,
     # check if the tx actually exists in Actual. If yes → add #receipt. If no → delete PB record.
