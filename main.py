@@ -680,14 +680,23 @@ def clear_cache_command(cache_type: str = None):
     from graph.cache import _get_client
     import os, shutil
     
-    if cache_type in (None, "redis"):
+    if cache_type in (None, "ocr", "parsed"):
         client = _get_client()
-        keys = client.keys("receipt:*")
+        if cache_type == "ocr":
+            keys = client.keys("receipt:*:ocr")
+            msg = " (OCR only)"
+        elif cache_type == "parsed":
+            keys = client.keys("receipt:*:parsed")
+            msg = " (Parsed only)"
+        else:
+            keys = client.keys("receipt:*")
+            msg = ""
+            
         if keys:
             client.delete(*keys)
-            print(f"Cleared {len(keys)} entries from Redis cache.")
+            print(f"Cleared {len(keys)} entries from Redis cache{msg}.")
         else:
-            print("Redis cache is already empty.")
+            print(f"Redis cache{msg} is already empty.")
     
     if cache_type in (None, "images"):
         local_cache_dir = os.path.join(os.getcwd(), "cache")
@@ -716,15 +725,27 @@ def purge_cache_command(ids: list[str], cache_type: str = None):
     client = _get_client()
     ids_set = set(ids)
     
-    if cache_type in (None, "redis"):
+    if cache_type in (None, "ocr", "parsed"):
         deleted_redis = 0
         for file_hash in ids_set:
-            keys = client.keys(f"receipt:{file_hash}:*")
+            if cache_type == "ocr":
+                keys = client.keys(f"receipt:{file_hash}:ocr")
+            elif cache_type == "parsed":
+                keys = client.keys(f"receipt:{file_hash}:parsed")
+            else:
+                keys = client.keys(f"receipt:{file_hash}:*")
+                
             if keys:
                 client.delete(*keys)
                 deleted_redis += len(keys)
                 
-        print(f"Purged {deleted_redis} Redis cache entries for {len(ids_set)} specified IDs.")
+        if cache_type == "ocr":
+            msg = " (OCR only)"
+        elif cache_type == "parsed":
+            msg = " (Parsed only)"
+        else:
+            msg = ""
+        print(f"Purged {deleted_redis} Redis cache entries{msg} for {len(ids_set)} specified IDs.")
     
     if cache_type in (None, "images"):
         local_cache_dir = os.path.join(os.getcwd(), "cache")
@@ -1013,11 +1034,11 @@ if __name__ == "__main__":
 
     cache_prune_parser = cache_subparsers.add_parser("prune", help="Remove cache for entries that exist in Pocketbase")
     cache_clear_parser = cache_subparsers.add_parser("clear", help="Remove all cache used by the application")
-    cache_clear_parser.add_argument("--type", choices=["redis", "images", "checkpoints"], help="Specific cache type to clear")
+    cache_clear_parser.add_argument("--type", choices=["ocr", "parsed", "images", "checkpoints"], help="Specific cache type to clear")
     
     cache_purge_parser = cache_subparsers.add_parser("purge", help="Remove cache for specific entry IDs")
     cache_purge_parser.add_argument("ids", nargs="+", help="List of cache entry IDs (hashes) to purge")
-    cache_purge_parser.add_argument("--type", choices=["redis", "images", "checkpoints"], help="Specific cache type to purge")
+    cache_purge_parser.add_argument("--type", choices=["ocr", "parsed", "images", "checkpoints"], help="Specific cache type to purge")
 
     # `flag` subcommand
     flag_parser = subparsers.add_parser("flag", help="Flag a file or pocketbase entry for deletion/cleanup")
