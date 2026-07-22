@@ -71,7 +71,8 @@ async def process_receipt(local_path: str, gdrive_source_ref: str, include_flagg
             if current_state.next and "human_approval" in current_state.next:
                 not_a_receipt = current_state.values.get("not_a_receipt")
                 forex_receipt = current_state.values.get("forex_receipt")
-                reason = "not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match")
+                parsing_failed = current_state.values.get("parsing_failed")
+                reason = "parsing-failed" if parsing_failed else ("not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match"))
                 
                 if include_flagged and reason in include_flagged:
                     print(f"⚠️ {gdrive_source_ref} was paused ({reason}), but --include-flagged {reason} is set. Re-running workflow...")
@@ -92,9 +93,13 @@ async def process_receipt(local_path: str, gdrive_source_ref: str, include_flagg
             if current_state.next and "human_approval" in current_state.next:
                 not_a_receipt = current_state.values.get("not_a_receipt")
                 forex_receipt = current_state.values.get("forex_receipt")
-                reason = "not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match")
+                parsing_failed = current_state.values.get("parsing_failed")
+                reason = "parsing-failed" if parsing_failed else ("not-receipt" if not_a_receipt else ("forex-receipt" if forex_receipt else "no-match"))
                 print(f"⚠️ Transaction needs manual review ({reason}). Pausing and deferring to end of batch.")
                 return {"status": "newly_paused", "config": config, "state": current_state, "reason": reason}
+            
+            if "error" in current_state.values:
+                return {"status": "error", "error": current_state.values["error"]}
                 
             return {"status": "finished"}
 
@@ -161,6 +166,10 @@ async def amain(include_flagged: list = None):
                 reason = res.get("reason", "unknown")
                 paused_receipts.append((gdrive_source_ref, local_path, res["config"], res["state"], reason))
                 print(f"--- Finished processing for {gdrive_source_ref} (Paused: {reason}) ---\n")
+            elif res and res.get("status") == "error":
+                print(f"❌ Graph error: {res.get('error')}")
+                print(f"--- Finished processing for {gdrive_source_ref} (Error) ---\n")
+                failed_receipts.append(gdrive_source_ref)
             elif res and res.get("status") == "finished":
                 print(f"--- Finished processing for {gdrive_source_ref} ---\n")
                 
@@ -176,9 +185,14 @@ async def amain(include_flagged: list = None):
         print(f"\n{len(paused_receipts)} receipts require manual review.")
         not_receipt_count = sum(1 for p in paused_receipts if p[4] == "not-receipt")
         no_match_count = sum(1 for p in paused_receipts if p[4] == "no-match")
+        parsing_failed_count = sum(1 for p in paused_receipts if p[4] == "parsing-failed")
         
-        print(f"  - {not_receipt_count} classified as NOT a receipt (not-receipt)")
-        print(f"  - {no_match_count} agent failed to match (no-match)")
+        if not_receipt_count > 0:
+            print(f"  - {not_receipt_count} classified as NOT a receipt (not-receipt)")
+        if no_match_count > 0:
+            print(f"  - {no_match_count} agent failed to match (no-match)")
+        if parsing_failed_count > 0:
+            print(f"  - {parsing_failed_count} failed to extract data (parsing-failed)")
         print("Run 'python main.py review' to process them.")
         
     if failed_receipts:
@@ -662,26 +676,36 @@ def prune_cache_command():
     
     print(f"Pruned {deleted_local} local cache files for already processed receipts.")
 
-def clear_cache_command():
+def clear_cache_command(cache_type: str = None):
     from graph.cache import _get_client
     import os, shutil
     
-    client = _get_client()
-    keys = client.keys("receipt:*")
-    if keys:
-        client.delete(*keys)
-        print(f"Cleared {len(keys)} entries from Redis cache.")
-    else:
-        print("Redis cache is already empty.")
+    if cache_type in (None, "redis"):
+        client = _get_client()
+        keys = client.keys("receipt:*")
+        if keys:
+            client.delete(*keys)
+            print(f"Cleared {len(keys)} entries from Redis cache.")
+        else:
+            print("Redis cache is already empty.")
     
-    local_cache_dir = os.path.join(os.getcwd(), "cache")
-    if os.path.exists(local_cache_dir):
-        shutil.rmtree(local_cache_dir)
-        print(f"Cleared local file cache at {local_cache_dir}")
-    else:
-        print("Local cache is already empty.")
+    if cache_type in (None, "images"):
+        local_cache_dir = os.path.join(os.getcwd(), "cache")
+        if os.path.exists(local_cache_dir):
+            shutil.rmtree(local_cache_dir)
+            print(f"Cleared local file cache at {local_cache_dir}")
+        else:
+            print("Local cache is already empty.")
 
-def purge_cache_command(ids: list[str]):
+    if cache_type in (None, "checkpoints"):
+        db_path = os.path.join("data", "checkpoints.sqlite")
+        if os.path.exists(db_path):
+            os.remove(db_path)
+            print(f"Cleared checkpoints database at {db_path}")
+        else:
+            print("Checkpoints database is already empty.")
+
+def purge_cache_command(ids: list[str], cache_type: str = None):
     from graph.cache import _get_client, _file_hash
     import os
     
@@ -692,30 +716,78 @@ def purge_cache_command(ids: list[str]):
     client = _get_client()
     ids_set = set(ids)
     
-    deleted_redis = 0
-    for file_hash in ids_set:
-        keys = client.keys(f"receipt:{file_hash}:*")
-        if keys:
-            client.delete(*keys)
-            deleted_redis += len(keys)
-            
-    print(f"Purged {deleted_redis} Redis cache entries for {len(ids_set)} specified IDs.")
+    if cache_type in (None, "redis"):
+        deleted_redis = 0
+        for file_hash in ids_set:
+            keys = client.keys(f"receipt:{file_hash}:*")
+            if keys:
+                client.delete(*keys)
+                deleted_redis += len(keys)
+                
+        print(f"Purged {deleted_redis} Redis cache entries for {len(ids_set)} specified IDs.")
     
-    local_cache_dir = os.path.join(os.getcwd(), "cache")
-    deleted_local = 0
-    if os.path.exists(local_cache_dir):
-        for filename in os.listdir(local_cache_dir):
-            file_path = os.path.join(local_cache_dir, filename)
-            if os.path.isfile(file_path):
-                try:
-                    fhash = _file_hash(file_path)
-                    if fhash in ids_set:
-                        os.unlink(file_path)
-                        deleted_local += 1
-                except Exception:
-                    pass
-                    
-    print(f"Purged {deleted_local} local cache files for specified IDs.")
+    if cache_type in (None, "images"):
+        local_cache_dir = os.path.join(os.getcwd(), "cache")
+        deleted_local = 0
+        if os.path.exists(local_cache_dir):
+            for filename in os.listdir(local_cache_dir):
+                file_path = os.path.join(local_cache_dir, filename)
+                if os.path.isfile(file_path):
+                    try:
+                        fhash = _file_hash(file_path)
+                        if fhash in ids_set:
+                            os.unlink(file_path)
+                            deleted_local += 1
+                    except Exception:
+                        pass
+                        
+        print(f"Purged {deleted_local} local cache files for specified IDs.")
+
+    if cache_type in (None, "checkpoints"):
+        db_path = os.path.join("data", "checkpoints.sqlite")
+        if os.path.exists(db_path):
+            import sqlite3
+            hash_to_name = {}
+            local_cache_dir = os.path.join(os.getcwd(), "cache")
+            if os.path.exists(local_cache_dir):
+                for filename in os.listdir(local_cache_dir):
+                    file_path = os.path.join(local_cache_dir, filename)
+                    if os.path.isfile(file_path):
+                        try:
+                            hash_to_name[_file_hash(file_path)] = filename
+                        except Exception:
+                            pass
+            
+            try:
+                from tools.pocketbase_client import get_pb_client
+                pb_client = get_pb_client()
+                for h in ids_set:
+                    if h not in hash_to_name:
+                        records = pb_client.collection("receipts").get_list(1, 1, query_params={
+                            "filter": f"source_hash='{h}'",
+                            "fields": "source_ref"
+                        })
+                        if records.items:
+                            ref = getattr(records.items[0], "source_ref", "")
+                            if ref:
+                                hash_to_name[h] = ref.split('/')[-1]
+            except Exception:
+                pass
+
+            conn = sqlite3.connect(db_path)
+            deleted_checkpoints = 0
+            for file_hash in ids_set:
+                filename = hash_to_name.get(file_hash)
+                if filename:
+                    pattern = f"%/{filename}"
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM checkpoints WHERE thread_id LIKE ?", (pattern,))
+                    cursor.execute("DELETE FROM writes WHERE thread_id LIKE ?", (pattern,))
+                    if cursor.rowcount > 0:
+                        deleted_checkpoints += 1
+            conn.commit()
+            conn.close()
+            print(f"Purged checkpoints for {deleted_checkpoints} specified IDs.")
 
 def flag_source_command(filename: str, delete: bool = False):
     gdrive_path = os.environ.get("RECEIPT_GDRIVE_PATH")
@@ -941,9 +1013,11 @@ if __name__ == "__main__":
 
     cache_prune_parser = cache_subparsers.add_parser("prune", help="Remove cache for entries that exist in Pocketbase")
     cache_clear_parser = cache_subparsers.add_parser("clear", help="Remove all cache used by the application")
+    cache_clear_parser.add_argument("--type", choices=["redis", "images", "checkpoints"], help="Specific cache type to clear")
     
     cache_purge_parser = cache_subparsers.add_parser("purge", help="Remove cache for specific entry IDs")
     cache_purge_parser.add_argument("ids", nargs="+", help="List of cache entry IDs (hashes) to purge")
+    cache_purge_parser.add_argument("--type", choices=["redis", "images", "checkpoints"], help="Specific cache type to purge")
 
     # `flag` subcommand
     flag_parser = subparsers.add_parser("flag", help="Flag a file or pocketbase entry for deletion/cleanup")
@@ -982,9 +1056,9 @@ if __name__ == "__main__":
             elif getattr(args, "cache_command", None) == "prune":
                 prune_cache_command()
             elif getattr(args, "cache_command", None) == "clear":
-                clear_cache_command()
+                clear_cache_command(getattr(args, "type", None))
             elif getattr(args, "cache_command", None) == "purge":
-                purge_cache_command(args.ids)
+                purge_cache_command(args.ids, getattr(args, "type", None))
             else:
                 cache_parser.print_help()
         elif cmd == "flag":

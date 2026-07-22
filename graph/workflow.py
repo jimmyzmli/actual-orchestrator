@@ -38,6 +38,7 @@ class ReceiptState(TypedDict, total=False):
     human_approved: bool
     not_a_receipt: bool   # True if content was classified as not a receipt
     forex_receipt: bool   # True if currency is not CAD
+    parsing_failed: bool  # True if deepseek parsing failed entirely
 
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -180,24 +181,43 @@ def parse_receipt_node(state: ReceiptState):
             return {"not_a_receipt": True}
         
         # ── Step 2: Structured extraction (only if it IS a receipt) ──
-        structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
-        
         prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total', 'currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations."),
             ("human", "Here is the raw OCR text:\n\n{ocr_text}")
         ])
         
-        chain = prompt | structured_llm
-        
         prompt_val = prompt.format_prompt(ocr_text=state["ocr_text"])
         print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+
+        try:
+            structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
+            chain = prompt | structured_llm
+            result = chain.invoke({"ocr_text": state["ocr_text"]})
+            parsed_dict = result.dict()
+        except Exception as e:
+            print(f"  ⚠️ Initial parsing failed: {e}. Retrying with deepseek-chat (pro model)...")
+            try:
+                pro_llm = ChatOpenAI(
+                    model="deepseek-chat", 
+                    api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
+                    base_url="https://api.deepseek.com/v1",
+                    max_tokens=1024
+                )
+                pro_structured_llm = pro_llm.with_structured_output(ParsedReceipt, method="json_mode")
+                pro_chain = prompt | pro_structured_llm
+                result = pro_chain.invoke({"ocr_text": state["ocr_text"]})
+                parsed_dict = result.dict()
+            except Exception as pro_e:
+                print(f"  ❌ Pro model also failed: {pro_e}. Flagging for review.")
+                return {"parsing_failed": True}
         
-        result = chain.invoke({"ocr_text": state["ocr_text"]})
-        
-        parsed_dict = result.dict()
         set_parsed(file_path, parsed_dict)
         
-        currency = parsed_dict.get("currency", "CAD").upper()
+        currency = parsed_dict.get("currency", "CAD")
+        if currency:
+            currency = currency.upper()
+        else:
+            currency = "CAD"
         forex_receipt = currency != "CAD"
             
         return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt}
@@ -758,7 +778,7 @@ def router_after_parse(state: ReceiptState):
     """Route after parse_receipt: non-receipts go to human review."""
     if state.get("status") == "error":
         return "error"
-    if state.get("not_a_receipt"):
+    if state.get("not_a_receipt") or state.get("parsing_failed"):
         return "human_approval"
     return "continue"
 
