@@ -326,7 +326,7 @@ async def _deterministic_search(session, receipt_date: str, receipt_cents: int,
     try:
         res = await session.call_tool("actual_query", {"args": [
             "run", "--table", "transactions",
-            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name,is_child,parent_id",
+            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name,is_child,parent_id,transfer_id",
             "--filter", json.dumps(filter_obj),
             "--format", "json",
         ]})
@@ -337,6 +337,9 @@ async def _deterministic_search(session, receipt_date: str, receipt_cents: int,
         parent_map = {}
         candidates = []
         for c in raw_candidates:
+            if c.get("transfer_id"):
+                continue  # Skip transfers
+                
             if c.get("is_child") and c.get("parent_id"):
                 pid = c["parent_id"]
                 if pid not in parent_map:
