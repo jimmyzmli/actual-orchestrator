@@ -1,0 +1,23 @@
+[project]
+name = "actual-orch"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+    "langchain",
+    "langchain-openai",
+    "langchain-google-genai",
+    "mcp",
+    "pdf2image",
+    "pocketbase",
+    "python-dotenv",
+    "pydantic",
+    "redis",
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["actual_orch*"]

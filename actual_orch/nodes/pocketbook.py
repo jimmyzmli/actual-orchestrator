@@ -1,19 +1,7 @@
-import os
-from pocketbase import PocketBase
-
-def get_pb_client():
-    pb_url = os.environ.get("PB_UPLOAD_BASE_URL")
-    pb_user = os.environ.get("PB_USER")
-    pb_pass = os.environ.get("PB_PASSWORD")
-    
-    if not pb_url or not pb_user or not pb_pass:
-        raise ValueError("PocketBase credentials not found in environment")
-        
-    client = PocketBase(pb_url)
-    client.collection("users").auth_with_password(pb_user, pb_pass)
-    return client
-
+import json
 from pocketbase.models.file_upload import FileUpload
+from actual_orch.clients.pocketbase import get_pb_client
+from actual_orch.clients.cache import _file_hash
 
 def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None):
     """
@@ -28,7 +16,6 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
     """
     client = get_pb_client()
     
-    import json
     data = {
         "tx_id": transaction_id,
         "lines": json.dumps(lines),
@@ -69,37 +56,6 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
     except Exception as e:
         raise Exception(f"Failed to upsert to pocketbase: {e}")
 
-def fetch_all_source_hashes():
-    """
-    Fetch all source_hash values from PocketBase in a single paginated sweep.
-    Uses `fields=source_hash` and `skipTotal=true` to minimise payload and
-    skip the expensive COUNT(*) query on the server.
-    Returns a set of hash strings.
-    """
-    client = get_pb_client()
-    hashes = set()
-    page = 1
-    per_page = 500
-    while True:
-        try:
-            records = client.collection("receipts").get_list(page, per_page, query_params={
-                "fields": "source_hash",
-                "skipTotal": "true",
-            })
-            for r in records.items:
-                h = getattr(r, "source_hash", None)
-                if h:
-                    hashes.add(h)
-            # If fewer items than perPage, we've reached the last page
-            if len(records.items) < per_page:
-                break
-            page += 1
-        except Exception as e:
-            print(f"⚠️ Error fetching source hashes page {page}: {e}")
-            break
-    return hashes
-
-
 def check_receipt_exists(source_hash, _cached_hashes=None):
     """
     Returns True if a receipt with the given source_hash already exists in PocketBase.
@@ -138,3 +94,38 @@ def delete_receipt_by_hash(source_hash):
     except Exception as e:
         print(f"Error deleting from pocketbase: {e}")
     return False
+
+def skip_if_processed(state: dict):
+    """Check PocketBase source_hash to skip already-processed files."""
+    file_path = state.get("file_path", "")
+    if file_path:
+        file_hash = _file_hash(file_path)
+        if check_receipt_exists(file_hash):
+            print(f"⏭️  Already processed in PocketBase (hash {file_hash[:12]}...): {file_path}")
+            return {"status": "already_processed"}
+    return {}
+
+def save_pocketbase_node(state: dict):
+    """Save the receipt and items to PocketBase"""
+    try:
+        print("Saving to PocketBase...")
+        parsed = state.get("parsed_data")
+        tx_id = state.get("actual_tx_id")
+        
+        if not parsed or not tx_id or tx_id == "unknown_id":
+            return {"status": "error", "error": "Missing parsed data or valid tx_id (was unknown_id)"}
+            
+        date = parsed["date"]
+        amount = parsed["total"]
+        payee = parsed["payee"]
+        lines = parsed.get("items", [])
+        source_ref = state.get("gdrive_path", "")
+        image_paths = state.get("image_paths", [])
+        file_path = state.get("file_path", "")
+        source_hash = _file_hash(file_path) if file_path else ""
+        
+        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, source_hash, image_paths)
+        
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "error": f"PocketBase save failed: {str(e)}"}
