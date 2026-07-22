@@ -128,6 +128,10 @@ async def amain(include_flagged: list = None):
     known_hashes = fetch_all_source_hashes()
     print(f"Loaded {len(known_hashes)} existing receipt hashes from PocketBase.")
     
+    print(f"Syncing files from {gdrive_path} to {tmpdir}...")
+    subprocess.check_call(["rclone", "copy", gdrive_path, tmpdir])
+    print("Sync complete.")
+    
     paused_receipts = []
     failed_receipts = []
     
@@ -136,10 +140,10 @@ async def amain(include_flagged: list = None):
         gdrive_source_ref = f"{gdrive_path}/{filename}"
         
         try:
-            # Download if needed (cheap — rclone skips if already present)
             local_path = os.path.join(tmpdir, filename)
             if not os.path.exists(local_path):
-                local_path = download_file(gdrive_path, filename, tmpdir)
+                print(f"File {local_path} missing after sync. Skipping.")
+                continue
 
             # Dedup by file content hash (O(1) set lookup, no HTTP)
             from graph.cache import _file_hash
