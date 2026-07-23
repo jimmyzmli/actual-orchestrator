@@ -10,20 +10,30 @@ import json
 import os
 from typing import Optional
 
-import redis
+try:
+    import redis
+except ImportError:
+    redis = None
 
-_client: Optional[redis.Redis] = None
+_client: Optional['redis.Redis'] = None
 
 CACHE_PREFIX = "receipt:"
 
-
-def _get_client() -> redis.Redis:
-    """Lazy-init a Redis connection (reused across calls)."""
+def _init_cache():
     global _client
-    if _client is None:
-        url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    if _client is not None:
+        return
+        
+    url = os.environ.get("REDIS_URL", "")
+    if not url or not redis:
+        raise ValueError("REDIS_URL environment variable is not set or redis python package is missing.")
+        
+    try:
         _client = redis.from_url(url, decode_responses=True)
-    return _client
+        # test connection
+        _client.ping()
+    except Exception as e:
+        raise ConnectionError(f"Failed to connect to Redis at {url}: {e}")
 
 
 def _file_hash(file_path: str) -> str:
@@ -37,28 +47,49 @@ def _file_hash(file_path: str) -> str:
 
 # ── public helpers ────────────────────────────────────────────
 
-def get_ocr(file_path: str) -> Optional[str]:
+def get_ocr(file_path: str, prefix: str = "receipt_") -> Optional[str]:
     """Return cached OCR text for *file_path*, or None."""
-    key = f"{CACHE_PREFIX}{_file_hash(file_path)}:ocr"
-    return _get_client().get(key)
+    _init_cache()
+    h = _file_hash(file_path)
+    return _client.get(f"{prefix}{h}:ocr")
 
 
-def set_ocr(file_path: str, text: str) -> None:
+def set_ocr(file_path: str, text: str, prefix: str = "receipt_") -> None:
     """Store OCR text (no expiry – persist forever)."""
-    key = f"{CACHE_PREFIX}{_file_hash(file_path)}:ocr"
-    _get_client().set(key, text)
+    _init_cache()
+    h = _file_hash(file_path)
+    _client.set(f"{prefix}{h}:ocr", text)
 
 
-def get_parsed(file_path: str) -> Optional[dict]:
-    """Return cached parsed receipt dict, or None."""
-    key = f"{CACHE_PREFIX}{_file_hash(file_path)}:parsed"
-    raw = _get_client().get(key)
+def get_parsed(file_path: str, prefix: str = "receipt_") -> Optional[dict]:
+    """Return cached parsed dict, or None."""
+    _init_cache()
+    h = _file_hash(file_path)
+    raw = _client.get(f"{prefix}{h}:parsed")
     if raw is not None:
         return json.loads(raw)
     return None
 
 
-def set_parsed(file_path: str, data: dict) -> None:
-    """Store parsed receipt dict as JSON."""
-    key = f"{CACHE_PREFIX}{_file_hash(file_path)}:parsed"
-    _get_client().set(key, json.dumps(data))
+def set_parsed(file_path: str, data: dict, prefix: str = "receipt_") -> None:
+    """Store parsed dict as JSON formatted to be human readable."""
+    _init_cache()
+    h = _file_hash(file_path)
+    _client.set(f"{prefix}{h}:parsed", json.dumps(data))
+
+
+def get_meta(file_path: str, prefix: str = "receipt_") -> Optional[dict]:
+    """Return cached metadata dict, or None."""
+    _init_cache()
+    h = _file_hash(file_path)
+    raw = _client.get(f"{prefix}{h}:meta")
+    if raw is not None:
+        return json.loads(raw)
+    return None
+
+
+def set_meta(file_path: str, meta: dict, prefix: str = "receipt_") -> None:
+    """Store metadata dict as JSON formatted to be human readable."""
+    _init_cache()
+    h = _file_hash(file_path)
+    _client.set(f"{prefix}{h}:meta", json.dumps(meta))
