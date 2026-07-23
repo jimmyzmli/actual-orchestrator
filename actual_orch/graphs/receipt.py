@@ -1,6 +1,6 @@
 import os
 import base64
-from typing import TypedDict, Dict, Any, List
+from typing import TypedDict, Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
@@ -36,8 +36,9 @@ class ReceiptItem(BaseModel):
 
 class ParsedReceipt(BaseModel):
     date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
-    total: float = Field(description="Total amount of the receipt")
+    total_cad: Optional[float] = Field(default=None, description="Total amount of the receipt in CAD ONLY if explicitly printed on the receipt. Do NOT calculate currency conversions yourself. If the receipt is in a foreign currency, leave this as null.")
     currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. If clearly from Canada or CAD is not explicitly stated otherwise, use CAD.")
+    total_foreign_currency: Optional[float] = Field(default=None, description="If the receipt is clearly in a foreign currency (not CAD), the exact total amount in that foreign currency. Otherwise leave as null.")
     payee: str = Field(description="Name of the store or payee")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
 
@@ -157,7 +158,7 @@ def parse_receipt_node(state: ReceiptState):
         
         # ── Step 2: Structured extraction (only if it IS a receipt) ──
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total', 'currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations."),
+            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Be very careful about classifying foreign receipts. If you detect a non-Canadian address, foreign language, or foreign currency symbol, set the 'currency' appropriately (e.g., USD, EUR, JPY) and put the exact amount in 'total_foreign_currency'. If it is CAD, leave 'total_foreign_currency' null."),
             ("human", "Here is the raw OCR text:\n\n{ocr_text}")
         ])
         
@@ -186,6 +187,10 @@ def parse_receipt_node(state: ReceiptState):
                 print(f"  ❌ Pro model also failed: {pro_e}. Flagging for review.")
                 return {"parsing_failed": True}
         
+        parsed_dict["total"] = parsed_dict.pop("total_cad", 0.0)
+        if "total_foreign_currency" in parsed_dict:
+            parsed_dict["foreign_amount"] = parsed_dict.pop("total_foreign_currency")
+        
         set_parsed(file_path, parsed_dict)
         
         currency = parsed_dict.get("currency", "CAD")
@@ -194,6 +199,22 @@ def parse_receipt_node(state: ReceiptState):
         else:
             currency = "CAD"
         forex_receipt = currency != "CAD"
+        
+        if forex_receipt and parsed_dict.get("foreign_amount"):
+            try:
+                import sys
+                utils_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils"))
+                if utils_path not in sys.path:
+                    sys.path.append(utils_path)
+                from modules.market import get_price
+                
+                price, _ = get_price(currency, parsed_dict.get("date"))
+                if price:
+                    cad_equiv = parsed_dict["foreign_amount"] * price
+                    parsed_dict["total"] = round(cad_equiv, 2)
+                    print(f"  [Forex] Converted {parsed_dict['foreign_amount']} {currency} to approx {parsed_dict['total']} CAD")
+            except Exception as e:
+                print(f"  ⚠️ Could not convert foreign amount to CAD: {e}")
             
         return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt}
     except Exception as e:
