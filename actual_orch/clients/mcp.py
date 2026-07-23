@@ -1,8 +1,7 @@
 import os
 import asyncio
 from contextlib import AsyncExitStack
-from mcp import StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 from mcp.client.session import ClientSession
 
 
@@ -23,17 +22,12 @@ class ActualMCPClient:
             return cls._instance.session
 
     async def _connect(self):
-        mcp_cli = os.getenv("ACTUAL_MCP_CLI", "actual-mcp")
+        mcp_endpoint = os.getenv("ACTUAL_MCP_ENDPOINT", "http://localhost:9991")
+        if not mcp_endpoint.endswith("/sse"):
+            mcp_endpoint = f"{mcp_endpoint.rstrip('/')}/sse"
 
-        import shlex
-        parts = shlex.split(mcp_cli)
-        server_params = StdioServerParameters(
-            command=parts[0],
-            args=parts[1:],
-            env=os.environ.copy(),
-        )
-        print("🚀 Starting shared Actual Budget MCP server instance via stdio...")
-        ctx = stdio_client(server_params)
+        print(f"🚀 Connecting to shared Actual Budget MCP server via SSE at {mcp_endpoint}...")
+        ctx = sse_client(mcp_endpoint)
         read, write = await self.stack.enter_async_context(ctx)
 
         session_ctx = ClientSession(read, write)
