@@ -19,6 +19,7 @@ class ReceiptState(TypedDict, total=False):
     ocr_text: str         # Text extracted by Gemini
     parsed_data: Dict[str, Any]
     actual_tx_id: str
+    actual_tx_id_transfer: str
     status: str
     error: str
     image_paths: List[str] # Paths to extracted JPEG images

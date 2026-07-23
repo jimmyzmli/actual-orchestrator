@@ -327,7 +327,13 @@ Task:
         else:
             return {"status": "error", "error": f"Actual Budget search failed: {str(e)}"}
             
-    return {"actual_tx_id": final_id}
+    transfer_id = None
+    if final_id != "unknown_id":
+        matched = next((c for c in scored if c["id"] == final_id), None)
+        if matched and matched.get("transfer_id"):
+            transfer_id = matched.get("transfer_id")
+            
+    return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
 
 
 async def tag_actual_transaction_node(state: dict):

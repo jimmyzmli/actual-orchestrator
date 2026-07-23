@@ -3,7 +3,7 @@ from pocketbase.models.file_upload import FileUpload
 from actual_orch.clients.pocketbase import get_pb_client
 from actual_orch.clients.cache import _file_hash
 
-def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None):
+def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None, tx_id_transfer=None):
     """
     transaction_id: The original 36 char UUID from actual budget
     lines: list of extracted items
@@ -13,6 +13,7 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
     payee: store name
     source_hash: SHA-256 hash of the source file for dedup
     image_paths: optional list of local paths to jpeg images
+    tx_id_transfer: The 36 char UUID of the other side of a transfer, if applicable
     """
     client = get_pb_client()
     
@@ -26,6 +27,9 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
         "source_ref": source_ref,
         "source_hash": source_hash
     }
+    
+    if tx_id_transfer:
+        data["tx_id_transfer"] = tx_id_transfer
     
     if image_paths:
         uploads = []
@@ -123,8 +127,9 @@ def save_pocketbase_node(state: dict):
         image_paths = state.get("image_paths", [])
         file_path = state.get("file_path", "")
         source_hash = _file_hash(file_path) if file_path else ""
+        tx_id_transfer = state.get("actual_tx_id_transfer")
         
-        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, source_hash, image_paths)
+        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, source_hash, image_paths, tx_id_transfer)
         
         return {"status": "success"}
     except Exception as e:
