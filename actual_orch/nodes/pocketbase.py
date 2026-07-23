@@ -33,7 +33,7 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
         data["tx_id_transfer"] = tx_id_transfer
         
     if parsed:
-        data["parsed"] = parsed
+        data["parsed"] = json.dumps(parsed)
     
     if image_paths:
         uploads = []

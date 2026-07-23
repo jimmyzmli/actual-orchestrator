@@ -13,6 +13,8 @@ dependencies = [
     "python-dotenv",
     "pydantic",
     "redis",
+    "docling",
+    "langgraph-checkpoint-sqlite",
 ]
 
 [build-system]

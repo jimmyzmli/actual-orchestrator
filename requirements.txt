@@ -9,3 +9,5 @@ python-dotenv
 pydantic
 langchain-google-genai
 redis
+docling
+langgraph-checkpoint-sqlite
