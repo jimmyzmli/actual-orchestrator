@@ -187,11 +187,11 @@ def parse_receipt_node(state: ReceiptState):
                 print(f"  ❌ Pro model also failed: {pro_e}. Flagging for review.")
                 return {"parsing_failed": True}
         
-        parsed_dict["total"] = parsed_dict.pop("total_cad", 0.0)
+        total_val = parsed_dict.pop("total_cad", None)
+        parsed_dict["total"] = total_val if total_val is not None else 0.0
+        
         if "total_foreign_currency" in parsed_dict:
             parsed_dict["foreign_amount"] = parsed_dict.pop("total_foreign_currency")
-        
-        set_parsed(file_path, parsed_dict)
         
         currency = parsed_dict.get("currency", "CAD")
         if currency:
@@ -215,6 +215,8 @@ def parse_receipt_node(state: ReceiptState):
                     print(f"  [Forex] Converted {parsed_dict['foreign_amount']} {currency} to approx {parsed_dict['total']} CAD")
             except Exception as e:
                 print(f"  ⚠️ Could not convert foreign amount to CAD: {e}")
+                
+        set_parsed(file_path, parsed_dict)
             
         return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt}
     except Exception as e:
@@ -245,7 +247,7 @@ def router_after_parse(state: ReceiptState):
 def router_after_search(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
-    if state.get("actual_tx_id") == "unknown_id" or state.get("forex_receipt"):
+    if state.get("actual_tx_id") == "unknown_id":
         return "human_approval"
     return "save_pocketbase"
 
