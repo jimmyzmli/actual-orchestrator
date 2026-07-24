@@ -20,6 +20,7 @@ class StatementState(TypedDict, total=False):
     error: str
     image_paths: List[str]
     use_gemini_only: bool
+    ocr_tool: str
 
 class ParsedInvestmentTx(BaseModel):
     date: Any = Field(description="Date of the transaction in YYYY-MM-DD format", default="")
@@ -47,14 +48,20 @@ def extract_ocr_node(state: StatementState):
             print("Using cached OCR text...")
             return {"ocr_text": cached, "image_paths": image_paths}
 
-        print(f"Extracting text with Docling for {file_path}...")
+        ocr_tool = state.get("ocr_tool", "docling")
+        print(f"Extracting text with {ocr_tool} for {file_path}...")
         
-        from docling.document_converter import DocumentConverter
-        converter = DocumentConverter()
-        result = converter.convert(file_path)
-        ocr_text = result.document.export_to_markdown()
+        if ocr_tool == "pdfplumber":
+            import pdfplumber
+            with pdfplumber.open(file_path) as pdf:
+                ocr_text = "\n\n".join([page.extract_text() or "" for page in pdf.pages])
+        else:
+            from docling.document_converter import DocumentConverter
+            converter = DocumentConverter()
+            result = converter.convert(file_path)
+            ocr_text = result.document.export_to_markdown()
             
-        if not ocr_text:
+        if not ocr_text or not ocr_text.strip():
             print(f"  -> WARNING: OCR text is empty!")
             
         set_ocr(file_path, ocr_text, prefix="statement_")
@@ -62,7 +69,7 @@ def extract_ocr_node(state: StatementState):
         meta = get_meta(file_path, prefix="statement_") or {}
         meta["source_file"] = f"file://{os.path.abspath(file_path)}"
         meta["ocr_generation_date"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        meta["ocr_model_used"] = "docling"
+        meta["ocr_model_used"] = ocr_tool
         set_meta(file_path, meta, prefix="statement_")
             
         return {"ocr_text": ocr_text, "image_paths": image_paths}
