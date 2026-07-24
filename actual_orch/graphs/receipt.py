@@ -9,19 +9,22 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 from pdf2image import convert_from_path
 
-from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed
+from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed, get_classify, set_classify
 from actual_orch.nodes.pocketbase import skip_if_processed, save_pocketbase_node
 from actual_orch.nodes.actual_budget import search_actual_transaction_node, tag_actual_transaction_node, estimate_tokens
+import datetime
 
 class ReceiptState(TypedDict, total=False):
-    file_path: str        # Local path to the downloaded PDF
-    gdrive_path: str      # Original gdrive path (for source_ref)
+    file_path: str        # Local path to the downloaded PDF or PNG
+    source_ref: str       # Original source reference (e.g. gdrive path or email msg_id)
+    source: str           # Source type (e.g. gdrive, email)
     ocr_text: str         # Text extracted by Gemini
     parsed_data: Dict[str, Any]
     actual_tx_id: str
     actual_tx_id_transfer: str
     status: str
     error: str
+    email_date: str
     image_paths: List[str] # Paths to extracted JPEG images
     proposed_transaction: str # JSON string of proposed transaction if not found
     human_approved: bool
@@ -50,18 +53,34 @@ def extract_ocr_node(state: ReceiptState):
         # If it's a PDF, we need page images for PocketBase upload and Gemini
         image_paths = []
         if file_path.lower().endswith(".pdf"):
+            gen_dir = os.path.join(os.getcwd(), "cache", "generated_image")
+            os.makedirs(gen_dir, exist_ok=True)
             images = convert_from_path(file_path)
             for idx, img in enumerate(images):
-                img_path = f"{file_path}_page_{idx}.jpg"
+                safe_name = os.path.basename(file_path) + f"_page_{idx}.jpg"
+                img_path = os.path.join(gen_dir, safe_name)
                 if not os.path.exists(img_path):
                     img.save(img_path, format="JPEG")
                 image_paths.append(img_path)
         else:
             # It's already an image (jpg/jpeg/png)
             image_paths.append(file_path)
+            
+        # Check if ocr_text is already provided (e.g. for emails)
+        prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
+        if "ocr_text" in state and state["ocr_text"]:
+            meta = {
+                "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "model": "email_client_parser",
+                "schema_version": "1.0.0"
+            }
+            set_ocr(file_path, state["ocr_text"], meta, prefix=prefix)
+            return {"ocr_text": state["ocr_text"], "image_paths": image_paths}
 
         # Check Redis cache
-        cached = get_ocr(file_path)
+        cached = get_ocr(file_path, prefix=prefix)
+        if cached is None and prefix != "receipt_":
+            cached = get_ocr(file_path, prefix="receipt_")
         if cached is not None:
             print("Using cached OCR text (Redis)...")
             return {"ocr_text": cached, "image_paths": image_paths}
@@ -105,9 +124,14 @@ def extract_ocr_node(state: ReceiptState):
         elif not isinstance(ocr_text, str):
             ocr_text = str(ocr_text)
             
-        set_ocr(file_path, ocr_text)
+        meta = {
+            "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": "gemini-3.1-flash-lite",
+            "schema_version": "1.0.0"
+        }
+        set_ocr(file_path, ocr_text, meta, prefix=prefix)
             
-        return {"ocr_text": ocr_text, "image_paths": image_paths}
+        return {"ocr_text": ocr_text, "image_paths": image_paths, "not_a_receipt": False}
     except Exception as e:
         return {"status": "error", "error": f"OCR failed: {str(e)}"}
 
@@ -121,7 +145,10 @@ def parse_receipt_node(state: ReceiptState):
         file_path = state["file_path"]
 
         # Check Redis cache
-        cached = get_parsed(file_path)
+        prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
+        cached = get_parsed(file_path, prefix=prefix)
+        if cached is None and prefix != "receipt_":
+            cached = get_parsed(file_path, prefix="receipt_")
         if cached is not None:
             print("Using cached parsed data (Redis)...")
             return {"parsed_data": cached}
@@ -140,20 +167,37 @@ def parse_receipt_node(state: ReceiptState):
         pause_if_peak_hours("deepseek")
         
         # ── Step 1: Classify whether this is actually a receipt ──
-        classify_prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record (anything representing a financial transaction with a date and amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
-            ("human", "{ocr_text}")
-        ])
-        classify_chain = classify_prompt | llm
-        
-        prompt_val = classify_prompt.format_prompt(ocr_text=state["ocr_text"])
-        print(f"  [Token Est] Classify prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
-        
-        classify_result = classify_chain.invoke({"ocr_text": state["ocr_text"]})
-        classification = classify_result.content.strip().upper()
+        classification = get_classify(file_path, prefix=prefix)
+        if classification is None and prefix != "receipt_":
+            classification = get_classify(file_path, prefix="receipt_")
+            
+        if classification is None:
+            classify_prompt = ChatPromptTemplate.from_messages([
+                ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record (anything representing a financial transaction with a date and amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
+                ("human", "{ocr_text}")
+            ])
+            classify_chain = classify_prompt | llm
+            
+            prompt_val = classify_prompt.format_prompt(ocr_text=state["ocr_text"])
+            print(f"  [Token Est] Classify prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+            
+            classify_result = classify_chain.invoke({"ocr_text": state["ocr_text"]})
+            classification = classify_result.content.strip().upper()
+            
+            meta = {
+                "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "model": "deepseek-v4-flash",
+                "schema_version": "1.0.0"
+            }
+            set_classify(file_path, classification, meta, prefix=prefix)
+        else:
+            print("Using cached classification data (Redis)...")
         
         if "NOT_RECEIPT" in classification:
-            print(f"⚠️  Content classified as NOT a receipt. Flagging for human review.")
+            if state.get("source") == "email":
+                print(f"  [Parse] Email classified as NOT a receipt. Skipping.")
+            else:
+                print(f"⚠️  Content classified as NOT a receipt. Flagging for human review.")
             return {"not_a_receipt": True}
         
         # ── Step 2: Structured extraction (only if it IS a receipt) ──
@@ -190,6 +234,9 @@ def parse_receipt_node(state: ReceiptState):
         total_val = parsed_dict.pop("total_cad", None)
         parsed_dict["total"] = total_val if total_val is not None else 0.0
         
+        if state.get("source") == "email" and state.get("email_date"):
+            parsed_dict["date"] = state["email_date"]
+        
         if "total_foreign_currency" in parsed_dict:
             parsed_dict["foreign_amount"] = parsed_dict.pop("total_foreign_currency")
         
@@ -216,9 +263,14 @@ def parse_receipt_node(state: ReceiptState):
             except Exception as e:
                 print(f"  ⚠️ Could not convert foreign amount to CAD: {e}")
                 
-        set_parsed(file_path, parsed_dict)
+        meta = {
+            "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": "deepseek-v4-flash" if "parsing_failed" not in locals() else "deepseek-chat",
+            "schema_version": "1.0.0"
+        }
+        set_parsed(file_path, parsed_dict, meta, prefix=prefix)
             
-        return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt}
+        return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt, "parsing_failed": False, "not_a_receipt": False}
     except Exception as e:
         return {"status": "error", "error": f"Parsing failed: {str(e)}"}
 
@@ -241,6 +293,8 @@ def router_after_parse(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
     if state.get("not_a_receipt") or state.get("parsing_failed"):
+        if state.get("source") == "email":
+            return "skip"
         return "human_approval"
     return "continue"
 
@@ -271,7 +325,7 @@ workflow.set_entry_point("dedup_check")
 
 workflow.add_conditional_edges("dedup_check", router_after_dedup, {"skip": END, "continue": "extract_ocr"})
 workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "parse_receipt"})
-workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_actual"})
+workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_actual", "skip": END})
 workflow.add_conditional_edges("search_actual", router_after_search, {"error": END, "human_approval": "human_approval", "save_pocketbase": "tag_actual"})
 workflow.add_conditional_edges("human_approval", router_after_human, {"save_pocketbase": "tag_actual", "skip": END})
 workflow.add_edge("tag_actual", "save_pocketbase")

@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 from pdf2image import convert_from_path
 
-from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed, get_meta, set_meta
+from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed
 import datetime
 
 class StatementState(TypedDict, total=False):
@@ -64,13 +64,15 @@ def extract_ocr_node(state: StatementState):
         if not ocr_text or not ocr_text.strip():
             print(f"  -> WARNING: OCR text is empty!")
             
-        set_ocr(file_path, ocr_text, prefix="statement_")
-        
-        meta = get_meta(file_path, prefix="statement_") or {}
-        meta["source_file"] = f"file://{os.path.abspath(file_path)}"
-        meta["ocr_generation_date"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        meta["ocr_model_used"] = ocr_tool
-        set_meta(file_path, meta, prefix="statement_")
+        meta = {
+            "source_file": f"file://{os.path.abspath(file_path)}",
+            "ocr_generation_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "ocr_model_used": ocr_tool,
+            "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": ocr_tool,
+            "schema_version": "1.0.0"
+        }
+        set_ocr(file_path, ocr_text, meta, prefix="statement_")
             
         return {"ocr_text": ocr_text, "image_paths": image_paths}
     except Exception as e:
@@ -120,14 +122,15 @@ def parse_statement_node(state: StatementState):
             print("  -> DeepSeek parsing completed (token usage unavailable without langchain-community)")
         
         parsed_dict = result.dict()
-        set_parsed(file_path, parsed_dict, prefix="statement_")
-        
-        meta = get_meta(file_path, prefix="statement_") or {}
-        meta["source_file"] = f"file://{os.path.abspath(file_path)}"
-        meta["parse_generation_date"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        meta["parse_model_used"] = "deepseek-chat"
-        meta["schema_version"] = "1.0.0"
-        set_meta(file_path, meta, prefix="statement_")
+        meta = {
+            "source_file": f"file://{os.path.abspath(file_path)}",
+            "parse_generation_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "parse_model_used": "deepseek-chat",
+            "schema_version": "1.0.0",
+            "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": "deepseek-chat"
+        }
+        set_parsed(file_path, parsed_dict, meta, prefix="statement_")
             
         return {"parsed_data": parsed_dict}
     except Exception as e:
@@ -147,9 +150,12 @@ def extract_and_parse_statement_node(state: StatementState):
         image_paths = state.get("image_paths", [])
         if not image_paths:
             if file_path.lower().endswith(".pdf"):
+                gen_dir = os.path.join(os.getcwd(), "cache", "generated_image")
+                os.makedirs(gen_dir, exist_ok=True)
                 images = convert_from_path(file_path, dpi=200)
                 for idx, img in enumerate(images):
-                    img_path = f"{file_path}_page_{idx}.jpg"
+                    safe_name = os.path.basename(file_path) + f"_page_{idx}.jpg"
+                    img_path = os.path.join(gen_dir, safe_name)
                     if not os.path.exists(img_path):
                         img.save(img_path, format="JPEG")
                     image_paths.append(img_path)
@@ -186,7 +192,12 @@ def extract_and_parse_statement_node(state: StatementState):
         result = structured_llm.invoke(messages)
         
         parsed_dict = result.dict()
-        set_parsed(file_path, parsed_dict)
+        meta = {
+            "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "model": "gemini-3.1-pro",
+            "schema_version": "1.0.0"
+        }
+        set_parsed(file_path, parsed_dict, meta)
             
         return {"parsed_data": parsed_dict, "image_paths": image_paths}
     except Exception as e:

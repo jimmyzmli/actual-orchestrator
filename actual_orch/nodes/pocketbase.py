@@ -3,7 +3,7 @@ from pocketbase.models.file_upload import FileUpload
 from actual_orch.clients.pocketbase import get_pb_client
 from actual_orch.clients.cache import _file_hash
 
-def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None, tx_id_transfer=None, parsed=None):
+def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None, tx_id_transfer=None, parsed=None, source="gdrive"):
     """
     transaction_id: The original 36 char UUID from actual budget
     lines: list of extracted items
@@ -24,7 +24,7 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
         "date": tx_date + " 00:00:00.000Z", # Pocketbase date format is 'YYYY-MM-DD HH:MM:SS.ZZZ'
         "amount": amount,
         "payee": payee,
-        "source": "gdrive",
+        "source": source,
         "source_ref": source_ref,
         "source_hash": source_hash
     }
@@ -104,7 +104,25 @@ def delete_receipt_by_hash(source_hash):
     return False
 
 def skip_if_processed(state: dict):
-    """Check PocketBase source_hash to skip already-processed files."""
+    """Check PocketBase source_hash or source_ref to skip already-processed files."""
+    source = state.get("source", "gdrive")
+    if source == "email":
+        source_ref = state.get("source_ref", "")
+        if source_ref:
+            client = get_pb_client()
+            try:
+                records = client.collection("receipts").get_list(1, 1, query_params={
+                    "filter": f"source_ref='{source_ref}'",
+                    "fields": "id",
+                    "skipTotal": "true",
+                })
+                if len(records.items) > 0:
+                    print(f"⏭️  Already processed email in PocketBase (ref {source_ref})")
+                    return {"status": "already_processed"}
+            except Exception:
+                pass
+        return {}
+
     file_path = state.get("file_path", "")
     if file_path:
         file_hash = _file_hash(file_path)
@@ -127,19 +145,35 @@ def save_pocketbase_node(state: dict):
         amount = parsed["total"]
         payee = parsed["payee"]
         lines = parsed.get("items", [])
-        source_ref = state.get("gdrive_path", "")
-        if source_ref:
+        
+        source = state.get("source", "gdrive")
+        source_ref = state.get("source_ref", state.get("gdrive_path", ""))
+        if source == "gdrive" and source_ref:
             source_ref = source_ref.split("/")[-1]
+            
         image_paths = state.get("image_paths", [])
         file_path = state.get("file_path", "")
-        source_hash = _file_hash(file_path) if file_path else ""
+        if source == "email":
+            source_hash = ""
+        else:
+            source_hash = _file_hash(file_path) if file_path else ""
         tx_id_transfer = state.get("actual_tx_id_transfer")
         
         parsed_to_save = dict(parsed)
         parsed_to_save["schema_version"] = "1.0.0"
         
-        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, source_hash, image_paths, tx_id_transfer, parsed_to_save)
+        res = save_receipt(tx_id, lines, date, source_ref, amount, payee, source_hash, image_paths, tx_id_transfer, parsed_to_save, source=source)
         
+        # Clean up generated images
+        if image_paths:
+            import os
+            for path in image_paths:
+                if "cache/generated_image" in path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        print(f"Warning: Failed to clean up {path}: {e}")
+                        
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "error": f"PocketBase save failed: {str(e)}"}
