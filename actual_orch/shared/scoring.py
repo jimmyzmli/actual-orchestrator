@@ -37,7 +37,7 @@ def _amount_similarity(receipt_cents: int, candidate_cents: int) -> float:
     return ratio
 
 
-def _date_proximity(receipt_date: str, candidate_date: str, max_days: int = 7) -> float:
+def _date_proximity(receipt_date: str, candidate_date: str, max_days: int = 2) -> float:
     """
     Linear decay over *max_days*.  Same-day → 1.0, max_days away → 0.0.
     """
@@ -64,9 +64,9 @@ def score_candidate(receipt_payee: str, receipt_cents: int, receipt_date: str, c
       - Date proximity:     0.30
       - Payee similarity:   0.10
     """
-    W_AMOUNT = 0.60
-    W_DATE   = 0.30
-    W_PAYEE  = 0.10
+    W_AMOUNT = 0.80
+    W_DATE   = 0.15
+    W_PAYEE  = 0.05
 
     cand_amount = abs(candidate.get("amount", 0))
     amount_score = _amount_similarity(receipt_cents, cand_amount)

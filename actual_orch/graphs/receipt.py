@@ -11,7 +11,7 @@ from pdf2image import convert_from_path
 
 from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed, get_classify, set_classify
 from actual_orch.nodes.pocketbase import skip_if_processed, save_pocketbase_node
-from actual_orch.nodes.actual_budget import search_actual_transaction_node, tag_actual_transaction_node, estimate_tokens
+from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, tag_actual_transaction_node, estimate_tokens
 import datetime
 
 class ReceiptState(TypedDict, total=False):
@@ -31,6 +31,8 @@ class ReceiptState(TypedDict, total=False):
     not_a_receipt: bool   # True if content was classified as not a receipt
     forex_receipt: bool   # True if currency is not CAD
     parsing_failed: bool  # True if deepseek parsing failed entirely
+    parse_retries: int    # Number of times parsing has been retried
+    log_agent: bool       # True if agent logs should be printed
 
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -135,43 +137,27 @@ def extract_ocr_node(state: ReceiptState):
     except Exception as e:
         return {"status": "error", "error": f"OCR failed: {str(e)}"}
 
-def parse_receipt_node(state: ReceiptState):
-    """Parse the OCR text using DeepSeek. First classifies whether the content
-    is actually a receipt; if not, flags it for human review."""
+def classify_input_node(state: ReceiptState):
+    """Classify whether the content is actually a receipt."""
     try:
         if not state.get("ocr_text"):
             return {"status": "error", "error": "No OCR text found"}
 
         file_path = state["file_path"]
-
-        # Check Redis cache
         prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
-        cached = get_parsed(file_path, prefix=prefix)
-        if cached is None and prefix != "receipt_":
-            cached = get_parsed(file_path, prefix="receipt_")
-        if cached is not None:
-            print("Using cached parsed data (Redis)...")
-            return {"parsed_data": cached}
-
-        print(f"Parsing receipt with DeepSeek...")
         
-        # Initialize DeepSeek model
-        llm = ChatOpenAI(
-            model="deepseek-v4-flash", 
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-            base_url="https://api.deepseek.com/v1",
-            max_tokens=1024
-        )
-        
-        from actual_orch.shared.peak_hours import pause_if_peak_hours
-        pause_if_peak_hours("deepseek")
-        
-        # ── Step 1: Classify whether this is actually a receipt ──
         classification = get_classify(file_path, prefix=prefix)
         if classification is None and prefix != "receipt_":
             classification = get_classify(file_path, prefix="receipt_")
             
         if classification is None:
+            llm = ChatOpenAI(
+                model="deepseek-v4-flash", 
+                api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
+                base_url="https://api.deepseek.com/v1",
+                max_tokens=64
+            )
+            
             classify_prompt = ChatPromptTemplate.from_messages([
                 ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record (anything representing a financial transaction with a date and amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
                 ("human", "{ocr_text}")
@@ -199,43 +185,77 @@ def parse_receipt_node(state: ReceiptState):
             else:
                 print(f"⚠️  Content classified as NOT a receipt. Flagging for human review.")
             return {"not_a_receipt": True}
+            
+        return {"not_a_receipt": False}
+    except Exception as e:
+        return {"status": "error", "error": f"Classification failed: {str(e)}"}
+
+def parse_receipt_node(state: ReceiptState):
+    """Parse the OCR text using DeepSeek."""
+    try:
+        file_path = state["file_path"]
+        prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
         
-        # ── Step 2: Structured extraction (only if it IS a receipt) ──
+        parse_retries = state.get("parse_retries", 0)
+        
+        if parse_retries == 0:
+            cached = get_parsed(file_path, prefix=prefix)
+            if cached is None and prefix != "receipt_":
+                cached = get_parsed(file_path, prefix="receipt_")
+            if cached is not None:
+                print("Using cached parsed data (Redis)...")
+                return {"parsed_data": cached}
+
+        model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"
+        print(f"Parsing receipt with {model_name} (retry {parse_retries})...")
+        
+        llm = ChatOpenAI(
+            model=model_name, 
+            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
+            base_url="https://api.deepseek.com/v1",
+            max_tokens=1024
+        )
+        
+        from actual_orch.shared.peak_hours import pause_if_peak_hours
+        pause_if_peak_hours("deepseek")
+        
+        source_type = state.get("source")
+        if source_type == "gdrive":
+            source_desc = "OCR text from a paper receipt"
+        elif source_type == "email":
+            source_desc = "raw text from an email receipt"
+        else:
+            source_desc = "OCR text from a receipt"
+            
+        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+
+        if parse_retries > 0:
+            prev_date = state.get("parsed_data", {}).get("date", "unknown")
+            system_prompt += f"\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction."
+
         prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are an expert at extracting structured data from raw OCR text of receipts. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Be very careful about classifying foreign receipts. If you detect a non-Canadian address, foreign language, or foreign currency symbol, set the 'currency' appropriately (e.g., USD, EUR, JPY) and put the exact amount in 'total_foreign_currency'. If it is CAD, leave 'total_foreign_currency' null."),
-            ("human", "Here is the raw OCR text:\n\n{ocr_text}")
+            ("system", system_prompt),
+            ("human", "Here is the {source_desc}:\n\n{ocr_text}")
         ])
         
-        prompt_val = prompt.format_prompt(ocr_text=state["ocr_text"])
+        prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"])
         print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
 
         try:
             structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
             chain = prompt | structured_llm
-            result = chain.invoke({"ocr_text": state["ocr_text"]})
+            result = chain.invoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
             parsed_dict = result.dict()
         except Exception as e:
-            print(f"  ⚠️ Initial parsing failed: {e}. Retrying with deepseek-chat (pro model)...")
-            try:
-                pro_llm = ChatOpenAI(
-                    model="deepseek-chat", 
-                    api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-                    base_url="https://api.deepseek.com/v1",
-                    max_tokens=1024
-                )
-                pro_structured_llm = pro_llm.with_structured_output(ParsedReceipt, method="json_mode")
-                pro_chain = prompt | pro_structured_llm
-                result = pro_chain.invoke({"ocr_text": state["ocr_text"]})
-                parsed_dict = result.dict()
-            except Exception as pro_e:
-                print(f"  ❌ Pro model also failed: {pro_e}. Flagging for review.")
-                return {"parsing_failed": True}
+            print(f"  ❌ Parsing failed: {e}. Flagging for review.")
+            return {"parsing_failed": True}
         
         total_val = parsed_dict.pop("total_cad", None)
         parsed_dict["total"] = total_val if total_val is not None else 0.0
         
         if state.get("source") == "email" and state.get("email_date"):
-            parsed_dict["date"] = state["email_date"]
+            if parse_retries == 0:
+                parsed_dict["date"] = state["email_date"]
         
         if "total_foreign_currency" in parsed_dict:
             parsed_dict["foreign_amount"] = parsed_dict.pop("total_foreign_currency")
@@ -265,14 +285,15 @@ def parse_receipt_node(state: ReceiptState):
                 
         meta = {
             "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "model": "deepseek-v4-flash" if "parsing_failed" not in locals() else "deepseek-chat",
+            "model": model_name,
             "schema_version": "1.0.0"
         }
         set_parsed(file_path, parsed_dict, meta, prefix=prefix)
             
-        return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt, "parsing_failed": False, "not_a_receipt": False}
+        return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt, "parsing_failed": False}
     except Exception as e:
         return {"status": "error", "error": f"Parsing failed: {str(e)}"}
+
 
 def human_approval_node(state: ReceiptState):
     """Placeholder node for human interrupt"""
@@ -288,20 +309,37 @@ def router_check_error(state: ReceiptState):
         return "error"
     return "continue"
 
-def router_after_parse(state: ReceiptState):
-    """Route after parse_receipt: non-receipts go to human review."""
+def router_after_classify(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
-    if state.get("not_a_receipt") or state.get("parsing_failed"):
+    if state.get("not_a_receipt"):
         if state.get("source") == "email":
             return "skip"
         return "human_approval"
     return "continue"
 
-def router_after_search(state: ReceiptState):
+def router_after_parse(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
-    if state.get("actual_tx_id") == "unknown_id":
+    if state.get("parsing_failed"):
+        return "human_approval"
+    return "continue"
+
+def router_after_search_deterministic(state: ReceiptState):
+    if state.get("status") == "error":
+        return "error"
+    if state.get("status") == "fallback_to_agent":
+        return "fallback_to_agent"
+    if state.get("actual_tx_id") != "unknown_id":
+        return "save_pocketbase"
+    return "error"
+
+def router_after_search_agent(state: ReceiptState):
+    if state.get("status") == "error":
+        return "error"
+    if state.get("status") == "retry_parse":
+        return "retry_parse"
+    if state.get("status") == "human_approval" or state.get("actual_tx_id") == "unknown_id":
         return "human_approval"
     return "save_pocketbase"
 
@@ -313,20 +351,33 @@ def router_after_human(state: ReceiptState):
 # Build Graph
 workflow = StateGraph(ReceiptState)
 
-workflow.add_node("dedup_check", skip_if_processed)
+workflow.add_node("skip_if_processed", skip_if_processed)
 workflow.add_node("extract_ocr", extract_ocr_node)
+workflow.add_node("classify_input", classify_input_node)
 workflow.add_node("parse_receipt", parse_receipt_node)
-workflow.add_node("search_actual", search_actual_transaction_node)
+workflow.add_node("search_deterministic", search_deterministic_node)
+workflow.add_node("search_agent", search_agent_node)
 workflow.add_node("human_approval", human_approval_node)
 workflow.add_node("tag_actual", tag_actual_transaction_node)
 workflow.add_node("save_pocketbase", save_pocketbase_node)
 
-workflow.set_entry_point("dedup_check")
+workflow.set_entry_point("skip_if_processed")
 
-workflow.add_conditional_edges("dedup_check", router_after_dedup, {"skip": END, "continue": "extract_ocr"})
-workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "parse_receipt"})
-workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_actual", "skip": END})
-workflow.add_conditional_edges("search_actual", router_after_search, {"error": END, "human_approval": "human_approval", "save_pocketbase": "tag_actual"})
-workflow.add_conditional_edges("human_approval", router_after_human, {"save_pocketbase": "tag_actual", "skip": END})
-workflow.add_edge("tag_actual", "save_pocketbase")
-workflow.add_edge("save_pocketbase", END)
+workflow.add_conditional_edges("skip_if_processed", router_after_dedup, {"skip": END, "continue": "extract_ocr"})
+workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "classify_input"})
+workflow.add_conditional_edges("classify_input", router_after_classify, {"error": END, "human_approval": "human_approval", "continue": "parse_receipt", "skip": END})
+workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_deterministic"})
+workflow.add_conditional_edges("search_deterministic", router_after_search_deterministic, {
+    "error": END, 
+    "fallback_to_agent": "search_agent", 
+    "save_pocketbase": "save_pocketbase"
+})
+workflow.add_conditional_edges("search_agent", router_after_search_agent, {
+    "error": END, 
+    "human_approval": "human_approval", 
+    "save_pocketbase": "save_pocketbase",
+    "retry_parse": "parse_receipt"
+})
+workflow.add_conditional_edges("human_approval", router_after_human, {"save_pocketbase": "save_pocketbase", "skip": END})
+workflow.add_edge("save_pocketbase", "tag_actual")
+workflow.add_edge("tag_actual", END)

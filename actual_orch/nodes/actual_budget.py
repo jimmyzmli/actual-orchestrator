@@ -24,23 +24,21 @@ class TransactionMatchResult(BaseModel):
     matched_id: Optional[str] = Field(description="The UUID of the best matching candidate transaction, if any. Leave null if no good match.")
 
 # ---------------------------------------------------------------------------
-# Deterministic search: query + score (no agent)
+# Shared query helper
 # ---------------------------------------------------------------------------
 
-async def _deterministic_search(session, receipt_date: str, receipt_cents: int,
-                                 receipt_payee: str) -> list[dict]:
+async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     """
-    Query Actual Budget for candidate transactions within ±7 days of
-    *receipt_date*, score them, and return them sorted best-first.
-    Each returned dict has an extra 'match_score' key.
+    Query Actual Budget for candidate transactions within ±1 days of receipt_date.
+    Returns the list of raw/reconstructed candidates, without filtering for #receipt.
     """
     try:
         rd = datetime.strptime(receipt_date, "%Y-%m-%d")
     except ValueError:
         return []
 
-    start_date = (rd - timedelta(days=7)).strftime("%Y-%m-%d")
-    end_date   = (rd + timedelta(days=7)).strftime("%Y-%m-%d")
+    start_date = (rd - timedelta(days=1)).strftime("%Y-%m-%d")
+    end_date   = (rd + timedelta(days=1)).strftime("%Y-%m-%d")
 
     filter_obj = {
         "date": {"$gte": start_date, "$lte": end_date},
@@ -61,9 +59,6 @@ async def _deterministic_search(session, receipt_date: str, receipt_cents: int,
         parent_map = {}
         candidates = []
         for c in raw_candidates:
-            if c.get("transfer_id"):
-                continue  # Skip transfers
-                
             if c.get("is_child") and c.get("parent_id"):
                 pid = c["parent_id"]
                 if pid not in parent_map:
@@ -74,132 +69,44 @@ async def _deterministic_search(session, receipt_date: str, receipt_cents: int,
                         "payee.name": c.get("payee.name"),
                         "imported_payee": c.get("imported_payee"),
                         "notes": c.get("notes") or "",
-                        "account.name": c.get("account.name")
+                        "account.name": c.get("account.name"),
+                        "children": []
                     }
                 parent_map[pid]["amount"] += c.get("amount", 0)
+                parent_map[pid]["children"].append(c)
                 # Ensure we catch #receipt if it's on any child
                 if "#receipt" in (c.get("notes") or "") and "#receipt" not in parent_map[pid]["notes"]:
                     parent_map[pid]["notes"] += " #receipt"
             else:
                 candidates.append(c)
-        candidates.extend(parent_map.values())
+                
+        for parent_tx in parent_map.values():
+            children = parent_tx.pop("children")
+            if parent_tx["amount"] == 0:
+                # Do not reconstruct; keep children as separate candidates
+                candidates.extend(children)
+            else:
+                candidates.append(parent_tx)
         
+        return candidates
     except Exception as e:
-        print(f"⚠️ Deterministic query failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print(f"⚠️ Query for candidates failed: {repr(e)}")
         return []
 
-    # Score every candidate
-    scored = []
-    for c in candidates:
-        # Skip transactions that already have #receipt tag (already matched)
-        notes = c.get("notes") or ""
-        if "#receipt" in notes:
-            continue
-        c["match_score"] = score_candidate(receipt_payee, receipt_cents, receipt_date, c)
-        scored.append(c)
-
-    scored.sort(key=lambda x: x["match_score"], reverse=True)
-    return scored
-
-
 # ---------------------------------------------------------------------------
-# LLM tiebreaker for ambiguous matches
+# Search Nodes (Deterministic and Agent)
 # ---------------------------------------------------------------------------
 
-async def _llm_tiebreaker(candidates: list[dict], receipt_payee: str,
-                           receipt_cents: int, receipt_date: str) -> Optional[str]:
+SCORE_AUTO_ACCEPT = 0.90
+
+async def search_deterministic_node(state: dict):
     """
-    Ask an LLM to pick the best candidate from a short-list.
-    Returns the transaction UUID or None if no good match.
+    Node 1: Deterministic matching and tiebreaker.
     """
-    if not candidates:
-        return None
-
-    llm = ChatOpenAI(
-        model="deepseek-v4-flash",
-        api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
-        base_url="https://api.deepseek.com/v1",
-        max_tokens=256,
-    )
-
-    candidate_descriptions = []
-    for i, c in enumerate(candidates[:5]):  # Max 5 candidates
-        candidate_descriptions.append(
-            f"  {i+1}. ID: {c['id']}\n"
-            f"     Date: {c.get('date', '?')}\n"
-            f"     Amount: ${abs(c.get('amount', 0))/100:.2f}\n"
-            f"     Payee: {c.get('payee.name', '?')}\n"
-            f"     Imported Payee: {c.get('imported_payee', '?')}\n"
-            f"     Account: {c.get('account.name', '?')}\n"
-            f"     Score: {c.get('match_score', 0):.3f}"
-        )
-
-    prompt = f"""You are a financial matching assistant. A receipt has been scanned and we need to find the matching bank transaction.
-
-Receipt details:
-- Date: {receipt_date}
-- Amount: ${receipt_cents/100:.2f}
-- Payee: {receipt_payee}
-
-Candidate transactions from the bank:
-{chr(10).join(candidate_descriptions)}
-
-Task: Pick the BEST matching transaction, or say NONE if none of them are a plausible match for this receipt.
-
-Rules:
-- The payee name on the receipt may differ from the bank's payee name (e.g., "Walmart" vs "WAL-MART SUPERCENTER #1234"). Use your judgment.
-- Small amount differences (tips, rounding, tax adjustments) are acceptable.
-- If the amounts are very different (>30% off), it's probably not a match unless the payees are a very strong match.
-- If there are multiple good candidates, pick the one with the closest amount AND most similar payee.
-
-YOUR RESPONSE MUST BE EXACTLY ONE OF:
-- The 36-character UUID of the best match (e.g., "abc12345-1234-1234-1234-123456789abc")
-- The word "NONE" if no candidate is a good match
-
-Do not explain your reasoning. Just output the UUID or NONE."""
-
-    print(f"  [Token Est] Tiebreaker prompt: ~{estimate_tokens(prompt)} tokens")
-
     try:
-        result = llm.invoke([HumanMessage(content=prompt)])
-        content = result.content.strip()
-
-        import re
-        uuid_match = re.search(
-            r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',
-            content, re.IGNORECASE,
-        )
-        if uuid_match:
-            matched_id = uuid_match.group(0)
-            # Validate that this ID is actually in our candidate list
-            valid_ids = {c["id"] for c in candidates}
-            if matched_id in valid_ids:
-                return matched_id
-            else:
-                print(f"⚠️ LLM returned UUID {matched_id} not in candidate list, ignoring.")
-        return None
-    except Exception as e:
-        print(f"⚠️ LLM tiebreaker failed: {e}")
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Main search node (hybrid: deterministic → LLM tiebreaker → agent fallback)
-# ---------------------------------------------------------------------------
-
-SCORE_AUTO_ACCEPT = 0.70
-SCORE_LLM_TIEBREAKER = 0.40
-
-async def search_actual_transaction_node(state: dict):
-    """Search for the transaction in Actual Budget using a hybrid approach:
-    1. Deterministic query + scoring
-    2. LLM tiebreaker for ambiguous matches
-    3. Agent fallback for when nothing is found
-    """
-    final_id = "unknown_id"
-    
-    try:
-        print("Matching transaction in Actual Budget...")
+        print("Matching transaction in Actual Budget (Deterministic)...")
         parsed = state.get("parsed_data")
         if not parsed:
             return {"status": "error", "error": "No parsed data found"}
@@ -211,41 +118,39 @@ async def search_actual_transaction_node(state: dict):
         
         session = await ActualMCPClient.get_session()
         
-        # ── Step 1: Deterministic search ──
-        scored = await _deterministic_search(session, date, receipt_cents, payee)
+        candidates = await get_actual_candidates(session, date)
+        if not candidates:
+            print("  No candidates found in date range, falling through to agent...")
+            return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
+            
+        # Score and filter
+        scored = []
+        for c in candidates:
+            c["match_score"] = score_candidate(payee, receipt_cents, date, c)
+            scored.append(c)
+            
+        scored.sort(key=lambda x: x["match_score"], reverse=True)
         
-        if scored:
-            top = scored[0]
-            top_score = top["match_score"]
-            print(f"  Top candidate: {top['id']} "
-                  f"(score={top_score:.3f}, payee={top.get('payee.name', '?')}, "
-                  f"amount=${abs(top.get('amount', 0))/100:.2f})")
+        if not scored:
+            print("  All candidates already tagged or none valid, falling through to agent...")
+            return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
             
-            if top_score >= SCORE_AUTO_ACCEPT:
-                # High confidence — auto-accept
-                final_id = top["id"]
-                print(f"✅ Auto-matched (score {top_score:.3f}): {final_id}")
-            
-            elif top_score >= SCORE_LLM_TIEBREAKER:
-                # Ambiguous — ask LLM to pick
-                # Send candidates scoring above threshold
-                ambiguous = [c for c in scored if c["match_score"] >= SCORE_LLM_TIEBREAKER]
-                print(f"  🤔 Ambiguous ({len(ambiguous)} candidates ≥ {SCORE_LLM_TIEBREAKER}), asking LLM to pick...")
-                picked = await _llm_tiebreaker(ambiguous, payee, receipt_cents, date)
-                if picked:
-                    final_id = picked
-                    picked_score = next((c["match_score"] for c in ambiguous if c["id"] == picked), 0)
-                    print(f"✅ LLM picked (score {picked_score:.3f}): {final_id}")
-                else:
-                    print(f"  LLM said NONE, falling through to agent...")
-            else:
-                print(f"  No candidate scored ≥ {SCORE_LLM_TIEBREAKER}, falling through to agent...")
+        top = scored[0]
+        top_score = top["match_score"]
+        print(f"  Top candidate: {top['id']} "
+              f"(score={top_score:.3f}, payee={top.get('payee.name', '?')}, "
+              f"amount=${abs(top.get('amount', 0))/100:.2f})")
+              
+        final_id = "unknown_id"
+        
+        if top_score >= SCORE_AUTO_ACCEPT:
+            final_id = top["id"]
+            print(f"✅ Auto-matched (score {top_score:.3f}): {final_id}")
         else:
-            print(f"  No candidates found in date range, falling through to agent...")
-
-        # ── Step 2: Validate the deterministic match ──
+            print(f"  No candidate scored ≥ {SCORE_AUTO_ACCEPT}, falling through to agent...")
+            
+        # Validate deterministic match
         if final_id != "unknown_id":
-            # Validate amount is within tolerance
             matched_candidate = next((c for c in scored if c["id"] == final_id), None)
             if matched_candidate:
                 actual_amt = abs(matched_candidate.get("amount", 0))
@@ -255,86 +160,174 @@ async def search_actual_transaction_node(state: dict):
                     print(f"❌ VALIDATION FAILED: Bank amount ${actual_amt/100:.2f} "
                           f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
                     final_id = "unknown_id"
-
-        # ── Step 3: Agent fallback ──
+                    
         if final_id == "unknown_id":
-            print("  🔄 Falling back to LLM structured selection...")
+            return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
             
-            narrowed_candidates = []
-            for c in scored:
-                narrowed_candidates.append({
-                    "id": c.get("id"),
-                    "date": c.get("date"),
-                    "amount": c.get("amount"),
-                    "payee": c.get("payee.name") or c.get("imported_payee"),
-                    "account": c.get("account.name"),
-                    "notes": (c.get("notes") or "")[:200]
-                })
-            # Limit to top 10 candidates to save tokens
-            narrowed_candidates = narrowed_candidates[:10]
-            
-            llm = ChatOpenAI(
-                model="deepseek-v4-flash", 
-                api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-                base_url="https://api.deepseek.com/v1"
-            )
-            
-            structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode")
-            
-            prompt_text = f"""You are a financial assistant connecting to Actual Budget.
-We have a new parsed receipt:
-- Date: {date}
-- Amount: ${amount}
-- Payee: {payee}
-
-Here are the top candidate transactions from the bank (within +/- 7 days):
-{json.dumps(narrowed_candidates, indent=2) if narrowed_candidates else "[]"}
-
-Task:
-1. Review the provided candidate transactions. If one is a good match based on Payee and Amount similarity, set `matched_id` to its ID.
-2. Note that the receipt amount and bank amount may differ significantly due to foreign currency conversion or added tips. If the Payee and Date are a very strong match, it is highly likely to be the correct transaction even if the amount differs.
-3. If NO good match is found in the candidates, you must return null for `matched_id`.
-4. Output EXACTLY a JSON object matching this schema:
-{{
-  "matched_id": "string UUID or null"
-}}"""
-            
-            print(f"  [Token Est] Fallback agent prompt: ~{estimate_tokens(prompt_text)} tokens")
-            
-            from actual_orch.shared.peak_hours import pause_if_peak_hours
-            pause_if_peak_hours("deepseek")
-            
-            try:
-                result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
-                if result.matched_id:
-                    final_id = result.matched_id
-                    print(f"Agent matched tx: {final_id}")
-                    # Validate that the ID actually exists in the narrowed candidates
-                    matched = next((c for c in narrowed_candidates if c["id"] == final_id), None)
-                    if matched:
-                        print(f"✅ Agent selected valid candidate: {final_id}")
-                    else:
-                        print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the narrowed candidates.")
-                        final_id = "unknown_id"
-                else:
-                    print(f"Agent output didn't contain matched_id")
-            except Exception as e:
-                print(f"Warning: Failed to parse structured output from LLM: {e}")
-                
-    except Exception as e:
-        if final_id != "unknown_id" and ("TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e)):
-            print("Ignored MCP shutdown error, agent succeeded.")
-        else:
-            return {"status": "error", "error": f"Actual Budget search failed: {str(e)}"}
-            
-    transfer_id = None
-    if final_id != "unknown_id":
+        transfer_id = None
         matched = next((c for c in scored if c["id"] == final_id), None)
         if matched and matched.get("transfer_id"):
             transfer_id = matched.get("transfer_id")
             
-    return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
+        return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
+        
+    except Exception as e:
+        if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
+            print("Ignored MCP shutdown error, agent succeeded.")
+            return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
+        else:
+            return {"status": "error", "error": f"Deterministic search failed: {str(e)}"}
 
+
+async def search_agent_node(state: dict):
+    """
+    Node 2: Agent fallback. Runs when deterministic matching fails.
+    """
+    try:
+        print("  🔄 Falling back to LLM structured selection (Agent Node)...")
+        parsed = state.get("parsed_data")
+        if not parsed:
+            return {"status": "error", "error": "No parsed data found"}
+            
+        date = parsed["date"]
+        amount = parsed["total"]
+        payee = parsed["payee"]
+        receipt_cents = abs(int(amount * 100))
+        
+        session = await ActualMCPClient.get_session()
+        
+        candidates = await get_actual_candidates(session, date)
+        
+        clean_candidates = candidates
+        
+        narrowed_candidates = []
+        for c in clean_candidates:
+            narrowed_candidates.append({
+                "id": c.get("id"),
+                "date": c.get("date"),
+                "amount": c.get("amount"),
+                "payee": c.get("payee.name") or c.get("imported_payee"),
+                "account": c.get("account.name"),
+                "notes": (c.get("notes") or "")[:200]
+            })
+            
+        def get_sort_key(c):
+            try:
+                cd = datetime.strptime(c.get("date"), "%Y-%m-%d")
+                rd = datetime.strptime(date, "%Y-%m-%d")
+                dd = abs((cd - rd).days)
+            except Exception:
+                dd = 999
+            
+            c_amt = abs(c.get("amount", 0))
+            a_diff = abs(c_amt - receipt_cents)
+            return (dd, a_diff)
+                
+        narrowed_candidates.sort(key=get_sort_key)
+        narrowed_candidates = narrowed_candidates[:50]
+        
+        parse_retries = state.get("parse_retries", 0)
+        model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"
+        
+        print(f"  🔄 Retrying match with model ({model_name})...")
+        
+        prompt_text = f"""You are a financial matching assistant.
+
+Receipt details:
+{json.dumps(parsed, indent=2)}
+
+Candidate transactions from the bank:
+{json.dumps(narrowed_candidates, indent=2)}
+
+Task: Identify the transaction that matches this receipt. You must respond in JSON.
+Rules:
+- Amounts must be exactly equal OR very close (e.g., tip included, currency difference).
+- Payee names might differ but should be conceptually similar.
+- Date must be within 1 day.
+
+Respond in JSON format with the 'matched_id' of the matching transaction, or null if no match exists."""
+            
+        llm = ChatOpenAI(
+            model=model_name, 
+            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
+            base_url="https://api.deepseek.com/v1"
+        )
+        
+        structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode")
+        
+        if state.get("log_agent"):
+            print(f"\n--- AGENT PROMPT ({model_name}) ---")
+            print(prompt_text)
+            print("---------------------------------------\n")
+            
+        final_id = "unknown_id"
+        try:
+            result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
+            
+            if state.get("log_agent"):
+                print(f"\n--- AGENT RESPONSE ({model_name}) ---")
+                print(result.dict())
+                print("---------------------------------------\n")
+                
+            if result.matched_id:
+                final_id = result.matched_id
+                print(f"Agent matched tx: {final_id} with {model_name}")
+                # Validate
+                matched = next((c for c in narrowed_candidates if c["id"] == final_id), None)
+                if matched:
+                    print(f"✅ Agent selected valid candidate: {final_id}")
+                    
+                    # Validate amount
+                    actual_amt = abs(matched.get("amount", 0))
+                    min_allowed = receipt_cents * 0.90
+                    max_allowed = receipt_cents * 1.30
+                    if not (min_allowed <= actual_amt <= max_allowed):
+                        print(f"❌ VALIDATION FAILED: Agent amount ${actual_amt/100:.2f} "
+                              f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
+                        final_id = "unknown_id"
+                        
+                    # Validate date
+                    if final_id != "unknown_id" and matched.get("date"):
+                        try:
+                            rd = datetime.strptime(date, "%Y-%m-%d")
+                            cd = datetime.strptime(matched.get("date"), "%Y-%m-%d")
+                            if abs((rd - cd).days) > 1:
+                                print(f"❌ VALIDATION FAILED: Agent date {matched.get('date')} "
+                                      f"is >1 days from receipt {date}. Rejecting.")
+                                final_id = "unknown_id"
+                        except Exception:
+                            pass
+                else:
+                    print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the narrowed candidates.")
+                    final_id = "unknown_id"
+            else:
+                print(f"Agent ({model_name}) output didn't contain matched_id")
+                final_id = "unknown_id"
+        except Exception as e:
+            print(f"Warning: Failed to parse structured output from {model_name}: {e}")
+            final_id = "unknown_id"
+
+        if final_id == "unknown_id":
+            if state.get("parse_retries", 0) == 0:
+                print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
+                return {"parse_retries": 1, "status": "retry_parse", "actual_tx_id": "unknown_id"}
+            else:
+                print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
+                return {"status": "human_approval", "actual_tx_id": "unknown_id"}
+                
+        transfer_id = None
+        matched_full = next((c for c in clean_candidates if c["id"] == final_id), None)
+        if matched_full and matched_full.get("transfer_id"):
+            transfer_id = matched_full.get("transfer_id")
+            
+        return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
+        
+    except Exception as e:
+        if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
+            print("Ignored MCP shutdown error, agent succeeded.")
+            return {"status": "human_approval", "actual_tx_id": "unknown_id"}
+        else:
+            return {"status": "error", "error": f"Agent search failed: {str(e)}"}
 
 async def tag_actual_transaction_node(state: dict):
     """Append #receipt to the matched/created transaction's notes in Actual Budget."""
