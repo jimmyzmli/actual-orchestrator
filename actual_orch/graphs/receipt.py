@@ -1,4 +1,5 @@
 import os
+import json
 import base64
 from typing import TypedDict, Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
@@ -11,7 +12,7 @@ from pdf2image import convert_from_path
 
 from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed, get_classify, set_classify
 from actual_orch.nodes.pocketbase import skip_if_processed, save_pocketbase_node
-from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, tag_actual_transaction_node, estimate_tokens
+from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, tag_actual_transaction_node, save_actual_transaction_node, estimate_tokens
 import datetime
 
 class ReceiptState(TypedDict, total=False):
@@ -33,6 +34,7 @@ class ReceiptState(TypedDict, total=False):
     parsing_failed: bool  # True if deepseek parsing failed entirely
     parse_retries: int    # Number of times parsing has been retried
     log_agent: bool       # True if agent logs should be printed
+    create_missing: bool  # True if we should auto-create a transaction on no-match
 
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -46,6 +48,8 @@ class ParsedReceipt(BaseModel):
     total_foreign_currency: Optional[float] = Field(default=None, description="If the receipt is clearly in a foreign currency (not CAD), the exact total amount in that foreign currency. Otherwise leave as null.")
     payee: str = Field(description="Name of the store or payee")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
+    account_key: Optional[str] = Field(default=None, description="If a list of valid account keys is provided, the most likely account key for this receipt based on the OCR text. Otherwise null.")
+    category_id: Optional[str] = Field(default=None, description="If a list of categories is provided, the most likely category ID for this receipt. Otherwise null.")
 
 def extract_ocr_node(state: ReceiptState):
     """Extract raw text from the PDF or image using Gemini Vision"""
@@ -190,7 +194,7 @@ def classify_input_node(state: ReceiptState):
     except Exception as e:
         return {"status": "error", "error": f"Classification failed: {str(e)}"}
 
-def parse_receipt_node(state: ReceiptState):
+async def parse_receipt_node(state: ReceiptState):
     """Parse the OCR text using DeepSeek."""
     try:
         file_path = state["file_path"]
@@ -227,7 +231,42 @@ def parse_receipt_node(state: ReceiptState):
         else:
             source_desc = "OCR text from a receipt"
             
-        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', and 'items'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+
+        if state.get("create_missing"):
+            try:
+                from actual_orch.clients.mcp import ActualMCPClient
+                mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
+                mapping = {}
+                if os.path.exists(mapping_path):
+                    with open(mapping_path, "r") as f:
+                        mapping = json.load(f)
+                
+                session = await ActualMCPClient.get_session()
+                res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                if res.content:
+                    try:
+                        accounts = json.loads(res.content[0].text)
+                        on_budget_ids = {acc.get("id") for acc in accounts if not acc.get("offbudget") and isinstance(acc, dict) and acc.get("id")}
+                        valid_keys = [k for k, v in mapping.items() if v in on_budget_ids]
+                        
+                        if valid_keys:
+                            keys_json = json.dumps(valid_keys).replace("{", "{{").replace("}", "}}")
+                            system_prompt += f"\n\nACCOUNT SELECTION:\nYou must also pick the MOST LIKELY account key from this list of valid on-budget account keys: {keys_json}\nValid account keys generally fall into two categories:\n1. The last 4 digits of a credit card (e.g. 1234, 5234).\n2. Different account names or types (e.g. WS-CHEQUING, DEFAULT-CC).\nIf you see the last 4 digits of a card on the receipt that matches one of the keys, use that key for 'account_key'. If you see the name of an institution or account type that strongly matches, use that key. If you are unsure, output the key 'DEFAULT-CC' if it exists in the list, or just pick the most likely one."
+                    except Exception as json_e:
+                        print(f"  ⚠️ Failed to parse accounts JSON: {json_e}")
+                
+                categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
+                if os.path.exists(categories_path):
+                    with open(categories_path, "r") as f:
+                        categories = json.load(f)
+                    if isinstance(categories, list):
+                        valid_categories = [{"id": c.get("id"), "name": c.get("name")} for c in categories if isinstance(c, dict) and not c.get("hidden") and not c.get("is_income") and c.get("id")]
+                        if valid_categories:
+                            categories_json = json.dumps(valid_categories).replace("{", "{{").replace("}", "}}")
+                            system_prompt += f"\n\nCATEGORY SELECTION:\nYou must also pick the MOST LIKELY category ID from this list: {categories_json}\nBased on the receipt items and payee, choose the best category and output its 'id' for the 'category_id' field. If unsure, pick the most generic expense category."
+            except Exception as e:
+                print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
 
         if parse_retries > 0:
             prev_date = state.get("parsed_data", {}).get("date", "unknown")
@@ -244,7 +283,7 @@ def parse_receipt_node(state: ReceiptState):
         try:
             structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
             chain = prompt | structured_llm
-            result = chain.invoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
+            result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
             parsed_dict = result.dict()
         except Exception as e:
             print(f"  ❌ Parsing failed: {e}. Flagging for review.")
@@ -340,6 +379,8 @@ def router_after_search_agent(state: ReceiptState):
     if state.get("status") == "retry_parse":
         return "retry_parse"
     if state.get("status") == "human_approval" or state.get("actual_tx_id") == "unknown_id":
+        if state.get("create_missing"):
+            return "save_actual"
         return "human_approval"
     return "save_pocketbase"
 
@@ -358,6 +399,7 @@ workflow.add_node("parse_receipt", parse_receipt_node)
 workflow.add_node("search_deterministic", search_deterministic_node)
 workflow.add_node("search_agent", search_agent_node)
 workflow.add_node("human_approval", human_approval_node)
+workflow.add_node("save_actual", save_actual_transaction_node)
 workflow.add_node("tag_actual", tag_actual_transaction_node)
 workflow.add_node("save_pocketbase", save_pocketbase_node)
 
@@ -375,9 +417,11 @@ workflow.add_conditional_edges("search_deterministic", router_after_search_deter
 workflow.add_conditional_edges("search_agent", router_after_search_agent, {
     "error": END, 
     "human_approval": "human_approval", 
+    "save_actual": "save_actual",
     "save_pocketbase": "save_pocketbase",
     "retry_parse": "parse_receipt"
 })
 workflow.add_conditional_edges("human_approval", router_after_human, {"save_pocketbase": "save_pocketbase", "skip": END})
+workflow.add_edge("save_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", "tag_actual")
 workflow.add_edge("tag_actual", END)

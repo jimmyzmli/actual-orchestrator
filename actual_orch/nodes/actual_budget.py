@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -10,6 +11,12 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 
 from actual_orch.shared.scoring import score_candidate
 from actual_orch.clients.mcp import ActualMCPClient
+
+def strip_emojis(s: str) -> str:
+    if not s:
+        return "" if s is None else str(s)
+    pattern = re.compile(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF]+')
+    return pattern.sub('', s).strip()
 
 # For estimate_tokens, just use a simple approximation if tiktoken is not present
 def estimate_tokens(text: str) -> int:
@@ -93,7 +100,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
         import traceback
         traceback.print_exc()
         print(f"⚠️ Query for candidates failed: {repr(e)}")
-        return []
+        raise e
 
 # ---------------------------------------------------------------------------
 # Search Nodes (Deterministic and Agent)
@@ -172,11 +179,7 @@ async def search_deterministic_node(state: dict):
         return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
         
     except Exception as e:
-        if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
-            print("Ignored MCP shutdown error, agent succeeded.")
-            return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
-        else:
-            return {"status": "error", "error": f"Deterministic search failed: {str(e)}"}
+        return {"status": "error", "error": f"Deterministic search failed: {str(e)}"}
 
 
 async def search_agent_node(state: dict):
@@ -202,12 +205,14 @@ async def search_agent_node(state: dict):
         
         narrowed_candidates = []
         for c in clean_candidates:
+            amount_cents = c.get("amount", 0)
+            amount_dollars = amount_cents / 100.0 if amount_cents else 0
             narrowed_candidates.append({
                 "id": c.get("id"),
                 "date": c.get("date"),
-                "amount": c.get("amount"),
-                "payee": c.get("payee.name") or c.get("imported_payee"),
-                "account": c.get("account.name"),
+                "amount": amount_dollars,
+                "payee": strip_emojis(c.get("payee.name") or c.get("imported_payee")),
+                "account": strip_emojis(c.get("account.name")),
                 "notes": (c.get("notes") or "")[:200]
             })
             
@@ -323,11 +328,106 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
         
     except Exception as e:
-        if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
-            print("Ignored MCP shutdown error, agent succeeded.")
-            return {"status": "human_approval", "actual_tx_id": "unknown_id"}
-        else:
-            return {"status": "error", "error": f"Agent search failed: {str(e)}"}
+        return {"status": "error", "error": f"Agent search failed: {str(e)}"}
+
+async def save_actual_transaction_node(state: dict):
+    """
+    Node 3: Auto-create the transaction if deterministic and agent matching fail.
+    Only triggers if create_missing is True.
+    """
+    if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
+        return {}
+        
+    try:
+        print("  ➕ Auto-creating missing transaction (save_actual_transaction_node)...")
+        parsed = state.get("parsed_data")
+        if not parsed:
+            return {"status": "error", "error": "No parsed data found for auto-creation"}
+            
+        date = parsed["date"]
+        amount = parsed["total"] # this is usually positive for a receipt
+        payee = parsed["payee"]
+        
+        # Load account-mapping.json
+        import os
+        import json
+        mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
+        
+        mapping = {}
+        if os.path.exists(mapping_path):
+            with open(mapping_path, "r") as f:
+                mapping = json.load(f)
+                
+        if not mapping:
+            print("  ⚠️ account-mapping.json not found or empty.")
+            return {"status": "human_approval"}
+            
+        selected_key = parsed.get("account_key")
+        if not selected_key or selected_key not in mapping:
+            print(f"  ⚠️ Parsed account key '{selected_key}' is invalid or missing. Falling back to human approval.")
+            return {"status": "human_approval"}
+            
+        account_id = mapping[selected_key]
+        print(f"  ✅ Extracted account key '{selected_key}' -> {account_id}")
+        
+        category_id = parsed.get("category_id")
+        if category_id:
+            print(f"  ✅ Extracted category ID -> {category_id}")
+            
+        session = await ActualMCPClient.get_session()
+        
+        # Create transaction
+        expense_cents = int(round(-abs(amount) * 100)) # Receipts are expenses, API expects cents
+        new_tx = {
+            "date": date,
+            "amount": expense_cents,
+            "payee_name": payee,
+            "notes": "#receipt",
+            "cleared": False
+        }
+        if category_id:
+            new_tx["category"] = category_id
+        
+        # Save using Actual MCP
+        mcp_tools = await load_mcp_tools(session)
+        tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+        if tx_tool:
+            await tx_tool.ainvoke({"args": [
+                "add", "--account", account_id,
+                "--data", json.dumps([new_tx])
+            ]})
+            print(f"  ✅ Created transaction for {payee} on {date} for {amount}")
+            
+            # Query back the ID
+            filter_obj = {
+                "account": account_id,
+                "date": date
+            }
+            q_res = await session.call_tool("actual_query", {"args": [
+                "run", "--table", "transactions",
+                "--filter", json.dumps(filter_obj),
+                "--select", "id,amount,payee.name,notes",
+                "--format", "json"
+            ]})
+            if q_res.content and len(q_res.content) > 0:
+                txs = json.loads(q_res.content[0].text)
+                if txs and len(txs) > 0:
+                    # Find the exact match
+                    for tx in txs:
+                        if tx.get("notes") and "#receipt" in tx["notes"] and "Auto-created" in tx["notes"]:
+                            print(f"  ✅ Retrieved new transaction ID: {tx['id']}")
+                            return {"actual_tx_id": tx["id"], "status": "continue"}
+                    # Fallback to first if not found by notes exactly
+                    print(f"  ✅ Retrieved new transaction ID (fallback): {txs[0]['id']}")
+                    return {"actual_tx_id": txs[0]["id"], "status": "continue"}
+            
+            print("  ⚠️ Created transaction but couldn't query its ID. PocketBase won't have the ID.")
+            return {"actual_tx_id": "unknown_id", "status": "continue"}
+            
+    except Exception as e:
+        print(f"  ❌ Auto-create failed: {e}")
+        return {"status": "error", "error": f"Auto-create failed: {str(e)}"}
+    return {}
 
 async def tag_actual_transaction_node(state: dict):
     """Append #receipt to the matched/created transaction's notes in Actual Budget."""
@@ -422,8 +522,5 @@ async def tag_actual_transaction_node(state: dict):
             return {"actual_tx_id": target_tx_id}
             
     except Exception as e:
-        if "TaskGroup" in str(e) or "JSONRPCMessage" in str(e) or "BrokenResourceError" in str(e):
-            print("Ignored MCP shutdown error, tag succeeded.")
-        else:
-            print(f"⚠️ Failed to tag transaction (non-fatal): {e}")
+        print(f"⚠️ Failed to tag transaction (non-fatal): {e}")
     return {}

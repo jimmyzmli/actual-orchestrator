@@ -27,7 +27,7 @@ class ActualMCPClient:
             mcp_endpoint = f"{mcp_endpoint.rstrip('/')}/sse"
 
         print(f"🚀 Connecting to shared Actual Budget MCP server via SSE at {mcp_endpoint}...")
-        ctx = sse_client(mcp_endpoint)
+        ctx = sse_client(mcp_endpoint, timeout=60.0)
         read, write = await self.stack.enter_async_context(ctx)
 
         session_ctx = ClientSession(read, write)
