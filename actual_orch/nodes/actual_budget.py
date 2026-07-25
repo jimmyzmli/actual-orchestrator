@@ -106,7 +106,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
 # Search Nodes (Deterministic and Agent)
 # ---------------------------------------------------------------------------
 
-SCORE_AUTO_ACCEPT = 0.90
+SCORE_AUTO_ACCEPT = 0.80
 
 async def search_deterministic_node(state: dict):
     """
@@ -230,6 +230,15 @@ async def search_agent_node(state: dict):
                 
         narrowed_candidates.sort(key=get_sort_key)
         narrowed_candidates = narrowed_candidates[:50]
+        
+        if not narrowed_candidates:
+            print("  ❌ No candidates available for agent to search. Failing immediately.")
+            if state.get("parse_retries", 0) == 0:
+                print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
+                return {"parse_retries": 1, "status": "retry_parse", "actual_tx_id": "unknown_id"}
+            else:
+                print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
+                return {"status": "human_approval", "actual_tx_id": "unknown_id"}
         
         parse_retries = state.get("parse_retries", 0)
         model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"

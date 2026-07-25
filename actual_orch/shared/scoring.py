@@ -58,15 +58,10 @@ def score_candidate(receipt_payee: str, receipt_cents: int, receipt_date: str, c
     """
     Return an aggregate match score (0.0–1.0) for a single Actual Budget
     transaction candidate against the parsed receipt.
-    
-    Weights:
-      - Amount similarity:  0.60
-      - Date proximity:     0.30
-      - Payee similarity:   0.10
     """
-    W_AMOUNT = 0.80
-    W_DATE   = 0.15
-    W_PAYEE  = 0.05
+    W_AMOUNT = 0.40
+    W_DATE   = 0.40
+    W_PAYEE  = 0.10
 
     cand_amount = abs(candidate.get("amount", 0))
     amount_score = _amount_similarity(receipt_cents, cand_amount)

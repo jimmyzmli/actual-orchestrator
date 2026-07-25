@@ -26,6 +26,9 @@ class ReceiptState(TypedDict, total=False):
     status: str
     error: str
     email_date: str
+    email_sender: str
+    email_subject: str
+    email_folder: str
     image_paths: List[str] # Paths to extracted JPEG images
     proposed_transaction: str # JSON string of proposed transaction if not found
     human_approved: bool
@@ -162,8 +165,14 @@ def classify_input_node(state: ReceiptState):
                 max_tokens=64
             )
             
+            system_prompt = "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record. If it's a future payment or an invoice, classify it as an invoice. Respond with EXACTLY one of these formats: RECEIPT, NOT_RECEIPT, or INVOICE|YYYY-MM-DD (where YYYY-MM-DD is the invoice date or due date). Do not explain."
+            
+            if state.get("source") == "email":
+                email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
+                system_prompt += email_ctx
+                
             classify_prompt = ChatPromptTemplate.from_messages([
-                ("system", "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record (anything representing a financial transaction with a date and amount). Respond with EXACTLY one word: RECEIPT or NOT_RECEIPT. Do not explain."),
+                ("system", system_prompt),
                 ("human", "{ocr_text}")
             ])
             classify_chain = classify_prompt | llm
@@ -188,6 +197,40 @@ def classify_input_node(state: ReceiptState):
                 print(f"  [Parse] Email classified as NOT a receipt. Skipping.")
             else:
                 print(f"⚠️  Content classified as NOT a receipt. Flagging for human review.")
+            return {"not_a_receipt": True}
+            
+        is_future_date = False
+        
+        if classification.startswith("INVOICE"):
+            parts = classification.split("|")
+            if len(parts) > 1:
+                try:
+                    invoice_date = datetime.datetime.strptime(parts[1].strip(), "%Y-%m-%d").date()
+                    if datetime.date.today() < invoice_date:
+                        is_future_date = True
+                except Exception as e:
+                    print(f"  ⚠️ Could not parse invoice date from {classification}: {e}")
+
+        parsed_data = state.get("parsed_data")
+        if not parsed_data:
+            cached_parsed = get_parsed(file_path, prefix=prefix)
+            if cached_parsed is None and prefix != "receipt_":
+                cached_parsed = get_parsed(file_path, prefix="receipt_")
+            parsed_data = cached_parsed
+            
+        if parsed_data and parsed_data.get("date"):
+            try:
+                parsed_date = datetime.datetime.strptime(parsed_data["date"], "%Y-%m-%d").date()
+                if datetime.date.today() < parsed_date:
+                    is_future_date = True
+            except Exception:
+                pass
+                
+        if is_future_date:
+            if state.get("source") == "email":
+                print(f"  [Parse] Invoice/Receipt date is in the future. Skipping.")
+            else:
+                print(f"⚠️  Invoice/Receipt date is in the future. Flagging for human review.")
             return {"not_a_receipt": True}
             
         return {"not_a_receipt": False}
@@ -232,6 +275,10 @@ async def parse_receipt_node(state: ReceiptState):
             source_desc = "OCR text from a receipt"
             
         system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+
+        if source_type == "email":
+            email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
+            system_prompt += email_ctx
 
         if state.get("create_missing"):
             try:
@@ -294,7 +341,17 @@ async def parse_receipt_node(state: ReceiptState):
         
         if state.get("source") == "email" and state.get("email_date"):
             if parse_retries == 0:
-                parsed_dict["date"] = state["email_date"]
+                try:
+                    email_dt = datetime.datetime.strptime(state["email_date"], "%Y-%m-%d")
+                    if parsed_dict.get("date"):
+                        parsed_dt = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d")
+                        if (email_dt - parsed_dt).days > 3:
+                            print(f"  [Date] Overriding parsed date {parsed_dict['date']} with email date {state['email_date']} (>3 days older)")
+                            parsed_dict["date"] = state["email_date"]
+                    else:
+                        parsed_dict["date"] = state["email_date"]
+                except Exception as e:
+                    print(f"  ⚠️ Could not compare dates for override: {e}")
         
         if "total_foreign_currency" in parsed_dict:
             parsed_dict["foreign_amount"] = parsed_dict.pop("total_foreign_currency")
@@ -328,6 +385,15 @@ async def parse_receipt_node(state: ReceiptState):
             "schema_version": "1.0.0"
         }
         set_parsed(file_path, parsed_dict, meta, prefix=prefix)
+        
+        if parsed_dict.get("date"):
+            try:
+                parsed_date = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d").date()
+                if datetime.date.today() < parsed_date:
+                    print(f"  ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
+                    return {"status": "error", "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
+            except Exception:
+                pass
             
         return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt, "parsing_failed": False}
     except Exception as e:
