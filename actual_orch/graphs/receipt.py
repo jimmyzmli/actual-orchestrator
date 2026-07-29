@@ -38,6 +38,7 @@ class ReceiptState(TypedDict, total=False):
     parse_retries: int    # Number of times parsing has been retried
     log_agent: bool       # True if agent logs should be printed
     create_missing: bool  # True if we should auto-create a transaction on no-match
+    classification: str   # The result of the LLM classification (e.g. RECEIPT, INVOICE)
 
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -165,11 +166,25 @@ def classify_input_node(state: ReceiptState):
                 max_tokens=64
             )
             
-            system_prompt = "You are a document classifier. Given raw OCR text, determine if the content is a purchase receipt, invoice, ATM receipt, or bank transfer record. If it's a future payment or an invoice, classify it as an invoice. Respond with EXACTLY one of these formats: RECEIPT, NOT_RECEIPT, or INVOICE|YYYY-MM-DD (where YYYY-MM-DD is the invoice date or due date). Do not explain."
+            system_prompt = (
+                "You are a document classifier. Given raw OCR text, classify the document into EXACTLY one of these categories:\n\n"
+                "RECEIPT - A document confirming a completed payment, charge, or money transfer. "
+                "Examples: store receipts, payment confirmations, Interac e-Transfer confirmations, ATM receipts, bank transfer records, money transfer screenshots.\n\n"
+                "INVOICE - A bill or notice showing an amount owed that has NOT been charged or paid yet. "
+                "Examples: utility bills, tax bills, property tax notices, insurance statements, subscription invoices with a due date.\n\n"
+                "ORDER_CONFIRMATION - An order acknowledgment or shipping notification. "
+                "Examples: online order confirmations, delivery notifications, booking confirmations.\n\n"
+                "NOT_RECEIPT - Anything that is not a financial document. "
+                "Examples: newsletters, advertisements, general correspondence, account statements with no actionable amount.\n\n"
+                "Respond with EXACTLY one of: RECEIPT, INVOICE, ORDER_CONFIRMATION, or NOT_RECEIPT. Do not explain."
+            )
             
+            client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
             if state.get("source") == "email":
-                email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
-                system_prompt += email_ctx
+                email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}"
+                system_prompt += email_ctx + client_ctx
+            else:
+                system_prompt += client_ctx
                 
             classify_prompt = ChatPromptTemplate.from_messages([
                 ("system", system_prompt),
@@ -190,26 +205,13 @@ def classify_input_node(state: ReceiptState):
             }
             set_classify(file_path, classification, meta, prefix=prefix)
         else:
-            print("Using cached classification data (Redis)...")
+            print(f"Using cached classification data (Redis): {classification}")
         
-        if "NOT_RECEIPT" in classification:
-            if state.get("source") == "email":
-                print(f"  [Parse] Email classified as NOT a receipt. Skipping.")
-            else:
-                print(f"⚠️  Content classified as NOT a receipt. Flagging for human review.")
-            return {"not_a_receipt": True}
+        if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
+            print(f"  [Parse] Document classified as {classification}. Skipping completely.")
+            return {"not_a_receipt": True, "classification": classification}
             
         is_future_date = False
-        
-        if classification.startswith("INVOICE"):
-            parts = classification.split("|")
-            if len(parts) > 1:
-                try:
-                    invoice_date = datetime.datetime.strptime(parts[1].strip(), "%Y-%m-%d").date()
-                    if datetime.date.today() < invoice_date:
-                        is_future_date = True
-                except Exception as e:
-                    print(f"  ⚠️ Could not parse invoice date from {classification}: {e}")
 
         parsed_data = state.get("parsed_data")
         if not parsed_data:
@@ -227,13 +229,10 @@ def classify_input_node(state: ReceiptState):
                 pass
                 
         if is_future_date:
-            if state.get("source") == "email":
-                print(f"  [Parse] Invoice/Receipt date is in the future. Skipping.")
-            else:
-                print(f"⚠️  Invoice/Receipt date is in the future. Flagging for human review.")
-            return {"not_a_receipt": True}
+            print(f"  ⏭️  Skipped {state.get('source_ref')}: Receipt date is in the future. (Classified as: {classification})")
+            return {"not_a_receipt": True, "classification": classification}
             
-        return {"not_a_receipt": False}
+        return {"not_a_receipt": False, "classification": classification}
     except Exception as e:
         return {"status": "error", "error": f"Classification failed: {str(e)}"}
 
@@ -274,11 +273,14 @@ async def parse_receipt_node(state: ReceiptState):
         else:
             source_desc = "OCR text from a receipt"
             
-        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Include taxes (HST, GST, PST, VAT, etc.) and points/rewards redemptions as separate line items. Points redemptions should appear as negative amounts (e.g. -2.50 for a $2.50 points discount). The line items should add up to the receipt total. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
 
+        client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
         if source_type == "email":
-            email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
-            system_prompt += email_ctx
+            email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}"
+            system_prompt += email_ctx + client_ctx
+        else:
+            system_prompt += client_ctx
 
         if state.get("create_missing"):
             try:
@@ -418,9 +420,7 @@ def router_after_classify(state: ReceiptState):
     if state.get("status") == "error":
         return "error"
     if state.get("not_a_receipt"):
-        if state.get("source") == "email":
-            return "skip"
-        return "human_approval"
+        return "skip"
     return "continue"
 
 def router_after_parse(state: ReceiptState):
