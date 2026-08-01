@@ -2,6 +2,7 @@ import os
 import json
 import base64
 from typing import TypedDict, Dict, Any, List, Optional
+from enum import Enum
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
@@ -15,6 +16,24 @@ from actual_orch.nodes.pocketbase import skip_if_processed, save_pocketbase_node
 from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, tag_actual_transaction_node, save_actual_transaction_node, estimate_tokens
 import datetime
 
+class WorkflowStatus(str, Enum):
+    """
+    Enum representing the flow control state for the LangGraph workflow.
+    """
+    CONTINUE = "continue"                     # Default state, proceed to the next logical node
+    ERROR = "error"                           # An error occurred, routing to END or an error handler
+    ALREADY_PROCESSED = "already_processed"   # The document was already processed, skip further steps
+    FALLBACK_TO_AGENT = "fallback_to_agent"   # Deterministic search failed, falling back to agent search
+    RETRY_PARSE = "retry_parse"               # Agent could not find transaction, retry parsing with better model
+    HUMAN_APPROVAL = "human_approval"         # Needs human intervention/approval
+
+class ProposedTransaction(TypedDict, total=False):
+    date: str
+    account: str
+    payee: str
+    notes: str
+    category: str
+
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF or PNG
     source_ref: str       # Original source reference (e.g. gdrive path or email msg_id)
@@ -23,21 +42,15 @@ class ReceiptState(TypedDict, total=False):
     parsed_data: Dict[str, Any]
     actual_tx_id: str
     actual_tx_id_transfer: str
-    status: str
+    status: WorkflowStatus
     error: str
     email_date: str
-    email_sender: str
-    email_subject: str
-    email_folder: str
+    email_context: str    # Context string containing sender, subject, folder, etc.
     image_paths: List[str] # Paths to extracted JPEG images
-    proposed_transaction: str # JSON string of proposed transaction if not found
-    human_approved: bool
-    not_a_receipt: bool   # True if content was classified as not a receipt
-    forex_receipt: bool   # True if currency is not CAD
-    parsing_failed: bool  # True if deepseek parsing failed entirely
-    parse_retries: int    # Number of times parsing has been retried
-    log_agent: bool       # True if agent logs should be printed
-    create_missing: bool  # True if we should auto-create a transaction on no-match
+    proposed_transaction: ProposedTransaction 
+    parse_attempts: List[Dict[str, Any]] # History of parsing attempts (model, success, error)
+    flag_log_agent: bool       # True if agent logs should be printed
+    flag_create_missing: bool  # True if we should auto-create a transaction on no-match
     classification: str   # The result of the LLM classification (e.g. RECEIPT, INVOICE)
 
 # Pydantic model for Deepseek parsing
@@ -51,6 +64,7 @@ class ParsedReceipt(BaseModel):
     currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. If clearly from Canada or CAD is not explicitly stated otherwise, use CAD.")
     total_foreign_currency: Optional[float] = Field(default=None, description="If the receipt is clearly in a foreign currency (not CAD), the exact total amount in that foreign currency. Otherwise leave as null.")
     payee: str = Field(description="Name of the store or payee")
+    notes: str = Field(default="", description="A concise ~50 character human-readable summary of what was purchased (e.g. 'Groceries - milk, eggs, bread' or 'Uber ride downtown'). Do NOT include the payee name, date, or amount — just describe the purchase.")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
     account_key: Optional[str] = Field(default=None, description="If a list of valid account keys is provided, the most likely account key for this receipt based on the OCR text. Otherwise null.")
     category_id: Optional[str] = Field(default=None, description="If a list of categories is provided, the most likely category ID for this receipt. Otherwise null.")
@@ -141,15 +155,15 @@ def extract_ocr_node(state: ReceiptState):
         }
         set_ocr(file_path, ocr_text, meta, prefix=prefix)
             
-        return {"ocr_text": ocr_text, "image_paths": image_paths, "not_a_receipt": False}
+        return {"ocr_text": ocr_text, "image_paths": image_paths}
     except Exception as e:
-        return {"status": "error", "error": f"OCR failed: {str(e)}"}
+        return {"status": WorkflowStatus.ERROR, "error": f"OCR failed: {str(e)}"}
 
 def classify_input_node(state: ReceiptState):
     """Classify whether the content is actually a receipt."""
     try:
         if not state.get("ocr_text"):
-            return {"status": "error", "error": "No OCR text found"}
+            return {"status": WorkflowStatus.ERROR, "error": "No OCR text found"}
 
         file_path = state["file_path"]
         prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
@@ -181,8 +195,10 @@ def classify_input_node(state: ReceiptState):
             
             client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
             if state.get("source") == "email":
-                email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}"
-                system_prompt += email_ctx + client_ctx
+                email_ctx = state.get("email_context", "")
+                if state.get('email_date'):
+                    email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
+                system_prompt += f"\n\nEMAIL CONTEXT:\n{email_ctx}" + client_ctx
             else:
                 system_prompt += client_ctx
                 
@@ -209,7 +225,7 @@ def classify_input_node(state: ReceiptState):
         
         if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
             print(f"  [Parse] Document classified as {classification}. Skipping completely.")
-            return {"not_a_receipt": True, "classification": classification}
+            return {"classification": classification}
             
         is_future_date = False
 
@@ -230,11 +246,11 @@ def classify_input_node(state: ReceiptState):
                 
         if is_future_date:
             print(f"  ⏭️  Skipped {state.get('source_ref')}: Receipt date is in the future. (Classified as: {classification})")
-            return {"not_a_receipt": True, "classification": classification}
+            return {"classification": classification}
             
-        return {"not_a_receipt": False, "classification": classification}
+        return {"classification": classification}
     except Exception as e:
-        return {"status": "error", "error": f"Classification failed: {str(e)}"}
+        return {"status": WorkflowStatus.ERROR, "error": f"Classification failed: {str(e)}"}
 
 async def parse_receipt_node(state: ReceiptState):
     """Parse the OCR text using DeepSeek."""
@@ -242,7 +258,8 @@ async def parse_receipt_node(state: ReceiptState):
         file_path = state["file_path"]
         prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
         
-        parse_retries = state.get("parse_retries", 0)
+        parse_attempts = state.get("parse_attempts", [])
+        parse_retries = len(parse_attempts)
         
         if parse_retries == 0:
             cached = get_parsed(file_path, prefix=prefix)
@@ -273,16 +290,18 @@ async def parse_receipt_node(state: ReceiptState):
         else:
             source_desc = "OCR text from a receipt"
             
-        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: Include taxes (HST, GST, PST, VAT, etc.) and points/rewards redemptions as separate line items. Points redemptions should appear as negative amounts (e.g. -2.50 for a $2.50 points discount). The line items should add up to the receipt total. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, a short note, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'notes', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: The 'notes' field should be a concise ~50 character human-readable summary of what was purchased (e.g. 'Groceries - milk, eggs, bread' or 'Uber ride downtown'). Do NOT include the payee name, date, or amount in the note — just describe the purchase. For ATM withdrawals use 'ATM withdrawal', for e-transfers use 'e-Transfer'. IMPORTANT: Include taxes (HST, GST, PST, VAT, etc.) and points/rewards redemptions as separate line items. Points redemptions should appear as negative amounts (e.g. -2.50 for a $2.50 points discount). The line items should add up to the receipt total. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
 
         client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
         if source_type == "email":
-            email_ctx = f"\n\nEMAIL CONTEXT:\n- Date: {state.get('email_date', 'Unknown')}\n- Sender: {state.get('email_sender', 'Unknown')}\n- Subject: {state.get('email_subject', 'Unknown')}\n- Folder: {state.get('email_folder', 'Unknown')}"
-            system_prompt += email_ctx + client_ctx
+            email_ctx = state.get("email_context", "")
+            if state.get('email_date'):
+                email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
+            system_prompt += f"\n\nEMAIL CONTEXT:\n{email_ctx}" + client_ctx
         else:
             system_prompt += client_ctx
 
-        if state.get("create_missing"):
+        if state.get("flag_create_missing"):
             try:
                 from actual_orch.clients.mcp import ActualMCPClient
                 mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
@@ -336,7 +355,8 @@ async def parse_receipt_node(state: ReceiptState):
             parsed_dict = result.dict()
         except Exception as e:
             print(f"  ❌ Parsing failed: {e}. Flagging for review.")
-            return {"parsing_failed": True}
+            parse_attempts.append({"model": model_name, "success": False, "error": str(e)})
+            return {"parse_attempts": parse_attempts}
         
         total_val = parsed_dict.pop("total_cad", None)
         parsed_dict["total"] = total_val if total_val is not None else 0.0
@@ -393,13 +413,66 @@ async def parse_receipt_node(state: ReceiptState):
                 parsed_date = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d").date()
                 if datetime.date.today() < parsed_date:
                     print(f"  ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
-                    return {"status": "error", "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
+                    return {"status": WorkflowStatus.ERROR, "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
             except Exception:
                 pass
             
-        return {"parsed_data": parsed_dict, "forex_receipt": forex_receipt, "parsing_failed": False}
+        parse_attempts.append({"model": model_name, "success": True, "error": None})
+        
+        # Build proposed_transaction from parsed data
+        proposed = {
+            "date": parsed_dict.get("date", ""),
+            "payee": parsed_dict.get("payee", ""),
+            "notes": parsed_dict.get("notes", ""),
+        }
+        
+        # Resolve account_key -> account name
+        account_key = parsed_dict.get("account_key")
+        if account_key and state.get("flag_create_missing"):
+            try:
+                mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
+                if os.path.exists(mapping_path):
+                    with open(mapping_path, "r") as f:
+                        acct_mapping = json.load(f)
+                    account_id = acct_mapping.get(account_key)
+                    if account_id:
+                        from actual_orch.clients.mcp import ActualMCPClient
+                        acct_session = await ActualMCPClient.get_session()
+                        acct_res = await acct_session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                        if acct_res.content:
+                            accts = json.loads(acct_res.content[0].text)
+                            acct_match = next((a for a in accts if a.get("id") == account_id), None)
+                            if acct_match:
+                                proposed["account"] = acct_match.get("name", account_key)
+                if "account" not in proposed:
+                    proposed["account"] = account_key
+            except Exception as e:
+                print(f"  ⚠️ Failed to resolve account name: {e}")
+                proposed["account"] = account_key
+        elif account_key:
+            proposed["account"] = account_key
+        
+        # Resolve category_id -> category name
+        cat_id = parsed_dict.get("category_id")
+        if cat_id:
+            try:
+                categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
+                if os.path.exists(categories_path):
+                    with open(categories_path, "r") as f:
+                        cats = json.load(f)
+                    if isinstance(cats, list):
+                        cat_match = next((c for c in cats if c.get("id") == cat_id), None)
+                        if cat_match:
+                            proposed["category"] = cat_match.get("name", "")
+                if "category" not in proposed:
+                    proposed["category"] = cat_id
+            except Exception as e:
+                print(f"  ⚠️ Failed to resolve category name: {e}")
+                proposed["category"] = cat_id
+        
+        return {"parsed_data": parsed_dict, "parse_attempts": parse_attempts, "proposed_transaction": proposed}
     except Exception as e:
-        return {"status": "error", "error": f"Parsing failed: {str(e)}"}
+        return {"status": WorkflowStatus.ERROR, "error": f"Parsing failed: {str(e)}"}
 
 
 def human_approval_node(state: ReceiptState):
@@ -407,50 +480,54 @@ def human_approval_node(state: ReceiptState):
     return {}
 
 def router_after_dedup(state: ReceiptState):
-    if state.get("status") == "already_processed":
+    if state.get("status") == WorkflowStatus.ALREADY_PROCESSED:
         return "skip"
     return "continue"
 
 def router_check_error(state: ReceiptState):
-    if state.get("status") == "error":
+    if state.get("status") == WorkflowStatus.ERROR:
         return "error"
     return "continue"
 
 def router_after_classify(state: ReceiptState):
-    if state.get("status") == "error":
+    if state.get("status") == WorkflowStatus.ERROR:
         return "error"
-    if state.get("not_a_receipt"):
+    classification = state.get("classification", "")
+    if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
         return "skip"
     return "continue"
 
 def router_after_parse(state: ReceiptState):
-    if state.get("status") == "error":
+    if state.get("status") == WorkflowStatus.ERROR:
         return "error"
-    if state.get("parsing_failed"):
+    attempts = state.get("parse_attempts", [])
+    if attempts and not attempts[-1].get("success", False):
         return "human_approval"
     return "continue"
 
 def router_after_search_deterministic(state: ReceiptState):
-    if state.get("status") == "error":
+    if state.get("status") == WorkflowStatus.ERROR:
         return "error"
-    if state.get("status") == "fallback_to_agent":
+    if state.get("status") == WorkflowStatus.FALLBACK_TO_AGENT:
         return "fallback_to_agent"
     if state.get("actual_tx_id") != "unknown_id":
         return "save_pocketbase"
     return "error"
 
 def router_after_search_agent(state: ReceiptState):
-    if state.get("status") == "error":
+    if state.get("status") == WorkflowStatus.ERROR:
         return "error"
-    if state.get("status") == "retry_parse":
+    if state.get("status") == WorkflowStatus.RETRY_PARSE:
         return "retry_parse"
-    if state.get("status") == "human_approval" or state.get("actual_tx_id") == "unknown_id":
-        if state.get("create_missing"):
+    if state.get("status") == WorkflowStatus.HUMAN_APPROVAL or state.get("actual_tx_id") == "unknown_id":
+        if state.get("flag_create_missing"):
             return "save_actual"
         return "human_approval"
     return "save_pocketbase"
 
 def router_after_human(state: ReceiptState):
+    if state.get("flag_create_missing") and state.get("actual_tx_id") == "unknown_id":
+        return "save_actual"
     if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
         return "save_pocketbase"
     return "skip"
@@ -487,7 +564,7 @@ workflow.add_conditional_edges("search_agent", router_after_search_agent, {
     "save_pocketbase": "save_pocketbase",
     "retry_parse": "parse_receipt"
 })
-workflow.add_conditional_edges("human_approval", router_after_human, {"save_pocketbase": "save_pocketbase", "skip": END})
+workflow.add_conditional_edges("human_approval", router_after_human, {"save_actual": "save_actual", "save_pocketbase": "save_pocketbase", "skip": END})
 workflow.add_edge("save_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", "tag_actual")
 workflow.add_edge("tag_actual", END)

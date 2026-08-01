@@ -231,17 +231,23 @@ async def search_agent_node(state: dict):
         narrowed_candidates.sort(key=get_sort_key)
         narrowed_candidates = narrowed_candidates[:50]
         
+        parse_attempts = state.get("parse_attempts", [])
+        already_retried = any(a.get("model") == "search_agent" for a in parse_attempts)
+        
         if not narrowed_candidates:
             print("  ❌ No candidates available for agent to search. Failing immediately.")
-            if state.get("parse_retries", 0) == 0:
+            if not already_retried:
                 print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
-                return {"parse_retries": 1, "status": "retry_parse", "actual_tx_id": "unknown_id"}
+                return {
+                    "parse_attempts": parse_attempts + [{"model": "search_agent", "success": False, "error": "No candidates"}],
+                    "status": "retry_parse",
+                    "actual_tx_id": "unknown_id"
+                }
             else:
                 print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
                 return {"status": "human_approval", "actual_tx_id": "unknown_id"}
         
-        parse_retries = state.get("parse_retries", 0)
-        model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"
+        model_name = "deepseek-v4-pro" if already_retried else "deepseek-v4-flash"
         
         print(f"  🔄 Retrying match with model ({model_name})...")
         
@@ -269,7 +275,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         
         structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode")
         
-        if state.get("log_agent"):
+        if state.get("flag_log_agent"):
             print(f"\n--- AGENT PROMPT ({model_name}) ---")
             print(prompt_text)
             print("---------------------------------------\n")
@@ -278,7 +284,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         try:
             result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
             
-            if state.get("log_agent"):
+            if state.get("flag_log_agent"):
                 print(f"\n--- AGENT RESPONSE ({model_name}) ---")
                 print(result.dict())
                 print("---------------------------------------\n")
@@ -322,9 +328,13 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
             final_id = "unknown_id"
 
         if final_id == "unknown_id":
-            if state.get("parse_retries", 0) == 0:
+            if not already_retried:
                 print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
-                return {"parse_retries": 1, "status": "retry_parse", "actual_tx_id": "unknown_id"}
+                return {
+                    "parse_attempts": parse_attempts + [{"model": "search_agent", "success": False, "error": "Match failed"}],
+                    "status": "retry_parse",
+                    "actual_tx_id": "unknown_id"
+                }
             else:
                 print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
                 return {"status": "human_approval", "actual_tx_id": "unknown_id"}
@@ -342,7 +352,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
 async def save_actual_transaction_node(state: dict):
     """
     Node 3: Auto-create the transaction if deterministic and agent matching fail.
-    Only triggers if create_missing is True.
+    Only triggers if flag_create_missing is True.
     """
     if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
         return {}
@@ -387,11 +397,13 @@ async def save_actual_transaction_node(state: dict):
         
         # Create transaction
         expense_cents = int(round(-abs(amount) * 100)) # Receipts are expenses, API expects cents
+        parsed_notes = (parsed.get("notes") or "").strip()
+        tx_notes = f"{parsed_notes} #receipt".strip() if parsed_notes else "#receipt"
         new_tx = {
             "date": date,
             "amount": expense_cents,
             "payee_name": payee,
-            "notes": "#receipt",
+            "notes": tx_notes,
             "cleared": False
         }
         if category_id:
@@ -421,9 +433,9 @@ async def save_actual_transaction_node(state: dict):
             if q_res.content and len(q_res.content) > 0:
                 txs = json.loads(q_res.content[0].text)
                 if txs and len(txs) > 0:
-                    # Find the exact match
+                    # Find the exact match by amount and #receipt tag
                     for tx in txs:
-                        if tx.get("notes") and "#receipt" in tx["notes"] and "Auto-created" in tx["notes"]:
+                        if tx.get("amount") == expense_cents and tx.get("notes") and "#receipt" in tx["notes"]:
                             print(f"  ✅ Retrieved new transaction ID: {tx['id']}")
                             return {"actual_tx_id": tx["id"], "status": "continue"}
                     # Fallback to first if not found by notes exactly
