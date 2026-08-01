@@ -93,7 +93,51 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                 # Do not reconstruct; keep children as separate candidates
                 candidates.extend(children)
             else:
+                # Include the reconstructed parent AND individual children
                 candidates.append(parent_tx)
+                candidates.extend(children)
+        
+        # Try to fetch real parent data to replace reconstructed approximations
+        if parent_map:
+            try:
+                # Use a split child's account to query via list API for real parent records
+                sample_parent = next(iter(parent_map.values()))
+                acc = sample_parent.get("account.name")
+                if acc:
+                    # Resolve account name to ID for list API
+                    acc_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                    acc_id = None
+                    if acc_res.content:
+                        accts = json.loads(acc_res.content[0].text)
+                        acc_match = next((a for a in accts if a.get("name") == acc), None)
+                        if acc_match:
+                            acc_id = acc_match.get("id")
+                    if acc_id:
+                        list_res = await session.call_tool("actual_transactions", {"args": [
+                            "list", "--account", acc_id,
+                            "--start", start_date, "--end", end_date,
+                            "--format", "json"
+                        ]})
+                        if list_res.content:
+                            all_txs = json.loads(list_res.content[0].text)
+                            for tx in all_txs:
+                                pid = tx.get("id")
+                                if pid in parent_map:
+                                    # Replace reconstructed parent with real data
+                                    for i, c in enumerate(candidates):
+                                        if c.get("id") == pid and not c.get("is_child"):
+                                            candidates[i] = {
+                                                "id": pid,
+                                                "date": tx.get("date", c.get("date")),
+                                                "amount": tx.get("amount", c.get("amount", 0)),
+                                                "payee.name": tx.get("payee", c.get("payee.name")),
+                                                "imported_payee": tx.get("imported_payee", c.get("imported_payee")),
+                                                "notes": tx.get("notes") or c.get("notes", ""),
+                                                "account.name": acc,
+                                            }
+                                            break
+            except Exception as e:
+                pass  # Fall back to reconstructed parents silently
         
         return candidates
     except Exception as e:
@@ -207,14 +251,18 @@ async def search_agent_node(state: dict):
         for c in clean_candidates:
             amount_cents = c.get("amount", 0)
             amount_dollars = amount_cents / 100.0 if amount_cents else 0
-            narrowed_candidates.append({
+            entry = {
                 "id": c.get("id"),
                 "date": c.get("date"),
                 "amount": amount_dollars,
                 "payee": strip_emojis(c.get("payee.name") or c.get("imported_payee")),
                 "account": strip_emojis(c.get("account.name")),
-                "notes": (c.get("notes") or "")[:200]
-            })
+                "notes": (c.get("notes") or "")[:200],
+            }
+            if c.get("is_child"):
+                entry["is_child"] = True
+                entry["parent_id"] = c.get("parent_id")
+            narrowed_candidates.append(entry)
             
         def get_sort_key(c):
             try:
@@ -262,6 +310,7 @@ Candidate transactions from the bank:
 Task: Identify the transaction that matches this receipt. You must respond in JSON.
 Rules:
 - Amounts must be exactly equal OR very close (e.g., tip included, currency difference).
+- Split transaction children (is_child=true) are valid candidates. Match on the individual child amount, not the parent total.
 - Payee names might differ but should be conceptually similar.
 - Date must be within 1 day.
 
@@ -460,62 +509,26 @@ async def tag_actual_transaction_node(state: dict):
         print(f"Tagging transaction {tx_id} with #receipt...")
         session = await ActualMCPClient.get_session()
         
-        # Fetch initial transaction
-        target_tx_id = tx_id
+        # Fetch the transaction to get its current notes and full data
         existing_notes = ""
-        is_child = False
-        parent_id = None
+        tx_data = None
         
         try:
             res = await session.call_tool("actual_query", {"args": [
                 "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), 
-                "--select", "id,notes,is_parent,is_child,parent_id,account,date", "--format", "json"
+                "--select", "id,date,amount,payee,imported_payee,notes,category,account,cleared,is_child,parent_id,sort_order",
+                "--format", "json"
             ]})
             if res.content and len(res.content) > 0:
                 query_data = json.loads(res.content[0].text)
                 if query_data and len(query_data) > 0:
                     tx_data = query_data[0]
                     existing_notes = tx_data.get("notes") or ""
-                    is_child = tx_data.get("is_child")
-                    parent_id = tx_data.get("parent_id")
-                else:
-                    # It might be a parent transaction (actual_query filters them out)
-                    # Try to find its children to get account and date
-                    c_res = await session.call_tool("actual_query", {"args": [
-                        "run", "--table", "transactions", "--filter", json.dumps({"parent_id": tx_id}), 
-                        "--select", "account,date", "--format", "json"
-                    ]})
-                    if c_res.content and len(c_res.content) > 0:
-                        c_data = json.loads(c_res.content[0].text)
-                        if c_data and len(c_data) > 0:
-                            tx_data = c_data[0]
-                            is_child = True # Force resolution block
-                            parent_id = tx_id
+                    if tx_data.get("is_child"):
+                        print(f"Matched child transaction {tx_id} (parent: {tx_data.get('parent_id')}). Tagging child directly.")
+                # else: tx_id is a parent row (actual_query filters these out) — tag it directly anyway
         except Exception as e:
             print(f"Failed to fetch transaction details: {e}")
-            
-        # If it's a child, resolve to parent
-        if is_child and parent_id:
-            print(f"Matched child transaction. Resolving to parent {parent_id}")
-            target_tx_id = parent_id
-            # Fetch parent notes and split breakdown using list API
-            try:
-                acc = tx_data.get("account")
-                dt = tx_data.get("date")
-                if acc and dt:
-                    list_res = await session.call_tool("actual_transactions", {"args": [
-                        "list", "--account", acc,
-                        "--start", dt, "--end", dt,
-                        "--format", "json"
-                    ]})
-                    if list_res.content and len(list_res.content) > 0:
-                        txs = json.loads(list_res.content[0].text)
-                        for t in txs:
-                            if t.get("id") == target_tx_id:
-                                existing_notes = t.get("notes") or ""
-                                break
-            except Exception as e:
-                print(f"Failed to fetch parent notes: {e}")
         
         # Append #receipt to existing notes
         if "#receipt" not in existing_notes:
@@ -524,23 +537,29 @@ async def tag_actual_transaction_node(state: dict):
             else:
                 new_notes = "#receipt"
         else:
-            print(f"Transaction {target_tx_id} already has #receipt tag.")
-            # Return potentially updated tx_id if we resolved to parent
-            if target_tx_id != tx_id:
-                return {"actual_tx_id": target_tx_id}
+            print(f"Transaction {tx_id} already has #receipt tag.")
             return {}
+
+        # Build update payload with only writable fields to prevent the update API
+        # from choking on relational/read-only fields returned by actual_query
+        # (e.g. payee.name, account.name, is_child, parent_id, transfer_id).
+        # This also preserves existing child transaction fields that would otherwise
+        # be wiped out if we only sent {"notes": ...}.
+        WRITABLE_FIELDS = {"date", "amount", "payee", "payee_name", "imported_payee",
+                           "notes", "category", "account", "cleared", "imported_id", "sort_order"}
+        update_payload = {"notes": new_notes}
+        if tx_data:
+            update_payload = {k: v for k, v in tx_data.items() if k in WRITABLE_FIELDS}
+            update_payload["notes"] = new_notes
 
         mcp_tools = await load_mcp_tools(session)
         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
         if tx_tool:
             await tx_tool.ainvoke({"args": [
-                "update", target_tx_id,
-                "--data", json.dumps({"notes": new_notes})
+                "update", tx_id,
+                "--data", json.dumps(update_payload)
             ]})
-            print(f"✅ Tagged transaction {target_tx_id} with #receipt")
-            
-        if target_tx_id != tx_id:
-            return {"actual_tx_id": target_tx_id}
+            print(f"✅ Tagged transaction {tx_id} with #receipt")
             
     except Exception as e:
         print(f"⚠️ Failed to tag transaction (non-fatal): {e}")
