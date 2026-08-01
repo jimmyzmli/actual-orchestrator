@@ -33,6 +33,7 @@ class ProposedTransaction(TypedDict, total=False):
     payee: str
     notes: str
     category: str
+    amount: float
 
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF or PNG
@@ -47,7 +48,7 @@ class ReceiptState(TypedDict, total=False):
     email_date: str
     email_context: str    # Context string containing sender, subject, folder, etc.
     image_paths: List[str] # Paths to extracted JPEG images
-    proposed_transaction: ProposedTransaction 
+    proposed_transactions: List[ProposedTransaction] 
     parse_attempts: List[Dict[str, Any]] # History of parsing attempts (model, success, error)
     flag_log_agent: bool       # True if agent logs should be printed
     flag_create_missing: bool  # True if we should auto-create a transaction on no-match
@@ -58,16 +59,19 @@ class ReceiptItem(BaseModel):
     description: str = Field(description="Description of the item")
     amount: float = Field(description="Amount of the item")
 
+class ParsedProposedTransaction(BaseModel):
+    amount: float = Field(description="Amount for this transaction line. Positive = expense, negative = refund or points redemption.")
+    notes: str = Field(description="Concise description of this line (e.g. 'Groceries - milk, eggs, bread', 'Points redemption')")
+    category_id: str = Field(description="The most likely category ID from the provided list")
+
 class ParsedReceipt(BaseModel):
     date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
-    total_cad: Optional[float] = Field(default=None, description="Total amount of the receipt in CAD ONLY if explicitly printed on the receipt. Do NOT calculate currency conversions yourself. If the receipt is in a foreign currency, leave this as null.")
-    currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. If clearly from Canada or CAD is not explicitly stated otherwise, use CAD.")
-    total_foreign_currency: Optional[float] = Field(default=None, description="If the receipt is clearly in a foreign currency (not CAD), the exact total amount in that foreign currency. Otherwise leave as null.")
+    currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. Default to CAD unless there is definitive proof otherwise.")
     payee: str = Field(description="Name of the store or payee")
     notes: str = Field(default="", description="A concise ~50 character human-readable summary of what was purchased (e.g. 'Groceries - milk, eggs, bread' or 'Uber ride downtown'). Do NOT include the payee name, date, or amount — just describe the purchase.")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
     account_key: Optional[str] = Field(default=None, description="If a list of valid account keys is provided, the most likely account key for this receipt based on the OCR text. Otherwise null.")
-    category_id: Optional[str] = Field(default=None, description="If a list of categories is provided, the most likely category ID for this receipt. Otherwise null.")
+    proposed_transactions: List[ParsedProposedTransaction] = Field(description="List of proposed transactions to create. The sum of amounts across all proposed transactions equals the receipt total.")
 
 def extract_ocr_node(state: ReceiptState):
     """Extract raw text from the PDF or image using Gemini Vision"""
@@ -261,106 +265,126 @@ async def parse_receipt_node(state: ReceiptState):
         parse_attempts = state.get("parse_attempts", [])
         parse_retries = len(parse_attempts)
         
+        # Try cache first (only on first attempt)
+        parsed_dict = None
+        model_name = None
         if parse_retries == 0:
             cached = get_parsed(file_path, prefix=prefix)
             if cached is None and prefix != "receipt_":
                 cached = get_parsed(file_path, prefix="receipt_")
             if cached is not None:
                 print("Using cached parsed data (Redis)...")
-                return {"parsed_data": cached}
+                parsed_dict = cached
 
-        model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"
-        print(f"Parsing receipt with {model_name} (retry {parse_retries})...")
-        
-        llm = ChatOpenAI(
-            model=model_name, 
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-            base_url="https://api.deepseek.com/v1",
-            max_tokens=1024
-        )
-        
-        from actual_orch.shared.peak_hours import pause_if_peak_hours
-        pause_if_peak_hours("deepseek")
-        
-        source_type = state.get("source")
-        if source_type == "gdrive":
-            source_desc = "OCR text from a paper receipt"
-        elif source_type == "email":
-            source_desc = "raw text from an email receipt"
-        else:
-            source_desc = "OCR text from a receipt"
+        if parsed_dict is None:
+            model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"
+            print(f"Parsing receipt with {model_name} (retry {parse_retries})...")
             
-        system_prompt = "You are an expert at extracting structured data from {source_desc}. Extract the date, total amount, currency, payee, a short note, and line items. If a date is missing, use the current date or guess based on context. Amount should be a number. Date MUST be YYYY-MM-DD. You MUST respond with a JSON object. For the top-level keys, strictly use 'date', 'total_cad', 'currency', 'total_foreign_currency', 'payee', 'notes', 'items', 'account_key', and 'category_id'. For the items array, strictly use the keys 'description' and 'amount'. For ATM receipts or transfers, 'items' can be empty, and 'payee' can be the bank name or 'ATM'. For the item 'description', write a casual, human-readable description but try to include all useful info (like brand or type) while avoiding weird characters or abbreviations. IMPORTANT: The 'notes' field should be a concise ~50 character human-readable summary of what was purchased (e.g. 'Groceries - milk, eggs, bread' or 'Uber ride downtown'). Do NOT include the payee name, date, or amount in the note — just describe the purchase. For ATM withdrawals use 'ATM withdrawal', for e-transfers use 'e-Transfer'. IMPORTANT: Include taxes (HST, GST, PST, VAT, etc.) and points/rewards redemptions as separate line items. Points redemptions should appear as negative amounts (e.g. -2.50 for a $2.50 points discount). The line items should add up to the receipt total. IMPORTANT: Your default assumption for currency MUST be CAD. Unless there is definitive proof of a foreign transaction (e.g., explicitly stating USD or foreign currency symbol), you must output CAD. Payees like Uber (Amsterdam) or Apple (California) often show foreign addresses but process transactions in CAD. Do NOT assume USD just because of a foreign address. If it is CAD, leave 'total_foreign_currency' null."
+            llm = ChatOpenAI(
+                model=model_name, 
+                api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
+                base_url="https://api.deepseek.com/v1",
+                max_tokens=1024
+            )
+            
+            from actual_orch.shared.peak_hours import pause_if_peak_hours
+            pause_if_peak_hours("deepseek")
+            
+            source_type = state.get("source")
+            if source_type == "gdrive":
+                source_desc = "OCR text from a paper receipt"
+            elif source_type == "email":
+                source_desc = "raw text from an email receipt"
+            else:
+                source_desc = "OCR text from a receipt"
+                
+            system_prompt = (
+                "You are an expert at extracting structured data from {source_desc}. "
+                "Respond with a JSON object using these top-level keys: 'date', 'currency', 'payee', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
+                "RULES:\n"
+                "- 'date': YYYY-MM-DD format. If missing, use the current date or guess from context.\n"
+                "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
+                "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
+                "- 'notes': A concise ~50 character summary of the purchase (e.g. 'Groceries - milk, eggs, bread'). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal', for e-transfers use 'e-Transfer'.\n"
+                "- 'items': Array of line items with 'description' and 'amount'. Include taxes (HST/GST/PST/VAT) as separate items. Points/rewards redemptions should be negative amounts. Items can be empty for ATM/transfers.\n"
+                "  - 'description': casual, human-readable — include useful info (brand, type) but avoid weird characters or abbreviations.\n\n"
+                "PROPOSED TRANSACTIONS (most important):\n"
+                "'proposed_transactions' is the primary output. Each entry has: 'amount' (number), 'notes' (concise description), 'category_id' (from the category list).\n"
+                "- Most receipts have ONE proposed transaction with the receipt total as the amount.\n"
+                "- If the receipt includes a points redemption or refund (negative amount on the receipt), create a SEPARATE proposed transaction for it with a negative amount and an Income category.\n"
+                "- The sum of all proposed_transaction amounts must equal the receipt total.\n"
+                "- Amounts are in the receipt's currency (the 'currency' field).\n"
+            )
 
-        client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
-        if source_type == "email":
-            email_ctx = state.get("email_context", "")
-            if state.get('email_date'):
-                email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
-            system_prompt += f"\n\nEMAIL CONTEXT:\n{email_ctx}" + client_ctx
-        else:
-            system_prompt += client_ctx
+            client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
+            if source_type == "email":
+                email_ctx = state.get("email_context", "")
+                if state.get('email_date'):
+                    email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
+                system_prompt += f"\n\nEMAIL CONTEXT:\n{email_ctx}" + client_ctx
+            else:
+                system_prompt += client_ctx
 
-        if state.get("flag_create_missing"):
+            if state.get("flag_create_missing"):
+                try:
+                    from actual_orch.clients.mcp import ActualMCPClient
+                    mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
+                    mapping = {}
+                    if os.path.exists(mapping_path):
+                        with open(mapping_path, "r") as f:
+                            mapping = json.load(f)
+                    
+                    session = await ActualMCPClient.get_session()
+                    res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                    if res.content:
+                        try:
+                            accounts = json.loads(res.content[0].text)
+                            on_budget_ids = {acc.get("id") for acc in accounts if not acc.get("offbudget") and isinstance(acc, dict) and acc.get("id")}
+                            valid_keys = [k for k, v in mapping.items() if v in on_budget_ids]
+                            
+                            if valid_keys:
+                                keys_json = json.dumps(valid_keys).replace("{", "{{").replace("}", "}}")
+                                system_prompt += f"\n\nACCOUNT SELECTION:\nYou must also pick the MOST LIKELY account key from this list of valid on-budget account keys: {keys_json}\nValid account keys generally fall into two categories:\n1. The last 4 digits of a credit card (e.g. 1234, 5234).\n2. Different account names or types (e.g. WS-CHEQUING, DEFAULT-CC).\nIf you see the last 4 digits of a card on the receipt that matches one of the keys, use that key for 'account_key'. If you see the name of an institution or account type that strongly matches, use that key. If you are unsure, output the key 'DEFAULT-CC' if it exists in the list, or just pick the most likely one."
+                        except Exception as json_e:
+                            print(f"  ⚠️ Failed to parse accounts JSON: {json_e}")
+                    
+                    categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
+                    if os.path.exists(categories_path):
+                        with open(categories_path, "r") as f:
+                            categories = json.load(f)
+                        if isinstance(categories, list):
+                            expense_categories = [{"id": c.get("id"), "name": c.get("name")} for c in categories if isinstance(c, dict) and not c.get("hidden") and not c.get("is_income") and c.get("id")]
+                            income_categories = [{"id": c.get("id"), "name": c.get("name")} for c in categories if isinstance(c, dict) and not c.get("hidden") and c.get("is_income") and c.get("id")]
+                            if expense_categories:
+                                expense_json = json.dumps(expense_categories).replace("{", "{{").replace("}", "}}")
+                                income_json = json.dumps(income_categories).replace("{", "{{").replace("}", "}}") if income_categories else "[]"
+                                system_prompt += f"\n\nCATEGORY SELECTION:\nEach proposed_transaction must have a 'category_id'. Pick from these expense categories: {expense_json}\nFor refunds or points redemptions (negative amounts), use one of these income categories instead: {income_json}\nIf unsure, pick the most generic expense category."
+                except Exception as e:
+                    print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
+
+            if parse_retries > 0:
+                prev_date = state.get("parsed_data", {}).get("date", "unknown")
+                system_prompt += f"\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction."
+
+            prompt = ChatPromptTemplate.from_messages([
+                ("system", system_prompt),
+                ("human", "Here is the {source_desc}:\n\n{ocr_text}")
+            ])
+            
+            prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"])
+            print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+
             try:
-                from actual_orch.clients.mcp import ActualMCPClient
-                mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
-                mapping = {}
-                if os.path.exists(mapping_path):
-                    with open(mapping_path, "r") as f:
-                        mapping = json.load(f)
-                
-                session = await ActualMCPClient.get_session()
-                res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
-                if res.content:
-                    try:
-                        accounts = json.loads(res.content[0].text)
-                        on_budget_ids = {acc.get("id") for acc in accounts if not acc.get("offbudget") and isinstance(acc, dict) and acc.get("id")}
-                        valid_keys = [k for k, v in mapping.items() if v in on_budget_ids]
-                        
-                        if valid_keys:
-                            keys_json = json.dumps(valid_keys).replace("{", "{{").replace("}", "}}")
-                            system_prompt += f"\n\nACCOUNT SELECTION:\nYou must also pick the MOST LIKELY account key from this list of valid on-budget account keys: {keys_json}\nValid account keys generally fall into two categories:\n1. The last 4 digits of a credit card (e.g. 1234, 5234).\n2. Different account names or types (e.g. WS-CHEQUING, DEFAULT-CC).\nIf you see the last 4 digits of a card on the receipt that matches one of the keys, use that key for 'account_key'. If you see the name of an institution or account type that strongly matches, use that key. If you are unsure, output the key 'DEFAULT-CC' if it exists in the list, or just pick the most likely one."
-                    except Exception as json_e:
-                        print(f"  ⚠️ Failed to parse accounts JSON: {json_e}")
-                
-                categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
-                if os.path.exists(categories_path):
-                    with open(categories_path, "r") as f:
-                        categories = json.load(f)
-                    if isinstance(categories, list):
-                        valid_categories = [{"id": c.get("id"), "name": c.get("name")} for c in categories if isinstance(c, dict) and not c.get("hidden") and not c.get("is_income") and c.get("id")]
-                        if valid_categories:
-                            categories_json = json.dumps(valid_categories).replace("{", "{{").replace("}", "}}")
-                            system_prompt += f"\n\nCATEGORY SELECTION:\nYou must also pick the MOST LIKELY category ID from this list: {categories_json}\nBased on the receipt items and payee, choose the best category and output its 'id' for the 'category_id' field. If unsure, pick the most generic expense category."
+                structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
+                chain = prompt | structured_llm
+                result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
+                parsed_dict = result.dict()
             except Exception as e:
-                print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
-
-        if parse_retries > 0:
-            prev_date = state.get("parsed_data", {}).get("date", "unknown")
-            system_prompt += f"\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction."
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", "Here is the {source_desc}:\n\n{ocr_text}")
-        ])
+                print(f"  ❌ Parsing failed: {e}. Flagging for review.")
+                parse_attempts.append({"model": model_name, "success": False, "error": str(e)})
+                return {"parse_attempts": parse_attempts}
         
-        prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"])
-        print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
-
-        try:
-            structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
-            chain = prompt | structured_llm
-            result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
-            parsed_dict = result.dict()
-        except Exception as e:
-            print(f"  ❌ Parsing failed: {e}. Flagging for review.")
-            parse_attempts.append({"model": model_name, "success": False, "error": str(e)})
-            return {"parse_attempts": parse_attempts}
-        
-        total_val = parsed_dict.pop("total_cad", None)
-        parsed_dict["total"] = total_val if total_val is not None else 0.0
-        
+        # Email date override logic
         if state.get("source") == "email" and state.get("email_date"):
             if parse_retries == 0:
                 try:
@@ -375,38 +399,61 @@ async def parse_receipt_node(state: ReceiptState):
                 except Exception as e:
                     print(f"  ⚠️ Could not compare dates for override: {e}")
         
-        if "total_foreign_currency" in parsed_dict:
-            parsed_dict["foreign_amount"] = parsed_dict.pop("total_foreign_currency")
+        # Validate proposed_transactions — each must have amount, notes, category_id
+        parsed_pts = parsed_dict.get("proposed_transactions") or []
         
-        currency = parsed_dict.get("currency", "CAD")
-        if currency:
-            currency = currency.upper()
-        else:
-            currency = "CAD"
-        forex_receipt = currency != "CAD"
+        # Backward compat: v1 cached data may lack proposed_transactions
+        if not parsed_pts and parsed_dict.get("total"):
+            parsed_pts = [{
+                "amount": parsed_dict["total"],
+                "notes": parsed_dict.get("notes", ""),
+                "category_id": parsed_dict.get("category_id", "")
+            }]
+            parsed_dict["proposed_transactions"] = parsed_pts
         
-        if forex_receipt and parsed_dict.get("foreign_amount"):
-            try:
-                import sys
-                utils_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils"))
-                if utils_path not in sys.path:
-                    sys.path.append(utils_path)
-                from modules.market import get_price
+        for i, pt in enumerate(parsed_pts):
+            missing = [f for f in ("amount", "notes", "category_id") if not pt.get(f) and pt.get(f) != 0]
+            if missing:
+                print(f"  ⚠️ proposed_transaction[{i}] missing fields: {missing} — {pt}")
+        
+        # Calculate total from sum of proposed transaction amounts (in receipt currency)
+        receipt_total = sum(pt.get("amount", 0.0) for pt in parsed_pts)
+        
+        # Currency / FX handling — skip if total already computed (cached data)
+        if "total" not in parsed_dict or parsed_dict["total"] == 0:
+            currency = (parsed_dict.get("currency") or "CAD").upper()
+            parsed_dict["currency"] = currency
+            forex_receipt = currency != "CAD"
+            
+            if forex_receipt and receipt_total:
+                parsed_dict["foreign_amount"] = receipt_total
+                try:
+                    import sys
+                    utils_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils"))
+                    if utils_path not in sys.path:
+                        sys.path.append(utils_path)
+                    from modules.market import get_price
+                    
+                    price, _ = get_price(currency, parsed_dict.get("date"))
+                    if price:
+                        parsed_dict["total"] = round(receipt_total * price, 2)
+                        print(f"  [Forex] Converted {receipt_total} {currency} to approx {parsed_dict['total']} CAD")
+                    else:
+                        parsed_dict["total"] = receipt_total
+                except Exception as e:
+                    print(f"  ⚠️ Could not convert foreign amount to CAD: {e}")
+                    parsed_dict["total"] = receipt_total
+            else:
+                parsed_dict["total"] = receipt_total
                 
-                price, _ = get_price(currency, parsed_dict.get("date"))
-                if price:
-                    cad_equiv = parsed_dict["foreign_amount"] * price
-                    parsed_dict["total"] = round(cad_equiv, 2)
-                    print(f"  [Forex] Converted {parsed_dict['foreign_amount']} {currency} to approx {parsed_dict['total']} CAD")
-            except Exception as e:
-                print(f"  ⚠️ Could not convert foreign amount to CAD: {e}")
-                
-        meta = {
-            "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "model": model_name,
-            "schema_version": "1.0.0"
-        }
-        set_parsed(file_path, parsed_dict, meta, prefix=prefix)
+        # Cache the raw agent response (only for fresh LLM calls, not cached data)
+        if model_name:
+            meta = {
+                "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "model": model_name,
+                "schema_version": "2.0.0"
+            }
+            set_parsed(file_path, parsed_dict, meta, prefix=prefix)
         
         if parsed_dict.get("date"):
             try:
@@ -417,16 +464,14 @@ async def parse_receipt_node(state: ReceiptState):
             except Exception:
                 pass
             
-        parse_attempts.append({"model": model_name, "success": True, "error": None})
+        if model_name:
+            parse_attempts.append({"model": model_name, "success": True, "error": None})
         
-        # Build proposed_transaction from parsed data
-        proposed = {
-            "date": parsed_dict.get("date", ""),
-            "payee": parsed_dict.get("payee", ""),
-            "notes": parsed_dict.get("notes", ""),
-        }
-        
+        # Build proposed_transactions for state (resolve display names, copy date/payee/account)
+        proposed_list = []
+            
         # Resolve account_key -> account name
+        account_name = parsed_dict.get("account_key")
         account_key = parsed_dict.get("account_key")
         if account_key and state.get("flag_create_missing"):
             try:
@@ -443,34 +488,39 @@ async def parse_receipt_node(state: ReceiptState):
                             accts = json.loads(acct_res.content[0].text)
                             acct_match = next((a for a in accts if a.get("id") == account_id), None)
                             if acct_match:
-                                proposed["account"] = acct_match.get("name", account_key)
-                if "account" not in proposed:
-                    proposed["account"] = account_key
+                                account_name = acct_match.get("name", account_key)
             except Exception as e:
                 print(f"  ⚠️ Failed to resolve account name: {e}")
-                proposed["account"] = account_key
-        elif account_key:
-            proposed["account"] = account_key
-        
-        # Resolve category_id -> category name
-        cat_id = parsed_dict.get("category_id")
-        if cat_id:
-            try:
-                categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
-                if os.path.exists(categories_path):
-                    with open(categories_path, "r") as f:
-                        cats = json.load(f)
-                    if isinstance(cats, list):
-                        cat_match = next((c for c in cats if c.get("id") == cat_id), None)
-                        if cat_match:
-                            proposed["category"] = cat_match.get("name", "")
-                if "category" not in proposed:
-                    proposed["category"] = cat_id
-            except Exception as e:
-                print(f"  ⚠️ Failed to resolve category name: {e}")
-                proposed["category"] = cat_id
-        
-        return {"parsed_data": parsed_dict, "parse_attempts": parse_attempts, "proposed_transaction": proposed}
+                
+        # Resolve category_ids -> category names
+        cats = []
+        try:
+            categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
+            if os.path.exists(categories_path):
+                with open(categories_path, "r") as f:
+                    loaded_cats = json.load(f)
+                    if isinstance(loaded_cats, list):
+                        cats = loaded_cats
+        except Exception as e:
+            print(f"  ⚠️ Failed to load categories for resolving names: {e}")
+            
+        for pt in parsed_pts:
+            p = {
+                "date": parsed_dict.get("date", ""),
+                "payee": parsed_dict.get("payee", ""),
+                "notes": pt.get("notes", ""),
+                "amount": pt.get("amount", 0.0)
+            }
+            if account_name:
+                p["account"] = account_name
+                
+            cat_id = pt.get("category_id")
+            if cat_id:
+                cat_match = next((c for c in cats if c.get("id") == cat_id), None)
+                p["category"] = cat_match.get("name") if cat_match else cat_id
+            proposed_list.append(p)
+            
+        return {"parsed_data": parsed_dict, "parse_attempts": parse_attempts, "proposed_transactions": proposed_list}
     except Exception as e:
         return {"status": WorkflowStatus.ERROR, "error": f"Parsing failed: {str(e)}"}
 

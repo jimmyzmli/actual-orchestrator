@@ -413,8 +413,14 @@ async def save_actual_transaction_node(state: dict):
             return {"status": "error", "error": "No parsed data found for auto-creation"}
             
         date = parsed["date"]
-        amount = parsed["total"] # this is usually positive for a receipt
         payee = parsed["payee"]
+        
+        proposed_txs = state.get("proposed_transactions") or []
+        
+        # Calculate total from proposed transactions (in CAD — FX already applied by parse node)
+        amount = parsed.get("total", 0.0)
+        if not amount and proposed_txs:
+            amount = sum(pt.get("amount", 0.0) for pt in proposed_txs)
         
         # Load account-mapping.json
         import os
@@ -437,26 +443,63 @@ async def save_actual_transaction_node(state: dict):
             
         account_id = mapping[selected_key]
         print(f"  ✅ Extracted account key '{selected_key}' -> {account_id}")
-        
-        category_id = parsed.get("category_id")
-        if category_id:
-            print(f"  ✅ Extracted category ID -> {category_id}")
             
         session = await ActualMCPClient.get_session()
         
-        # Create transaction
-        expense_cents = int(round(-abs(amount) * 100)) # Receipts are expenses, API expects cents
+        # Create transaction — receipts are expenses, API expects negative cents
+        expense_cents = int(round(-abs(amount) * 100))
         parsed_notes = (parsed.get("notes") or "").strip()
         tx_notes = f"{parsed_notes} #receipt".strip() if parsed_notes else "#receipt"
-        new_tx = {
-            "date": date,
-            "amount": expense_cents,
-            "payee_name": payee,
-            "notes": tx_notes,
-            "cleared": False
-        }
-        if category_id:
-            new_tx["category"] = category_id
+        
+        # Load categories for reverse lookup (name/id -> id)
+        cats = []
+        try:
+            categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
+            if os.path.exists(categories_path):
+                with open(categories_path, "r") as f:
+                    loaded_cats = json.load(f)
+                    if isinstance(loaded_cats, list):
+                        cats = loaded_cats
+        except Exception:
+            pass
+        
+        if len(proposed_txs) > 1:
+            print("  ➕ Detected multiple proposed transactions. Creating split transaction...")
+            new_tx = {
+                "date": date,
+                "amount": expense_cents,
+                "payee_name": payee,
+                "notes": tx_notes,
+                "cleared": False,
+                "subtransactions": []
+            }
+            for pt in proposed_txs:
+                # Negate: positive pt_amount (expense) -> negative cents for Actual API
+                sub_cents = int(round(-pt.get("amount", 0.0) * 100))
+                sub = {
+                    "amount": sub_cents,
+                    "notes": pt.get("notes", "")
+                }
+                pt_cat = pt.get("category")
+                if pt_cat:
+                    cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
+                    sub["category"] = cat_match.get("id") if cat_match else pt_cat
+                new_tx["subtransactions"].append(sub)
+        else:
+            new_tx = {
+                "date": date,
+                "amount": expense_cents,
+                "payee_name": payee,
+                "notes": tx_notes,
+                "cleared": False
+            }
+            # Single transaction — get category from the first proposed transaction
+            if proposed_txs:
+                pt_cat = proposed_txs[0].get("category")
+                if pt_cat:
+                    cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
+                    if cat_match:
+                        new_tx["category"] = cat_match.get("id")
         
         # Save using Actual MCP
         mcp_tools = await load_mcp_tools(session)
@@ -476,20 +519,32 @@ async def save_actual_transaction_node(state: dict):
             q_res = await session.call_tool("actual_query", {"args": [
                 "run", "--table", "transactions",
                 "--filter", json.dumps(filter_obj),
-                "--select", "id,amount,payee.name,notes",
+                "--select", "id,amount,payee.name,notes,is_child,parent_id",
                 "--format", "json"
             ]})
             if q_res.content and len(q_res.content) > 0:
                 txs = json.loads(q_res.content[0].text)
                 if txs and len(txs) > 0:
-                    # Find the exact match by amount and #receipt tag
+                    # 1. Try to find the exact parent transaction match (for single/normal tx)
                     for tx in txs:
-                        if tx.get("amount") == expense_cents and tx.get("notes") and "#receipt" in tx["notes"]:
+                        if not tx.get("is_child") and tx.get("amount") == expense_cents and tx.get("notes") and "#receipt" in tx["notes"]:
                             print(f"  ✅ Retrieved new transaction ID: {tx['id']}")
                             return {"actual_tx_id": tx["id"], "status": "continue"}
-                    # Fallback to first if not found by notes exactly
-                    print(f"  ✅ Retrieved new transaction ID (fallback): {txs[0]['id']}")
-                    return {"actual_tx_id": txs[0]["id"], "status": "continue"}
+                            
+                    # 2. Try to find a child transaction match (for split tx)
+                    for tx in txs:
+                        if tx.get("is_child") and tx.get("parent_id"):
+                            # Match if payee is the same and amount matches one of the subtransactions
+                            sub_amounts = [int(round(-pt.get("amount", 0.0) * 100)) for pt in proposed_txs]
+                            if (payee and tx.get("payee.name") == payee) or (tx.get("amount") in sub_amounts):
+                                print(f"  ✅ Retrieved new split transaction parent ID: {tx['parent_id']}")
+                                return {"actual_tx_id": tx["parent_id"], "status": "continue"}
+                                
+                    # 3. Fallback to first returned transaction
+                    fallback_tx = txs[0]
+                    fallback_id = fallback_tx.get("parent_id") if fallback_tx.get("is_child") else fallback_tx["id"]
+                    print(f"  ✅ Retrieved new transaction ID (fallback): {fallback_id}")
+                    return {"actual_tx_id": fallback_id, "status": "continue"}
             
             print("  ⚠️ Created transaction but couldn't query its ID. PocketBase won't have the ID.")
             return {"actual_tx_id": "unknown_id", "status": "continue"}
