@@ -205,13 +205,18 @@ async def search_deterministic_node(state: dict):
             matched_candidate = next((c for c in scored if c["id"] == final_id), None)
             if matched_candidate:
                 actual_amt = abs(matched_candidate.get("amount", 0))
-                min_allowed = receipt_cents * 0.90
-                max_allowed = receipt_cents * 1.30
-                if not (min_allowed <= actual_amt <= max_allowed):
-                    print(f"❌ VALIDATION FAILED: Bank amount ${actual_amt/100:.2f} "
-                          f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
+                
+                if state.get("source") == "email" and actual_amt != receipt_cents:
+                    print(f"❌ VALIDATION FAILED: Email receipt amount ${amount:.2f} "
+                          f"must exactly match bank amount ${actual_amt/100:.2f}. Rejecting.")
                     final_id = "unknown_id"
-                    
+                else:
+                    min_allowed = receipt_cents * 0.90
+                    max_allowed = receipt_cents * 1.30
+                    if not (min_allowed <= actual_amt <= max_allowed):
+                        print(f"❌ VALIDATION FAILED: Bank amount ${actual_amt/100:.2f} "
+                              f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
+                        final_id = "unknown_id"
         if final_id == "unknown_id":
             return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
             
@@ -446,8 +451,9 @@ async def save_actual_transaction_node(state: dict):
             
         session = await ActualMCPClient.get_session()
         
-        # Create transaction — receipts are expenses, API expects negative cents
-        expense_cents = int(round(-abs(amount) * 100))
+        # Create transaction — receipts are expenses (positive amounts) so we negate them for the API.
+        # Refunds are negative amounts, negating them makes them positive (inflow) for the API.
+        expense_cents = int(round(-amount * 100))
         parsed_notes = (parsed.get("notes") or "").strip()
         tx_notes = f"{parsed_notes} #receipt".strip() if parsed_notes else "#receipt"
         
