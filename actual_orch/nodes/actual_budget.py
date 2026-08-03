@@ -252,6 +252,27 @@ async def search_agent_node(state: dict):
         
         clean_candidates = candidates
         
+        # Pre-fetch existing receipts from PocketBase for candidates that have #receipt
+        candidate_ids_with_receipts = [c.get("id") for c in clean_candidates if c.get("id") and "#receipt" in (c.get("notes") or "")]
+        previously_attached_receipts_map = {}
+        if candidate_ids_with_receipts:
+            try:
+                from actual_orch.clients.pocketbase import get_pb_client
+                pb_client = get_pb_client()
+                for cid in candidate_ids_with_receipts:
+                    try:
+                        records = pb_client.collection("receipts").get_list(1, 10, query_params={
+                            "filter": f"tx_id='{cid}'",
+                            "fields": "payee,amount,date"
+                        })
+                        receipts = [{"payee": getattr(r, "payee", ""), "amount": getattr(r, "amount", 0.0), "date": str(getattr(r, "date", ""))[:10]} for r in records.items]
+                        if receipts:
+                            previously_attached_receipts_map[cid] = receipts
+                    except Exception as e:
+                        print(f"  ⚠️ Warning: Failed to fetch receipts for candidate {cid}: {e}")
+            except Exception as e:
+                print(f"  ⚠️ Warning: Could not import or use pocketbase client: {e}")
+        
         narrowed_candidates = []
         for c in clean_candidates:
             amount_cents = c.get("amount", 0)
@@ -264,6 +285,11 @@ async def search_agent_node(state: dict):
                 "account": strip_emojis(c.get("account.name")),
                 "notes": (c.get("notes") or "")[:200],
             }
+            if "#receipt" in (c.get("notes") or ""):
+                entry["already_has_receipt_attached"] = True
+                if c.get("id") in previously_attached_receipts_map:
+                    entry["previously_attached_receipts"] = previously_attached_receipts_map[c.get("id")]
+                
             if c.get("is_child"):
                 entry["is_child"] = True
                 entry["parent_id"] = c.get("parent_id")
@@ -318,6 +344,7 @@ Rules:
 - Split transaction children (is_child=true) are valid candidates. Match on the individual child amount, not the parent total.
 - Payee names might differ but should be conceptually similar.
 - Date must be within 1 day.
+- Candidates with 'already_has_receipt_attached' = true already have a receipt. If 'previously_attached_receipts' is provided, it contains the details (payee, amount, date) of the receipt(s) already attached to this candidate. Only select this candidate if you are absolutely sure the current receipt is a different version of the receipt for the exact same transaction.
 
 Respond in JSON format with the 'matched_id' of the matching transaction, or null if no match exists."""
             
