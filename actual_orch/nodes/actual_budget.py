@@ -347,11 +347,11 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                 final_id = result.matched_id
                 print(f"Agent matched tx: {final_id} with {model_name}")
                 # Validate
-                matched = next((c for c in narrowed_candidates if c["id"] == final_id), None)
+                matched = next((c for c in clean_candidates if c["id"] == final_id), None)
                 if matched:
                     print(f"✅ Agent selected valid candidate: {final_id}")
                     
-                    # Validate amount
+                    # Validate amount (clean_candidates has amount in cents)
                     actual_amt = abs(matched.get("amount", 0))
                     min_allowed = receipt_cents * 0.90
                     max_allowed = receipt_cents * 1.30
@@ -372,7 +372,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                         except Exception:
                             pass
                 else:
-                    print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the narrowed candidates.")
+                    print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the candidates.")
                     final_id = "unknown_id"
             else:
                 print(f"Agent ({model_name}) output didn't contain matched_id")
