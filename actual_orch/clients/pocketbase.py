@@ -13,35 +13,33 @@ def get_pb_client():
     client.collection("users").auth_with_password(pb_user, pb_pass)
     return client
 
-def fetch_all_source_hashes():
+def fetch_all_field_values(field: str):
     """
-    Fetch all source_hash values from PocketBase in a single paginated sweep.
-    Uses `fields=source_hash` and `skipTotal=true` to minimise payload and
-    skip the expensive COUNT(*) query on the server.
-    Returns a set of hash strings.
+    Fetch all values for a specific field from PocketBase in a single paginated sweep.
+    Uses `fields=field` and `skipTotal=true` to minimise payload.
+    Returns a set of string values.
     """
     client = get_pb_client()
-    hashes = set()
+    values = set()
     page = 1
     per_page = 500
     while True:
         try:
             records = client.collection("receipts").get_list(page, per_page, query_params={
-                "fields": "source_hash",
+                "fields": field,
                 "skipTotal": "true",
             })
             for r in records.items:
-                h = getattr(r, "source_hash", None)
-                if h:
-                    hashes.add(h)
-            # If fewer items than perPage, we've reached the last page
+                v = getattr(r, field, None)
+                if v:
+                    values.add(v)
             if len(records.items) < per_page:
                 break
             page += 1
         except Exception as e:
-            print(f"⚠️ Error fetching source hashes page {page}: {e}")
+            print(f"⚠️ Error fetching {field} page {page}: {e}")
             break
-    return hashes
+    return values
 
 def fetch_all_receipts():
     """
