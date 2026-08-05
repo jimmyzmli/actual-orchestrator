@@ -446,8 +446,28 @@ async def parse_receipt_node(state: ReceiptState):
                     print(json.dumps(parsed_dict, indent=2))
                     print("---------------------------------------\n")
             except Exception as e:
-                print(f"  ❌ Parsing failed: {e}. Flagging for review.")
-                parse_attempts.append({"model": model_name, "success": False, "error": str(e)})
+                error_msg = str(e)
+                try:
+                    cause = getattr(e, "__cause__", None) or e
+                    if hasattr(cause, "errors") and callable(getattr(cause, "errors")):
+                        fields = []
+                        for err in cause.errors():
+                            loc = ".".join(str(x) for x in err.get("loc", []))
+                            fields.append(f"'{loc}'")
+                        if fields:
+                            error_msg = f"Validation failed on fields: {', '.join(fields)}"
+                    elif "validation error" in error_msg.lower():
+                        lines = error_msg.split('\n')
+                        for i, line in enumerate(lines):
+                            if "validation error" in line.lower() and i + 1 < len(lines):
+                                field = lines[i+1].strip()
+                                error_msg = f"Validation failed on field '{field}'"
+                                break
+                except Exception:
+                    pass
+
+                print(f"  ❌ Parsing failed: {error_msg}. Flagging for review.")
+                parse_attempts.append({"model": model_name, "success": False, "error": error_msg})
                 return {"parse_attempts": parse_attempts}
         
         # Email date override logic
