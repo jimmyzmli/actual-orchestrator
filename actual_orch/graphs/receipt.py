@@ -13,7 +13,7 @@ from pdf2image import convert_from_path
 
 from actual_orch.clients.cache import get_ocr, set_ocr, get_parsed, set_parsed, get_classify, set_classify
 from actual_orch.nodes.pocketbase import skip_if_processed, save_pocketbase_node
-from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, tag_actual_transaction_node, save_actual_transaction_node, estimate_tokens
+from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, update_actual_transaction_node, save_actual_transaction_node, estimate_tokens
 import datetime
 
 class WorkflowStatus(str, Enum):
@@ -34,6 +34,7 @@ class ProposedTransaction(TypedDict, total=False):
     notes: str
     category: str
     amount: float
+    transfer_account: str
 
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF or PNG
@@ -43,6 +44,7 @@ class ReceiptState(TypedDict, total=False):
     parsed_data: Dict[str, Any]
     actual_tx_id: str
     actual_tx_id_transfer: str
+    update_transaction: ProposedTransaction # Agent proposed updates
     status: WorkflowStatus
     error: str
     email_date: str
@@ -53,7 +55,8 @@ class ReceiptState(TypedDict, total=False):
     flag_log_agent: bool       # True if agent logs should be printed
     flag_create_missing: bool  # True if we should auto-create a transaction on no-match
     classification: str   # The result of the LLM classification (e.g. RECEIPT, INVOICE)
-
+    override_classification: str # Explicit override for classification
+    
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
     description: str = Field(description="Description of the item")
@@ -184,10 +187,15 @@ def classify_input_node(state: ReceiptState):
         file_path = state["file_path"]
         prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
         
-        classification = get_classify(file_path, prefix=prefix)
-        if (not classification or not classification.strip()) and prefix != "receipt_":
-            classification = get_classify(file_path, prefix="receipt_")
-            
+        classification = state.get("override_classification")
+        
+        if classification:
+            print(f"Using override classification: [{classification}]")
+        else:
+            classification = get_classify(file_path, prefix=prefix)
+            if (not classification or not classification.strip()) and prefix != "receipt_":
+                classification = get_classify(file_path, prefix="receipt_")
+                
         if not classification or not classification.strip():
             llm = ChatOpenAI(
                 model="deepseek-v4-flash", 
@@ -256,7 +264,8 @@ def classify_input_node(state: ReceiptState):
             }
             set_classify(file_path, classification, meta, prefix=prefix)
         else:
-            print(f"Using cached classification data (Redis): [{classification.strip()}]")
+            if not state.get("override_classification"):
+                print(f"Using cached classification data (Redis): [{classification.strip()}]")
         
         if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
             print(f"  [Parse] Document classified as {classification}. Skipping completely.")
@@ -644,7 +653,7 @@ workflow.add_node("search_deterministic", search_deterministic_node)
 workflow.add_node("search_agent", search_agent_node)
 workflow.add_node("human_approval", human_approval_node)
 workflow.add_node("save_actual", save_actual_transaction_node)
-workflow.add_node("tag_actual", tag_actual_transaction_node)
+workflow.add_node("update_actual", update_actual_transaction_node)
 workflow.add_node("save_pocketbase", save_pocketbase_node)
 
 workflow.set_entry_point("skip_if_processed")
@@ -667,5 +676,5 @@ workflow.add_conditional_edges("search_agent", router_after_search_agent, {
 })
 workflow.add_conditional_edges("human_approval", router_after_human, {"save_actual": "save_actual", "save_pocketbase": "save_pocketbase", "skip": END})
 workflow.add_edge("save_actual", "save_pocketbase")
-workflow.add_edge("save_pocketbase", "tag_actual")
-workflow.add_edge("tag_actual", END)
+workflow.add_edge("save_pocketbase", "update_actual")
+workflow.add_edge("update_actual", END)

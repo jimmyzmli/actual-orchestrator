@@ -29,6 +29,10 @@ def estimate_tokens(text: str) -> int:
 
 class TransactionMatchResult(BaseModel):
     matched_id: Optional[str] = Field(description="The UUID of the best matching candidate transaction, if any. Leave null if no good match.")
+    updated_amount: Optional[float] = Field(default=None, description="If allowed_to_update is true and the receipt has new info (like tip), output the new total amount here. Otherwise null.")
+    updated_payee: Optional[str] = Field(default=None, description="If allowed_to_update is true and the receipt has a better payee, output it here. Otherwise null.")
+    updated_notes: Optional[str] = Field(default=None, description="If allowed_to_update is true and you want to append/update notes, output them here. Otherwise null.")
+    updated_transfer_account: Optional[str] = Field(default=None, description="If allowed_to_update is true and the receipt indicates it is a transfer to another account, output the exact transfer account name here. Otherwise null.")
 
 # ---------------------------------------------------------------------------
 # Shared query helper
@@ -76,7 +80,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     try:
         res = await session.call_tool("actual_query", {"args": [
             "run", "--table", "transactions",
-            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name,is_child,parent_id,transfer_id",
+            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name,is_child,parent_id,transfer_id,cleared,reconciled",
             "--filter", json.dumps(filter_obj),
             "--format", "json",
         ]})
@@ -98,6 +102,8 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                         "imported_payee": c.get("imported_payee"),
                         "notes": c.get("notes") or "",
                         "account.name": c.get("account.name"),
+                        "cleared": c.get("cleared"),
+                        "reconciled": c.get("reconciled"),
                         "children": []
                     }
                 parent_map[pid]["amount"] += c.get("amount", 0)
@@ -155,6 +161,8 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                                                 "imported_payee": tx.get("imported_payee", c.get("imported_payee")),
                                                 "notes": tx.get("notes") or c.get("notes", ""),
                                                 "account.name": acc,
+                                                "cleared": tx.get("cleared", c.get("cleared")),
+                                                "reconciled": tx.get("reconciled", c.get("reconciled"))
                                             }
                                             break
             except Exception as e:
@@ -307,7 +315,8 @@ async def search_agent_node(state: dict):
                 "payee": strip_emojis(c.get("payee.name") or c.get("imported_payee")),
                 "account": strip_emojis(c.get("account.name")),
                 "notes": (c.get("notes") or "")[:200],
-                "already_attached_receipts": previously_attached_receipts_map.get(c.get("id"), []) if "#receipt" in (c.get("notes") or "") else []
+                "already_attached_receipts": previously_attached_receipts_map.get(c.get("id"), []) if "#receipt" in (c.get("notes") or "") else [],
+                "allowed_to_update": not (c.get("cleared") or c.get("reconciled"))
             }
                 
             if c.get("is_child"):
@@ -509,6 +518,7 @@ Rules:
 - Payee names might differ but should be conceptually similar, but transfers will often have completely different payee names. Sometimes the notes might contain payee name too (often in a # tag)
 - Date should be within 1 day. However, often rent income and bill payments are shifted to the start of the next month.
 - Candidates have an 'already_attached_receipts' array. If it is not empty, it contains details (payee, amount, date) of the receipt(s) already attached to this candidate. Only select such a candidate if you are absolutely sure the current receipt is a different version or additional document for the exact same transaction.
+- Each candidate has an 'allowed_to_update' flag. If 'allowed_to_update' is true, you can match the transaction and update the payee, transfer_account, notes, or amount, but ONLY if you are absolutely sure it's the same transaction and the current receipt has new info (such as tip amount, or transfer account which often happens with self e-transfers). Use the updated_* fields in your JSON response for this. If 'allowed_to_update' is false, you MUST NOT provide any updated_* fields.
 
 Respond in JSON format with the 'matched_id' of the matching transaction, or null if no match exists."""
             
@@ -546,7 +556,9 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                     actual_amt = abs(matched.get("amount", 0))
                     min_allowed = receipt_cents * 0.90
                     max_allowed = receipt_cents * 1.30
-                    if not (min_allowed <= actual_amt <= max_allowed):
+                    if getattr(result, "updated_amount", None) is not None:
+                        print(f"  Agent updating amount to ${result.updated_amount:.2f} (original: ${actual_amt/100:.2f})")
+                    elif not (min_allowed <= actual_amt <= max_allowed):
                         print(f"❌ VALIDATION FAILED: Agent amount ${actual_amt/100:.2f} "
                               f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
                         final_id = "unknown_id"
@@ -589,7 +601,18 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         if matched_full and matched_full.get("transfer_id"):
             transfer_id = matched_full.get("transfer_id")
             
-        return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
+        update_transaction = {}
+        if final_id != "unknown_id" and result:
+            if getattr(result, "updated_amount", None) is not None:
+                update_transaction["amount"] = result.updated_amount
+            if getattr(result, "updated_payee", None) is not None:
+                update_transaction["payee"] = result.updated_payee
+            if getattr(result, "updated_notes", None) is not None:
+                update_transaction["notes"] = result.updated_notes
+            if getattr(result, "updated_transfer_account", None) is not None:
+                update_transaction["transfer_account"] = result.updated_transfer_account
+            
+        return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id, "update_transaction": update_transaction}
         
     except Exception as e:
         import traceback
@@ -810,8 +833,8 @@ async def save_actual_transaction_node(state: dict):
         return {"status": "error", "error": f"Auto-create failed: {str(e)}", "traceback": traceback.format_exc()}
     return {}
 
-async def tag_actual_transaction_node(state: dict):
-    """Append #receipt to the matched/created transaction's notes in Actual Budget."""
+async def update_actual_transaction_node(state: dict):
+    """Update matched/created transaction with #receipt and any agent updates in Actual Budget."""
     tx_id = state.get("actual_tx_id")
     if not tx_id or tx_id == "unknown_id":
         return {}
@@ -827,7 +850,7 @@ async def tag_actual_transaction_node(state: dict):
         try:
             res = await session.call_tool("actual_query", {"args": [
                 "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), 
-                "--select", "id,date,amount,payee,imported_payee,notes,category,account,cleared,is_child,parent_id,sort_order",
+                "--select", "id,date,amount,payee,imported_payee,notes,category,account,cleared,reconciled,is_child,parent_id,sort_order",
                 "--format", "json"
             ]})
             if res.content and len(res.content) > 0:
@@ -841,15 +864,16 @@ async def tag_actual_transaction_node(state: dict):
         except Exception as e:
             print(f"Failed to fetch transaction details: {e}")
         
-        # Append #receipt to existing notes
-        if "#receipt" not in existing_notes:
-            if existing_notes.strip():
-                new_notes = f"{existing_notes.strip()} #receipt"
-            else:
-                new_notes = "#receipt"
+        update_transaction = state.get("update_transaction") or {}
+        
+        # Determine base notes and append #receipt
+        base_notes = update_transaction.get("notes", existing_notes)
+        if "#receipt" not in base_notes:
+            new_notes = f"{base_notes.strip()} #receipt".strip()
         else:
-            print(f"Transaction {tx_id} already has #receipt tag.")
-            return {}
+            new_notes = base_notes
+            
+        update_transaction["notes"] = new_notes
 
         # Build update payload with only writable fields to prevent the update API
         # from choking on relational/read-only fields returned by actual_query
@@ -858,10 +882,52 @@ async def tag_actual_transaction_node(state: dict):
         # be wiped out if we only sent {"notes": ...}.
         WRITABLE_FIELDS = {"date", "amount", "payee", "payee_name", "imported_payee",
                            "notes", "category", "account", "cleared", "imported_id", "sort_order"}
-        update_payload = {"notes": new_notes}
+        update_payload = {}
         if tx_data:
             update_payload = {k: v for k, v in tx_data.items() if k in WRITABLE_FIELDS}
-            update_payload["notes"] = new_notes
+            
+        update_payload["notes"] = update_transaction["notes"]
+
+        if tx_data and not tx_data.get("cleared") and not tx_data.get("reconciled"):
+            if "amount" in update_transaction:
+                update_amount = update_transaction["amount"]
+                update_cents = int(round(-update_amount * 100))
+                update_payload["amount"] = update_cents
+                print(f"Agent requested amount update to: {update_cents}")
+            
+            if "payee" in update_transaction:
+                update_payload["payee_name"] = update_transaction["payee"]
+                print(f"Agent requested payee update to: {update_transaction['payee']}")
+                
+            if "transfer_account" in update_transaction:
+                transfer_acc_name = update_transaction["transfer_account"]
+                try:
+                    acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                    payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
+                    all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
+                    all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
+                    
+                    def clean_acct_name(s):
+                        return re.sub(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF\u2B00-\u2BFF\uFE00-\uFE0F]+', '', s).strip()
+                        
+                    clean_transfer = clean_acct_name(transfer_acc_name)
+                    transfer_payee_id = None
+                    for acc in all_accounts:
+                        if clean_acct_name(acc.get("name", "")) == clean_transfer:
+                            acc_id = acc.get("id")
+                            for p in all_payees:
+                                if p.get("transfer_acct") == acc_id:
+                                    transfer_payee_id = p.get("id")
+                                    break
+                            break
+                            
+                    if transfer_payee_id:
+                        update_payload["payee"] = transfer_payee_id
+                        if "payee_name" in update_payload:
+                            del update_payload["payee_name"]
+                        print(f"Agent requested transfer update to: {transfer_acc_name} ({transfer_payee_id})")
+                except Exception as e:
+                    print(f"⚠️ Failed to resolve transfer account {transfer_acc_name}: {e}")
 
         mcp_tools = await load_mcp_tools(session)
         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
