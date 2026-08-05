@@ -15,7 +15,7 @@ from actual_orch.clients.mcp import ActualMCPClient
 def strip_emojis(s: str) -> str:
     if not s:
         return "" if s is None else str(s)
-    pattern = re.compile(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF]+')
+    pattern = re.compile(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF\u2B00-\u2BFF\uFE00-\uFE0F]+')
     return pattern.sub('', s).strip()
 
 # For estimate_tokens, just use a simple approximation if tiktoken is not present
@@ -44,11 +44,32 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     except ValueError:
         return []
 
+    # Default ±1 day range
     start_date = (rd - timedelta(days=1)).strftime("%Y-%m-%d")
     end_date   = (rd + timedelta(days=1)).strftime("%Y-%m-%d")
 
+    # Additional requested dates
+    first_day_this_month = rd.replace(day=1)
+    last_day_last_month = (first_day_this_month - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    if rd.month == 12:
+        first_day_next_month = rd.replace(year=rd.year+1, month=1, day=1)
+    else:
+        first_day_next_month = rd.replace(month=rd.month+1, day=1)
+    first_day_next_month_str = first_day_next_month.strftime("%Y-%m-%d")
+
+    target_dates = list(set([
+        rd.strftime("%Y-%m-%d"),
+        start_date,
+        end_date,
+        last_day_last_month,
+        first_day_next_month_str
+    ]))
+
+    raw_candidates = []
+    
     filter_obj = {
-        "date": {"$gte": start_date, "$lte": end_date},
+        "$or": [{"date": d} for d in target_dates],
         "account.offbudget": False,
     }
 
@@ -61,7 +82,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
         ]})
         raw = res.content[0].text if res.content else "[]"
         raw_candidates = json.loads(raw) if isinstance(raw, str) else []
-        
+
         # Reconstruct parents from children since actual_query filters parents out
         parent_map = {}
         candidates = []
@@ -228,7 +249,8 @@ async def search_deterministic_node(state: dict):
         return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
         
     except Exception as e:
-        return {"status": "error", "error": f"Deterministic search failed: {str(e)}"}
+        import traceback
+        return {"status": "error", "error": f"Deterministic search failed: {str(e)}", "traceback": traceback.format_exc()}
 
 
 async def search_agent_node(state: dict):
@@ -274,6 +296,7 @@ async def search_agent_node(state: dict):
                 print(f"  ⚠️ Warning: Could not import or use pocketbase client: {e}")
         
         narrowed_candidates = []
+        entries_by_id = {}
         for c in clean_candidates:
             amount_cents = c.get("amount", 0)
             amount_dollars = amount_cents / 100.0 if amount_cents else 0
@@ -284,16 +307,105 @@ async def search_agent_node(state: dict):
                 "payee": strip_emojis(c.get("payee.name") or c.get("imported_payee")),
                 "account": strip_emojis(c.get("account.name")),
                 "notes": (c.get("notes") or "")[:200],
+                "already_attached_receipts": previously_attached_receipts_map.get(c.get("id"), []) if "#receipt" in (c.get("notes") or "") else []
             }
-            if "#receipt" in (c.get("notes") or ""):
-                entry["already_has_receipt_attached"] = True
-                if c.get("id") in previously_attached_receipts_map:
-                    entry["previously_attached_receipts"] = previously_attached_receipts_map[c.get("id")]
                 
             if c.get("is_child"):
                 entry["is_child"] = True
                 entry["parent_id"] = c.get("parent_id")
-            narrowed_candidates.append(entry)
+                
+            if c.get("transfer_id"):
+                entry["transfer_id"] = c.get("transfer_id")
+                
+            entries_by_id[entry["id"]] = entry
+            
+        structured_candidates = []
+        processed_ids = set()
+        
+        for c in clean_candidates:
+            cid = c.get("id")
+            if cid in processed_ids:
+                continue
+                
+            entry = entries_by_id[cid]
+            
+            # 1. Handle Transfers
+            if entry.get("transfer_id"):
+                tid = entry["transfer_id"]
+                transfer_txs = [entries_by_id[k] for k, v in entries_by_id.items() if v.get("transfer_id") == tid]
+                if len(transfer_txs) > 1:
+                    structured = {
+                        "transfer_id": tid,
+                        "type": "transfer",
+                        "date": transfer_txs[0]["date"],
+                        "transactions": []
+                    }
+                    for tx in transfer_txs:
+                        tx_copy = dict(tx)
+                        tx_copy.pop("transfer_id", None)
+                        tx_copy.pop("is_child", None)
+                        tx_copy.pop("parent_id", None)
+                        structured["transactions"].append(tx_copy)
+                        processed_ids.add(tx["id"])
+                    structured_candidates.append(structured)
+                    continue
+                    
+            # 2. Handle Splits (Parent)
+            children = [entries_by_id[k] for k, v in entries_by_id.items() if v.get("is_child") and v.get("parent_id") == cid]
+            if children:
+                structured = {
+                    "id": cid,
+                    "type": "split",
+                    "date": entry["date"],
+                    "amount": entry["amount"],
+                    "payee": entry["payee"],
+                    "account": entry["account"],
+                    "notes": entry["notes"],
+                    "already_attached_receipts": entry["already_attached_receipts"],
+                    "subtransactions": []
+                }
+                for child in children:
+                    child_copy = dict(child)
+                    child_copy.pop("is_child", None)
+                    child_copy.pop("parent_id", None)
+                    structured["subtransactions"].append(child_copy)
+                    processed_ids.add(child["id"])
+                structured_candidates.append(structured)
+                processed_ids.add(cid)
+                continue
+                
+            # 3. Handle standalone children (e.g. 0-amount parent)
+            if entry.get("is_child"):
+                pid = entry["parent_id"]
+                siblings = [entries_by_id[k] for k, v in entries_by_id.items() if v.get("is_child") and v.get("parent_id") == pid]
+                if len(siblings) > 1:
+                    structured = {
+                        "id": pid,
+                        "type": "split",
+                        "date": entry["date"],
+                        "amount": 0.0,
+                        "payee": entry["payee"],
+                        "account": entry["account"],
+                        "notes": entry["notes"],
+                        "already_attached_receipts": [],
+                        "subtransactions": []
+                    }
+                    for sib in siblings:
+                        sib_copy = dict(sib)
+                        sib_copy.pop("is_child", None)
+                        sib_copy.pop("parent_id", None)
+                        structured["subtransactions"].append(sib_copy)
+                        processed_ids.add(sib["id"])
+                    structured_candidates.append(structured)
+                    continue
+
+            # 4. Standalone normal transaction
+            entry_copy = dict(entry)
+            entry_copy.pop("is_child", None)
+            entry_copy.pop("parent_id", None)
+            entry_copy.pop("transfer_id", None)
+            structured_candidates.append(entry_copy)
+            processed_ids.add(cid)
             
         def get_sort_key(c):
             try:
@@ -303,17 +415,26 @@ async def search_agent_node(state: dict):
             except Exception:
                 dd = 999
             
-            c_amt = abs(c.get("amount", 0))
-            a_diff = abs(c_amt - receipt_cents)
-            return (dd, a_diff)
+            amounts_to_check = []
+            if "amount" in c:
+                amounts_to_check.append(abs(c["amount"]))
+            if c.get("type") == "split":
+                for sub in c.get("subtransactions", []):
+                    amounts_to_check.append(abs(sub["amount"]))
+            if c.get("type") == "transfer":
+                for tx in c.get("transactions", []):
+                    amounts_to_check.append(abs(tx["amount"]))
+                    
+            min_a_diff = min([abs((amt * 100) - receipt_cents) for amt in amounts_to_check]) if amounts_to_check else 9999999
+            return (dd, min_a_diff)
                 
-        narrowed_candidates.sort(key=get_sort_key)
-        narrowed_candidates = narrowed_candidates[:50]
+        structured_candidates.sort(key=get_sort_key)
+        structured_candidates = structured_candidates[:50]
         
         parse_attempts = state.get("parse_attempts", [])
         already_retried = any(a.get("model") == "search_agent" for a in parse_attempts)
         
-        if not narrowed_candidates:
+        if not structured_candidates:
             print("  ❌ No candidates available for agent to search. Failing immediately.")
             if not already_retried:
                 print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
@@ -330,21 +451,64 @@ async def search_agent_node(state: dict):
         
         print(f"  🔄 Retrying match with model ({model_name})...")
         
+        # Prepare receipt details for the prompt
+        parsed_prompt = dict(parsed)
+        parsed_prompt.pop("proposed_transactions", None)
+        
+        account_key = parsed_prompt.pop("account_key", None)
+        if account_key:
+            try:
+                mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
+                if os.path.exists(mapping_path):
+                    with open(mapping_path, "r") as f:
+                        mapping = json.load(f)
+                    acc_id = mapping.get(account_key)
+                    if acc_id:
+                        res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                        if res.content:
+                            accounts = json.loads(res.content[0].text)
+                            acc_match = next((a for a in accounts if a.get("id") == acc_id), None)
+                            if acc_match:
+                                parsed_prompt["account"] = strip_emojis(acc_match.get("name"))
+                            else:
+                                parsed_prompt["account"] = strip_emojis(account_key)
+                    else:
+                        parsed_prompt["account"] = strip_emojis(account_key)
+                else:
+                    parsed_prompt["account"] = strip_emojis(account_key)
+            except Exception as e:
+                print(f"  ⚠️ Failed to translate account_key: {e}")
+                parsed_prompt["account"] = strip_emojis(account_key)
+
+        if state.get("source") == "email" and state.get("email_context"):
+            parsed_prompt["email_context"] = state.get("email_context")
+            
+        try:
+            config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config_data = json.load(f)
+                if config_data.get("AGENT_USER_CONTEXT"):
+                    parsed_prompt["AGENT_USER_CONTEXT"] = config_data["AGENT_USER_CONTEXT"]
+        except Exception as e:
+            print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
+
         prompt_text = f"""You are a financial matching assistant.
 
 Receipt details:
-{json.dumps(parsed, indent=2)}
+{json.dumps(parsed_prompt, indent=2)}
 
 Candidate transactions from the bank:
-{json.dumps(narrowed_candidates, indent=2)}
+{json.dumps(structured_candidates, indent=2)}
 
 Task: Identify the transaction that matches this receipt. You must respond in JSON.
 Rules:
-- Amounts must be exactly equal OR very close (e.g., tip included, currency difference).
-- Split transaction children (is_child=true) are valid candidates. Match on the individual child amount, not the parent total.
-- Payee names might differ but should be conceptually similar.
-- Date must be within 1 day.
-- Candidates with 'already_has_receipt_attached' = true already have a receipt. If 'previously_attached_receipts' is provided, it contains the details (payee, amount, date) of the receipt(s) already attached to this candidate. Only select this candidate if you are absolutely sure the current receipt is a different version of the receipt for the exact same transaction.
+- Amounts may differ due to tip, currency difference, etc. Make sure there is a good reason for the difference.
+- Split transactions (type='split') contain 'subtransactions'. Match on the individual subtransaction 'id' (not the parent 'id') if the receipt corresponds to a specific portion of the split.
+- Transfers (type='transfer') represent money moving between accounts and contain a 'transactions' array with both sides of the transfer. Match on the specific transaction 'id' within the array that corresponds to the account the receipt is for.
+- Payee names might differ but should be conceptually similar, but transfers will often have completely different payee names. Sometimes the notes might contain payee name too (often in a # tag)
+- Date should be within 1 day. However, often rent income and bill payments are shifted to the start of the next month.
+- Candidates have an 'already_attached_receipts' array. If it is not empty, it contains details (payee, amount, date) of the receipt(s) already attached to this candidate. Only select such a candidate if you are absolutely sure the current receipt is a different version or additional document for the exact same transaction.
 
 Respond in JSON format with the 'matched_id' of the matching transaction, or null if no match exists."""
             
@@ -428,7 +592,8 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
         
     except Exception as e:
-        return {"status": "error", "error": f"Agent search failed: {str(e)}"}
+        import traceback
+        return {"status": "error", "error": f"Agent search failed: {str(e)}", "traceback": traceback.format_exc()}
 
 async def save_actual_transaction_node(state: dict):
     """
@@ -495,6 +660,33 @@ async def save_actual_transaction_node(state: dict):
                         cats = loaded_cats
         except Exception:
             pass
+            
+        # Fetch accounts and payees for transfer resolution
+        try:
+            acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+            payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
+            all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
+            all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
+        except Exception as e:
+            print(f"  ⚠️ Failed to fetch accounts or payees for transfer resolution: {e}")
+            all_accounts = []
+            all_payees = []
+
+        import re
+        def clean_acct(s):
+            return re.sub(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF\u2B00-\u2BFF\uFE00-\uFE0F]+', '', s).strip()
+
+        def get_transfer_payee(transfer_name):
+            if not transfer_name:
+                return None
+            clean_transfer = clean_acct(transfer_name)
+            for acc in all_accounts:
+                if clean_acct(acc.get("name", "")) == clean_transfer:
+                    acc_id = acc.get("id")
+                    for p in all_payees:
+                        if p.get("transfer_acct") == acc_id:
+                            return p.get("id")
+            return None
         
         if len(proposed_txs) > 1:
             print("  ➕ Detected multiple proposed transactions. Creating split transaction...")
@@ -513,10 +705,18 @@ async def save_actual_transaction_node(state: dict):
                     "amount": sub_cents,
                     "notes": pt.get("notes", "")
                 }
-                pt_cat = pt.get("category")
-                if pt_cat:
-                    cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
-                    sub["category"] = cat_match.get("id") if cat_match else pt_cat
+                
+                transfer_account = pt.get("transfer_account")
+                transfer_payee_id = get_transfer_payee(transfer_account)
+                
+                if transfer_payee_id:
+                    sub["payee"] = transfer_payee_id
+                else:
+                    pt_cat = pt.get("category")
+                    if pt_cat:
+                        cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
+                        sub["category"] = cat_match.get("id") if cat_match else pt_cat
+                        
                 new_tx["subtransactions"].append(sub)
         else:
             new_tx = {
@@ -526,13 +726,22 @@ async def save_actual_transaction_node(state: dict):
                 "notes": tx_notes,
                 "cleared": False
             }
-            # Single transaction — get category from the first proposed transaction
+            # Single transaction — check for transfer or category
             if proposed_txs:
-                pt_cat = proposed_txs[0].get("category")
-                if pt_cat:
-                    cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
-                    if cat_match:
-                        new_tx["category"] = cat_match.get("id")
+                pt = proposed_txs[0]
+                transfer_account = pt.get("transfer_account")
+                transfer_payee_id = get_transfer_payee(transfer_account)
+                
+                if transfer_payee_id:
+                    # It's a transfer, so override payee_name with payee ID
+                    del new_tx["payee_name"]
+                    new_tx["payee"] = transfer_payee_id
+                else:
+                    pt_cat = pt.get("category")
+                    if pt_cat:
+                        cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
+                        if cat_match:
+                            new_tx["category"] = cat_match.get("id")
         
         # Save using Actual MCP
         mcp_tools = await load_mcp_tools(session)
@@ -540,6 +749,7 @@ async def save_actual_transaction_node(state: dict):
         if tx_tool:
             await tx_tool.ainvoke({"args": [
                 "add", "--account", account_id,
+                "--run-transfers",
                 "--data", json.dumps([new_tx])
             ]})
             print(f"  ✅ Created transaction for {payee} on {date} for {amount}")
@@ -552,7 +762,7 @@ async def save_actual_transaction_node(state: dict):
             q_res = await session.call_tool("actual_query", {"args": [
                 "run", "--table", "transactions",
                 "--filter", json.dumps(filter_obj),
-                "--select", "id,amount,payee.name,notes,is_child,parent_id",
+                "--select", "id,amount,payee.name,notes,is_child,parent_id,transfer_id",
                 "--format", "json"
             ]})
             if q_res.content and len(q_res.content) > 0:
@@ -562,7 +772,7 @@ async def save_actual_transaction_node(state: dict):
                     for tx in txs:
                         if not tx.get("is_child") and tx.get("amount") == expense_cents and tx.get("notes") and "#receipt" in tx["notes"]:
                             print(f"  ✅ Retrieved new transaction ID: {tx['id']}")
-                            return {"actual_tx_id": tx["id"], "status": "continue"}
+                            return {"actual_tx_id": tx["id"], "actual_tx_id_transfer": tx.get("transfer_id"), "status": "continue"}
                             
                     # 2. Try to find a child transaction match (for split tx)
                     for tx in txs:
@@ -571,20 +781,33 @@ async def save_actual_transaction_node(state: dict):
                             sub_amounts = [int(round(-pt.get("amount", 0.0) * 100)) for pt in proposed_txs]
                             if (payee and tx.get("payee.name") == payee) or (tx.get("amount") in sub_amounts):
                                 print(f"  ✅ Retrieved new split transaction parent ID: {tx['parent_id']}")
-                                return {"actual_tx_id": tx["parent_id"], "status": "continue"}
+                                # A split sub-transaction might be a transfer, but Actual maps transfer_id on the child. We need to query parent or just pass child transfer_id if present.
+                                # Since Pocketbase maps to parent, we'll try to find any transfer_id in siblings.
+                                transfer_id = None
+                                for sibling in txs:
+                                    if sibling.get("parent_id") == tx["parent_id"] and sibling.get("transfer_id"):
+                                        transfer_id = sibling.get("transfer_id")
+                                        break
+                                return {"actual_tx_id": tx["parent_id"], "actual_tx_id_transfer": transfer_id, "status": "continue"}
                                 
                     # 3. Fallback to first returned transaction
                     fallback_tx = txs[0]
                     fallback_id = fallback_tx.get("parent_id") if fallback_tx.get("is_child") else fallback_tx["id"]
+                    transfer_id = fallback_tx.get("transfer_id")
+                    if fallback_tx.get("is_child"):
+                        for sibling in txs:
+                            if sibling.get("parent_id") == fallback_id and sibling.get("transfer_id"):
+                                transfer_id = sibling.get("transfer_id")
+                                break
                     print(f"  ✅ Retrieved new transaction ID (fallback): {fallback_id}")
-                    return {"actual_tx_id": fallback_id, "status": "continue"}
+                    return {"actual_tx_id": fallback_id, "actual_tx_id_transfer": transfer_id, "status": "continue"}
             
             print("  ⚠️ Created transaction but couldn't query its ID. PocketBase won't have the ID.")
             return {"actual_tx_id": "unknown_id", "status": "continue"}
             
     except Exception as e:
-        print(f"  ❌ Auto-create failed: {e}")
-        return {"status": "error", "error": f"Auto-create failed: {str(e)}"}
+        import traceback
+        return {"status": "error", "error": f"Auto-create failed: {str(e)}", "traceback": traceback.format_exc()}
     return {}
 
 async def tag_actual_transaction_node(state: dict):

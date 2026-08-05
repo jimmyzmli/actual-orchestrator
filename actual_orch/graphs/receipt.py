@@ -62,7 +62,8 @@ class ReceiptItem(BaseModel):
 class ParsedProposedTransaction(BaseModel):
     amount: float = Field(description="Amount for this transaction line. Positive = expense, negative = refund or points redemption.")
     notes: str = Field(description="Concise description of this line (e.g. 'Groceries - milk, eggs, bread', 'Points redemption')")
-    category_id: str = Field(description="The most likely category ID from the provided list")
+    category: Optional[str] = Field(default=None, description="The most likely category name from the provided list, or null if it's a transfer")
+    transfer_account: Optional[str] = Field(default=None, description="The name of the account to transfer to, if this transaction is a transfer to another account")
 
 class ParsedReceipt(BaseModel):
     date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
@@ -145,12 +146,23 @@ def extract_ocr_node(state: ReceiptState):
             HumanMessage(content=content)
         ]
         
+        if state.get("flag_log_agent"):
+            print(f"\n--- AGENT PROMPT (gemini-3.1-flash-lite) ---")
+            print("Extract all the text from this receipt accurately, line by line. Output ONLY the raw text without any markdown formatting or extra commentary.")
+            print(f"[{len(image_paths)} images attached]")
+            print("---------------------------------------\n")
+        
         result = llm.invoke(messages)
         ocr_text = result.content
         if isinstance(ocr_text, list):
             ocr_text = "".join([block.get("text", "") if isinstance(block, dict) else str(block) for block in ocr_text])
         elif not isinstance(ocr_text, str):
             ocr_text = str(ocr_text)
+            
+        if state.get("flag_log_agent"):
+            print(f"\n--- AGENT RESPONSE (gemini-3.1-flash-lite) ---")
+            print(ocr_text)
+            print("---------------------------------------\n")
             
         meta = {
             "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -173,10 +185,10 @@ def classify_input_node(state: ReceiptState):
         prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
         
         classification = get_classify(file_path, prefix=prefix)
-        if classification is None and prefix != "receipt_":
+        if (not classification or not classification.strip()) and prefix != "receipt_":
             classification = get_classify(file_path, prefix="receipt_")
             
-        if classification is None:
+        if not classification or not classification.strip():
             llm = ChatOpenAI(
                 model="deepseek-v4-flash", 
                 api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
@@ -198,6 +210,15 @@ def classify_input_node(state: ReceiptState):
             )
             
             client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
+            try:
+                config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        config_data = json.load(f)
+                    if config_data.get("AGENT_USER_CONTEXT"):
+                        client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
+            except Exception as e:
+                print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
             if state.get("source") == "email":
                 email_ctx = state.get("email_context", "")
                 if state.get('email_date'):
@@ -215,8 +236,18 @@ def classify_input_node(state: ReceiptState):
             prompt_val = classify_prompt.format_prompt(ocr_text=state["ocr_text"])
             print(f"  [Token Est] Classify prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
             
+            if state.get("flag_log_agent"):
+                print(f"\n--- AGENT PROMPT (deepseek-v4-flash) ---")
+                print(prompt_val.to_string())
+                print("---------------------------------------\n")
+            
             classify_result = classify_chain.invoke({"ocr_text": state["ocr_text"]})
             classification = classify_result.content.strip().upper()
+            
+            if state.get("flag_log_agent"):
+                print(f"\n--- AGENT RESPONSE (deepseek-v4-flash) ---")
+                print(classification)
+                print("---------------------------------------\n")
             
             meta = {
                 "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -225,7 +256,7 @@ def classify_input_node(state: ReceiptState):
             }
             set_classify(file_path, classification, meta, prefix=prefix)
         else:
-            print(f"Using cached classification data (Redis): {classification}")
+            print(f"Using cached classification data (Redis): [{classification.strip()}]")
         
         if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
             print(f"  [Parse] Document classified as {classification}. Skipping completely.")
@@ -305,11 +336,11 @@ async def parse_receipt_node(state: ReceiptState):
                 "- 'date': YYYY-MM-DD format. If missing, use the current date or guess from context.\n"
                 "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
                 "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
-                "- 'notes': A concise ~50 character summary of the purchase (e.g. 'Groceries - milk, eggs, bread'). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal', for e-transfers use 'e-Transfer'.\n"
+                "- 'notes': A concise ~50 character summary of the purchase (e.g. 'Groceries - milk, eggs, bread'). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'. For e-transfers, include the reference number if available (e.g., 'e-Transfer Ref: CA4ABCD123').\n"
                 "- 'items': Array of line items with 'description' and 'amount'. Include taxes (HST/GST/PST/VAT) as separate items. Points/rewards redemptions should be negative amounts. Items can be empty for ATM/transfers.\n"
                 "  - 'description': casual, human-readable — include useful info (brand, type) but avoid weird characters or abbreviations.\n\n"
                 "PROPOSED TRANSACTIONS (most important):\n"
-                "'proposed_transactions' is the primary output. Each entry has: 'amount' (number), 'notes' (concise description), 'category_id' (from the category list).\n"
+                "'proposed_transactions' is the primary output. Each entry has: 'amount' (number), 'notes' (concise description), and EITHER 'category' (from the category list) OR 'transfer_account' (from the account list) if it is a transfer.\n"
                 "- Most receipts have ONE proposed transaction with the receipt total as the amount.\n"
                 "- If the receipt includes a points redemption or refund (negative amount on the receipt), create a SEPARATE proposed transaction for it with a negative amount and an Income category.\n"
                 "- The sum of all proposed_transaction amounts must equal the receipt total.\n"
@@ -317,6 +348,15 @@ async def parse_receipt_node(state: ReceiptState):
             )
 
             client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
+            try:
+                config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))
+                if os.path.exists(config_path):
+                    with open(config_path, "r") as f:
+                        config_data = json.load(f)
+                    if config_data.get("AGENT_USER_CONTEXT"):
+                        client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
+            except Exception as e:
+                print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
             if source_type == "email":
                 email_ctx = state.get("email_context", "")
                 if state.get('email_date'):
@@ -345,6 +385,13 @@ async def parse_receipt_node(state: ReceiptState):
                             if valid_keys:
                                 keys_json = json.dumps(valid_keys).replace("{", "{{").replace("}", "}}")
                                 system_prompt += f"\n\nACCOUNT SELECTION:\nYou must also pick the MOST LIKELY account key from this list of valid on-budget account keys: {keys_json}\nValid account keys generally fall into two categories:\n1. The last 4 digits of a credit card (e.g. 1234, 5234).\n2. Different account names or types (e.g. WS-CHEQUING, DEFAULT-CC).\nIf you see the last 4 digits of a card on the receipt that matches one of the keys, use that key for 'account_key'. If you see the name of an institution or account type that strongly matches, use that key. If you are unsure, output the key 'DEFAULT-CC' if it exists in the list, or just pick the most likely one."
+                            
+                            import re
+                            def clean_acct(s):
+                                return re.sub(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF\u2B00-\u2BFF\uFE00-\uFE0F]+', '', s).strip()
+                            all_account_names = [clean_acct(acc.get("name")) for acc in accounts if acc.get("name")]
+                            all_accounts_json = json.dumps(all_account_names).replace("{", "{{").replace("}", "}}")
+                            system_prompt += f"\n\nTRANSFER ACCOUNTS:\nIf a proposed transaction is actually a transfer of money to another account (e.g., an e-transfer to yourself is a transfer to another chequing account, an Uber redemption is a transfer to the Credits account), omit the 'category' field and instead provide 'transfer_account' matching EXACTLY one of these account names: {all_accounts_json}"
                         except Exception as json_e:
                             print(f"  ⚠️ Failed to parse accounts JSON: {json_e}")
                     
@@ -353,12 +400,12 @@ async def parse_receipt_node(state: ReceiptState):
                         with open(categories_path, "r") as f:
                             categories = json.load(f)
                         if isinstance(categories, list):
-                            expense_categories = [{"id": c.get("id"), "name": c.get("name")} for c in categories if isinstance(c, dict) and not c.get("hidden") and not c.get("is_income") and c.get("id")]
-                            income_categories = [{"id": c.get("id"), "name": c.get("name")} for c in categories if isinstance(c, dict) and not c.get("hidden") and c.get("is_income") and c.get("id")]
+                            expense_categories = [c.get("name") for c in categories if isinstance(c, dict) and not c.get("hidden") and not c.get("is_income") and c.get("name")]
+                            income_categories = [c.get("name") for c in categories if isinstance(c, dict) and not c.get("hidden") and c.get("is_income") and c.get("name")]
                             if expense_categories:
                                 expense_json = json.dumps(expense_categories).replace("{", "{{").replace("}", "}}")
                                 income_json = json.dumps(income_categories).replace("{", "{{").replace("}", "}}") if income_categories else "[]"
-                                system_prompt += f"\n\nCATEGORY SELECTION:\nEach proposed_transaction must have a 'category_id'. Pick from these expense categories: {expense_json}\nFor refunds or points redemptions (negative amounts), use one of these income categories instead: {income_json}\nIf unsure, pick the most generic expense category."
+                                system_prompt += f"\n\nCATEGORY SELECTION:\nEach proposed_transaction must have a 'category' (unless it's a transfer). Pick from these expense categories: {expense_json}\nFor refunds or points redemptions (negative amounts), use one of these income categories instead: {income_json}\nIf unsure, pick the most generic expense category."
                 except Exception as e:
                     print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
 
@@ -373,12 +420,22 @@ async def parse_receipt_node(state: ReceiptState):
             
             prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"])
             print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+            
+            if state.get("flag_log_agent"):
+                print(f"\n--- AGENT PROMPT ({model_name}) ---")
+                print(prompt_val.to_string())
+                print("---------------------------------------\n")
 
             try:
                 structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
                 chain = prompt | structured_llm
                 result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
                 parsed_dict = result.dict()
+                
+                if state.get("flag_log_agent"):
+                    print(f"\n--- AGENT RESPONSE ({model_name}) ---")
+                    print(json.dumps(parsed_dict, indent=2))
+                    print("---------------------------------------\n")
             except Exception as e:
                 print(f"  ❌ Parsing failed: {e}. Flagging for review.")
                 parse_attempts.append({"model": model_name, "success": False, "error": str(e)})
@@ -412,9 +469,11 @@ async def parse_receipt_node(state: ReceiptState):
             parsed_dict["proposed_transactions"] = parsed_pts
         
         for i, pt in enumerate(parsed_pts):
-            missing = [f for f in ("amount", "notes", "category_id") if not pt.get(f) and pt.get(f) != 0]
+            missing = [f for f in ("amount", "notes") if not pt.get(f) and pt.get(f) != 0]
             if missing:
                 print(f"  ⚠️ proposed_transaction[{i}] missing fields: {missing} — {pt}")
+            if not pt.get("category") and not pt.get("transfer_account"):
+                print(f"  ⚠️ proposed_transaction[{i}] missing both category and transfer_account — {pt}")
         
         # Calculate total from sum of proposed transaction amounts (in receipt currency)
         receipt_total = sum(pt.get("amount", 0.0) for pt in parsed_pts)
@@ -492,18 +551,6 @@ async def parse_receipt_node(state: ReceiptState):
             except Exception as e:
                 print(f"  ⚠️ Failed to resolve account name: {e}")
                 
-        # Resolve category_ids -> category names
-        cats = []
-        try:
-            categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
-            if os.path.exists(categories_path):
-                with open(categories_path, "r") as f:
-                    loaded_cats = json.load(f)
-                    if isinstance(loaded_cats, list):
-                        cats = loaded_cats
-        except Exception as e:
-            print(f"  ⚠️ Failed to load categories for resolving names: {e}")
-            
         for pt in parsed_pts:
             p = {
                 "date": parsed_dict.get("date", ""),
@@ -514,10 +561,14 @@ async def parse_receipt_node(state: ReceiptState):
             if account_name:
                 p["account"] = account_name
                 
-            cat_id = pt.get("category_id")
-            if cat_id:
-                cat_match = next((c for c in cats if c.get("id") == cat_id), None)
-                p["category"] = cat_match.get("name") if cat_match else cat_id
+            cat = pt.get("category")
+            if cat:
+                p["category"] = cat
+                
+            transfer = pt.get("transfer_account")
+            if transfer:
+                p["transfer_account"] = transfer
+                
             proposed_list.append(p)
             
         return {"parsed_data": parsed_dict, "parse_attempts": parse_attempts, "proposed_transactions": proposed_list}
