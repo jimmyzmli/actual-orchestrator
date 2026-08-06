@@ -99,7 +99,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     try:
         res = await session.call_tool("actual_query", {"args": [
             "run", "--table", "transactions",
-            "--select", "id,date,amount,payee.name,imported_payee,notes,account.name,is_child,parent_id,transfer_id,cleared,reconciled",
+            "--select", "id,date,amount,payee.name,imported_payee,notes,account,account.name,is_child,parent_id,transfer_id,cleared,reconciled",
             "--filter", json.dumps(filter_obj),
             "--format", "json",
         ]})
@@ -120,6 +120,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                         "payee.name": c.get("payee.name"),
                         "imported_payee": c.get("imported_payee"),
                         "notes": c.get("notes") or "",
+                        "account": c.get("account"),
                         "account.name": c.get("account.name"),
                         "cleared": c.get("cleared"),
                         "reconciled": c.get("reconciled"),
@@ -179,6 +180,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                                                 "payee.name": tx.get("payee", c.get("payee.name")),
                                                 "imported_payee": tx.get("imported_payee", c.get("imported_payee")),
                                                 "notes": tx.get("notes") or c.get("notes", ""),
+                                                "account": tx.get("account", c.get("account")),
                                                 "account.name": acc,
                                                 "cleared": tx.get("cleared", c.get("cleared")),
                                                 "reconciled": tx.get("reconciled", c.get("reconciled"))
@@ -214,6 +216,26 @@ async def search_deterministic_node(state: dict):
         amount = parsed["total"]
         payee = parsed["payee"]
         receipt_cents = abs(int(amount * 100))
+        receipt_cents_for_actual = int(round(-amount * 100))
+        
+        # Resolve account ID
+        account_key = parsed.get("account_key")
+        receipt_account_id = None
+        if account_key:
+            mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
+            if os.path.exists(mapping_path):
+                try:
+                    with open(mapping_path, "r") as f:
+                        mapping = json.load(f)
+                    receipt_account_id = mapping.get(account_key)
+                except Exception:
+                    pass
+                    
+        # Extract transfer account
+        proposed_txs = state.get("proposed_transactions") or []
+        receipt_transfer_account = None
+        if len(proposed_txs) == 1:
+            receipt_transfer_account = proposed_txs[0].get("transfer_account")
         
         session = await ActualMCPClient.get_session()
         
@@ -225,7 +247,7 @@ async def search_deterministic_node(state: dict):
         # Score and filter
         scored = []
         for c in candidates:
-            c["match_score"] = score_candidate(payee, receipt_cents, date, c)
+            c["match_score"] = score_candidate(payee, receipt_cents_for_actual, date, receipt_account_id, receipt_transfer_account, c)
             scored.append(c)
             
         scored.sort(key=lambda x: x["match_score"], reverse=True)

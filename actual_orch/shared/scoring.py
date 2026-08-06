@@ -54,18 +54,32 @@ def _date_proximity(receipt_date: str, candidate_date: str, max_days: int = 2) -
         return 0.0
 
 
-def score_candidate(receipt_payee: str, receipt_cents: int, receipt_date: str, candidate: dict) -> float:
+def score_candidate(
+    receipt_payee: str, 
+    receipt_amount_cents: int, 
+    receipt_date: str, 
+    receipt_account_id: str, 
+    receipt_transfer_account: str, 
+    candidate: dict
+) -> float:
     """
     Return an aggregate match score (0.0–1.0) for a single Actual Budget
     transaction candidate against the parsed receipt.
     """
     W_AMOUNT = 0.40
     W_DATE   = 0.40
-    W_PAYEE  = 0.10
+    W_PAYEE  = 0.20
 
-    cand_amount = abs(candidate.get("amount", 0))
-    amount_score = _amount_similarity(receipt_cents, cand_amount)
+    cand_amount = candidate.get("amount", 0)
+    
+    # 1. Direction check
+    # If the total is in the same positive/negative or credit/debit direction FOR the account it's in (based on account_key)
+    # If they are opposite signs (one > 0, one < 0), return 0.0 immediately.
+    if (receipt_amount_cents > 0 and cand_amount < 0) or (receipt_amount_cents < 0 and cand_amount > 0):
+        return 0.0
 
+    amount_score = _amount_similarity(abs(receipt_amount_cents), abs(cand_amount))
+    
     payee_score = _payee_similarity(
         receipt_payee,
         candidate.get("payee.name") or candidate.get("payee_name", ""),
@@ -75,4 +89,34 @@ def score_candidate(receipt_payee: str, receipt_cents: int, receipt_date: str, c
     cand_date = candidate.get("date", "")
     date_score = _date_proximity(receipt_date, cand_date)
 
-    return (W_AMOUNT * amount_score) + (W_PAYEE * payee_score) + (W_DATE * date_score)
+    base_score = (W_AMOUNT * amount_score) + (W_PAYEE * payee_score) + (W_DATE * date_score)
+    
+    cand_account_id = candidate.get("account")
+    account_matched = (receipt_account_id and cand_account_id and receipt_account_id == cand_account_id)
+    
+    is_receipt_transfer = bool(receipt_transfer_account)
+    is_candidate_transfer = bool(candidate.get("transfer_id"))
+    
+    score = base_score
+    
+    # Example 1: exact total, exact date match, is transfer_account
+    if amount_score == 1.0 and date_score == 1.0 and is_receipt_transfer and is_candidate_transfer:
+        score = max(score, 0.85)
+        
+    if account_matched:
+        # Boost score slightly for matching account
+        score += 0.15
+        
+        # Example 2: account_key match, close payee match, close total, +/-1 day
+        if payee_score >= 0.5 and amount_score >= 0.9 and date_score >= 0.5:
+            score = max(score, 0.85)
+            
+        # Example 3: account_key match, transfer_account match, close total, +/-1 day
+        if is_receipt_transfer and is_candidate_transfer and amount_score >= 0.9 and date_score >= 0.5:
+            score = max(score, 0.85)
+            
+    # Penalty for account mismatch if account was provided
+    if receipt_account_id and not account_matched:
+        score *= 0.5
+        
+    return min(score, 1.0)
