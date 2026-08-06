@@ -43,12 +43,19 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
         data["image"] = FileUpload(*uploads)
     
     try:
-        # Try to find existing record by source_hash
+        # Try to find existing record by source_hash or source_ref
         existing = None
+        filter_expr = []
         if source_hash:
+            filter_expr.append(f"source_hash='{source_hash}'")
+        if source_ref:
+            filter_expr.append(f"source_ref='{source_ref}'")
+            
+        if filter_expr:
             try:
+                filter_str = " || ".join(filter_expr)
                 records = client.collection("receipts").get_list(1, 1, query_params={
-                    "filter": f"source_hash~'{source_hash}'",
+                    "filter": filter_str,
                     "fields": "id,source_hash,source_ref",
                     "skipTotal": "true",
                 })
@@ -106,35 +113,41 @@ def delete_receipt_by_hash(source_hash):
 def skip_if_processed(state: dict):
     """Check PocketBase source_hash or source_ref to skip already-processed files."""
     source = state.get("source", "gdrive")
-    if source == "email":
-        source_ref = state.get("source_ref", "")
-        if source_ref:
-            client = get_pb_client()
-            try:
-                records = client.collection("receipts").get_list(1, 1, query_params={
-                    "filter": f"source_ref='{source_ref}'",
-                    "fields": "id",
-                    "skipTotal": "true",
-                })
-                if len(records.items) > 0:
-                    print(f"⏭️  Already processed email in PocketBase (ref {source_ref})")
-                    return {"status": "already_processed"}
-            except Exception:
-                pass
-        return {}
+    
+    # 1. Check source_ref
+    source_ref = state.get("source_ref", "")
+    if source == "gdrive" and source_ref:
+        source_ref = source_ref.split("/")[-1]
+        
+    if source_ref:
+        client = get_pb_client()
+        try:
+            records = client.collection("receipts").get_list(1, 1, query_params={
+                "filter": f"source_ref='{source_ref}'",
+                "fields": "id",
+                "skipTotal": "true",
+            })
+            if len(records.items) > 0:
+                print(f"⏭️  Already processed in PocketBase (ref {source_ref})")
+                return {"status": "already_processed"}
+        except Exception:
+            pass
 
+    # 2. Check source_hash
     file_path = state.get("file_path", "")
     if file_path:
         file_hash = _file_hash(file_path)
         if check_receipt_exists(file_hash):
             print(f"⏭️  Already processed in PocketBase (hash {file_hash[:12]}...): {file_path}")
             return {"status": "already_processed"}
+            
     return {}
 
 def save_pocketbase_node(state: dict):
     """Save the receipt and items to PocketBase"""
     try:
         print("Saving to PocketBase...")
+
         parsed = state.get("parsed_data")
         tx_id = state.get("actual_tx_id")
         

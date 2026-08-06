@@ -63,8 +63,8 @@ class ReceiptItem(BaseModel):
     amount: float = Field(description="Amount of the item")
 
 class ParsedProposedTransaction(BaseModel):
-    amount: float = Field(description="Amount for this transaction line. Positive = expense, negative = refund or points redemption.")
-    notes: str = Field(description="Concise description of this line (e.g. 'Groceries - milk, eggs, bread', 'Points redemption')")
+    amount: float = Field(description="Amount for this transaction line. Positive = expense, negative = deposit, refund, credit, or points redemption.")
+    notes: str = Field(description="Concise description of this line (e.g. 'Groceries', 'Points redemption'). Do NOT list out items, summarize as short as possible.")
     category: Optional[str] = Field(default=None, description="The most likely category name from the provided list, or null if it's a transfer")
     transfer_account: Optional[str] = Field(default=None, description="The name of the account to transfer to, if this transaction is a transfer to another account")
 
@@ -342,15 +342,16 @@ async def parse_receipt_node(state: ReceiptState):
                 "You are an expert at extracting structured data from {source_desc}. "
                 "Respond with a JSON object using these top-level keys: 'date', 'currency', 'payee', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
                 "RULES:\n"
-                "- 'date': YYYY-MM-DD format. If missing, use the current date or guess from context.\n"
+                "- 'date': YYYY-MM-DD format. Today's date is {todays_date}. If missing, use the current date or guess from context. The date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and email context is available, use the email date instead.\n"
                 "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
                 "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
                 "- 'notes': A concise ~50 character summary of the purchase (e.g. 'Groceries - milk, eggs, bread'). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'. For e-transfers, include the reference number if available (e.g., 'e-Transfer Ref: CA4ABCD123').\n"
                 "- 'items': Array of line items with 'description' and 'amount'. Include taxes (HST/GST/PST/VAT) as separate items. Points/rewards redemptions should be negative amounts. Items can be empty for ATM/transfers.\n"
                 "  - 'description': casual, human-readable — include useful info (brand, type) but avoid weird characters or abbreviations.\n\n"
                 "PROPOSED TRANSACTIONS (most important):\n"
-                "'proposed_transactions' is the primary output. Each entry has: 'amount' (number), 'notes' (concise description), and EITHER 'category' (from the category list) OR 'transfer_account' (from the account list) if it is a transfer.\n"
+                "'proposed_transactions' is the primary output. Each entry has: 'amount' (number), 'notes' (concise description: do NOT list out items, summarize as short as possible), and EITHER 'category' (from the category list) OR 'transfer_account' (from the account list) if it is a transfer.\n"
                 "- Most receipts have ONE proposed transaction with the receipt total as the amount.\n"
+                "- If the receipt is for a deposit, refund, or credit (money coming INTO the account), the proposed_transaction 'amount' MUST be negative.\n"
                 "- If the receipt includes a points redemption or refund (negative amount on the receipt), create a SEPARATE proposed transaction for it with a negative amount and an Income category.\n"
                 "- The sum of all proposed_transaction amounts must equal the receipt total.\n"
                 "- Amounts are in the receipt's currency (the 'currency' field).\n"
@@ -414,7 +415,7 @@ async def parse_receipt_node(state: ReceiptState):
                             if expense_categories:
                                 expense_json = json.dumps(expense_categories).replace("{", "{{").replace("}", "}}")
                                 income_json = json.dumps(income_categories).replace("{", "{{").replace("}", "}}") if income_categories else "[]"
-                                system_prompt += f"\n\nCATEGORY SELECTION:\nEach proposed_transaction must have a 'category' (unless it's a transfer). Pick from these expense categories: {expense_json}\nFor refunds or points redemptions (negative amounts), use one of these income categories instead: {income_json}\nIf unsure, pick the most generic expense category."
+                                system_prompt += f"\n\nCATEGORY SELECTION:\nEach proposed_transaction must have a 'category' (unless it's a transfer). Pick from these expense categories: {expense_json}\nFor deposits, refunds, credits, or points redemptions (negative amounts), use one of these income categories instead: {income_json}\nIf unsure, pick the most generic expense category."
                 except Exception as e:
                     print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
 
@@ -427,7 +428,8 @@ async def parse_receipt_node(state: ReceiptState):
                 ("human", "Here is the {source_desc}:\n\n{ocr_text}")
             ])
             
-            prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"])
+            todays_date = datetime.date.today().isoformat()
+            prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"], todays_date=todays_date)
             print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
             
             if state.get("flag_log_agent"):
@@ -438,7 +440,7 @@ async def parse_receipt_node(state: ReceiptState):
             try:
                 structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
                 chain = prompt | structured_llm
-                result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc})
+                result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc, "todays_date": todays_date})
                 parsed_dict = result.dict()
                 
                 if state.get("flag_log_agent"):
@@ -467,6 +469,23 @@ async def parse_receipt_node(state: ReceiptState):
                     pass
 
                 print(f"  ❌ Parsing failed: {error_msg}. Flagging for review.")
+                llm_out = getattr(e, "llm_output", None)
+                if not llm_out and "from completion " in str(e):
+                    import re
+                    match = re.search(r'from completion (\{.*?\})\. Got:', str(e), re.DOTALL)
+                    if match:
+                        llm_out = match.group(1)
+                
+                if llm_out:
+                    if not isinstance(llm_out, str):
+                        llm_out = str(llm_out)
+                    try:
+                        parsed_out = json.loads(llm_out)
+                        llm_out_fmt = json.dumps(parsed_out, indent=2)
+                        print(f"  Agent response was:\n{llm_out_fmt}")
+                    except Exception:
+                        print(f"  Agent response was:\n{llm_out}")
+
                 parse_attempts.append({"model": model_name, "success": False, "error": error_msg})
                 return {"parse_attempts": parse_attempts}
         
@@ -547,8 +566,14 @@ async def parse_receipt_node(state: ReceiptState):
             try:
                 parsed_date = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d").date()
                 if datetime.date.today() < parsed_date:
-                    print(f"  ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
-                    return {"status": WorkflowStatus.ERROR, "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
+                    if state.get("source") == "email" and state.get("email_date"):
+                        print(f"  ⚠️ Parsed date {parsed_date} is in the future. Falling back to email date {state['email_date']}.")
+                        parsed_dict["date"] = state["email_date"]
+                        for pt in proposed_list:
+                            pt["date"] = state["email_date"]
+                    else:
+                        print(f"  ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
+                        return {"status": WorkflowStatus.ERROR, "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
             except Exception:
                 pass
             

@@ -29,7 +29,7 @@ def estimate_tokens(text: str) -> int:
 
 class TransactionMatchResult(BaseModel):
     matched_id: Optional[str] = Field(description="The UUID of the best matching candidate transaction, if any. Leave null if no good match.")
-    updated_amount: Optional[float] = Field(default=None, description="If allowed_to_update is true and the receipt has new info (like tip), output the new total amount here. Otherwise null.")
+    updated_amount: Optional[float] = Field(default=None, description="If allowed_to_update is true and the receipt has new info (like tip), output the new total amount here. The polarity must match the receipt (positive for expense, negative for deposit). Otherwise null.")
     updated_payee: Optional[str] = Field(default=None, description="If allowed_to_update is true and the receipt has a better payee, output it here. Otherwise null.")
     updated_notes: Optional[str] = Field(default=None, description="If allowed_to_update is true and you want to append/update notes, output them here. Otherwise null.")
     updated_transfer_account: Optional[str] = Field(default=None, description="If allowed_to_update is true and the receipt indicates it is a transfer to another account, output the exact transfer account name here. Otherwise null.")
@@ -37,6 +37,25 @@ class TransactionMatchResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Shared query helper
 # ---------------------------------------------------------------------------
+
+def print_matched_transaction(tx_data: dict, existing_notes: str = None):
+    if not tx_data:
+        return
+    payee_name = tx_data.get("payee.name") or tx_data.get("imported_payee") or "?"
+    account_name = tx_data.get("account.name") or "?"
+    amount_disp = abs(tx_data.get("amount", 0)) / 100.0
+    date_disp = tx_data.get("date") or "?"
+    if existing_notes is None:
+        existing_notes = tx_data.get("notes") or ""
+    notes_disp = (existing_notes or "").strip()
+    
+    print(f"  \n  📋 Matched transaction:")
+    print(f"     Date:    {date_disp}")
+    print(f"     Payee:   {payee_name}")
+    print(f"     Amount:  ${amount_disp:.2f}")
+    print(f"     Account: {account_name}")
+    if notes_disp:
+        print(f"     Notes:   {notes_disp[:100]}")
 
 async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     """
@@ -217,15 +236,12 @@ async def search_deterministic_node(state: dict):
             
         top = scored[0]
         top_score = top["match_score"]
-        print(f"  Top candidate: {top['id']} "
-              f"(score={top_score:.3f}, payee={top.get('payee.name', '?')}, "
-              f"amount=${abs(top.get('amount', 0))/100:.2f})")
-              
         final_id = "unknown_id"
         
         if top_score >= SCORE_AUTO_ACCEPT:
             final_id = top["id"]
             print(f"✅ Auto-matched (score {top_score:.3f}): {final_id}")
+            print_matched_transaction(top)
         else:
             print(f"  No candidate scored ≥ {SCORE_AUTO_ACCEPT}, falling through to agent...")
             
@@ -253,7 +269,7 @@ async def search_deterministic_node(state: dict):
         matched = next((c for c in scored if c["id"] == final_id), None)
         if matched and matched.get("transfer_id"):
             transfer_id = matched.get("transfer_id")
-            
+
         return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id}
         
     except Exception as e:
@@ -518,7 +534,7 @@ Rules:
 - Payee names might differ but should be conceptually similar, but transfers will often have completely different payee names. Sometimes the notes might contain payee name too (often in a # tag)
 - Date should be within 1 day. However, often rent income and bill payments are shifted to the start of the next month.
 - Candidates have an 'already_attached_receipts' array. If it is not empty, it contains details (payee, amount, date) of the receipt(s) already attached to this candidate. Only select such a candidate if you are absolutely sure the current receipt is a different version or additional document for the exact same transaction.
-- Each candidate has an 'allowed_to_update' flag. If 'allowed_to_update' is true, you can match the transaction and update the payee, transfer_account, notes, or amount, but ONLY if you are absolutely sure it's the same transaction and the current receipt has new info (such as tip amount, or transfer account which often happens with self e-transfers). Use the updated_* fields in your JSON response for this. If 'allowed_to_update' is false, you MUST NOT provide any updated_* fields.
+- Each candidate has an 'allowed_to_update' flag. If 'allowed_to_update' is true, you can match the transaction and update the payee, transfer_account, notes, or amount, but ONLY if you are absolutely sure it's the same transaction and the current receipt has new info (such as tip amount, or transfer account which often happens with self e-transfers). Use the updated_* fields in your JSON response for this. If updating the amount, the polarity must match the receipt (positive for expense, negative for deposit). If 'allowed_to_update' is false, you MUST NOT provide any updated_* fields.
 
 Respond in JSON format with the 'matched_id' of the matching transaction, or null if no match exists."""
             
@@ -551,6 +567,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                 matched = next((c for c in clean_candidates if c["id"] == final_id), None)
                 if matched:
                     print(f"✅ Agent selected valid candidate: {final_id}")
+                    print_matched_transaction(matched)
                     
                     # Validate amount (clean_candidates has amount in cents)
                     actual_amt = abs(matched.get("amount", 0))
@@ -600,7 +617,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         matched_full = next((c for c in clean_candidates if c["id"] == final_id), None)
         if matched_full and matched_full.get("transfer_id"):
             transfer_id = matched_full.get("transfer_id")
-            
+
         update_transaction = {}
         if final_id != "unknown_id" and result:
             if getattr(result, "updated_amount", None) is not None:
@@ -611,7 +628,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                 update_transaction["notes"] = result.updated_notes
             if getattr(result, "updated_transfer_account", None) is not None:
                 update_transaction["transfer_account"] = result.updated_transfer_account
-            
+
         return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id, "update_transaction": update_transaction}
         
     except Exception as e:
@@ -850,7 +867,7 @@ async def update_actual_transaction_node(state: dict):
         try:
             res = await session.call_tool("actual_query", {"args": [
                 "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), 
-                "--select", "id,date,amount,payee,imported_payee,notes,category,account,cleared,reconciled,is_child,parent_id,sort_order",
+                "--select", "id,date,amount,payee,payee.name,imported_payee,notes,category,account,account.name,cleared,reconciled,is_child,parent_id,sort_order",
                 "--format", "json"
             ]})
             if res.content and len(res.content) > 0:
@@ -865,6 +882,21 @@ async def update_actual_transaction_node(state: dict):
             print(f"Failed to fetch transaction details: {e}")
         
         update_transaction = state.get("update_transaction") or {}
+
+        # Summarise what we know about the matched transaction before proceeding
+        if tx_data:
+            print_matched_transaction(tx_data, existing_notes)
+
+        if update_transaction:
+            fields = {k: v for k, v in update_transaction.items() if k != "notes"}
+            if fields:
+                parts = []
+                for k, v in fields.items():
+                    if k == "amount":
+                        parts.append(f"amount → ${v:.2f}")
+                    else:
+                        parts.append(f"{k} → {v}")
+                print(f"  ✏️  Agent updates: {', '.join(parts)}")
         
         # Determine base notes and append #receipt
         base_notes = update_transaction.get("notes", existing_notes)
