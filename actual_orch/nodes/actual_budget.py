@@ -585,9 +585,10 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
             if result.matched_id:
                 final_id = result.matched_id
                 print(f"Agent matched tx: {final_id} with {model_name}")
-                # Validate
-                matched = next((c for c in clean_candidates if c["id"] == final_id), None)
+                # Validate case-insensitively and use the exact casing from the candidate list
+                matched = next((c for c in clean_candidates if c["id"].lower() == final_id.lower()), None)
                 if matched:
+                    final_id = matched["id"]
                     print(f"✅ Agent selected valid candidate: {final_id}")
                     print_matched_transaction(matched)
                     
