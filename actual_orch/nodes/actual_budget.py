@@ -890,7 +890,7 @@ async def update_actual_transaction_node(state: dict):
         try:
             res = await session.call_tool("actual_query", {"args": [
                 "run", "--table", "transactions", "--filter", json.dumps({"id": tx_id}), 
-                "--select", "id,date,amount,payee,payee.name,imported_payee,notes,category,account,account.name,cleared,reconciled,is_child,parent_id,sort_order",
+                "--select", "id,date,amount,payee,payee.name,imported_payee,notes,category,account,account.name,cleared,reconciled,is_child,parent_id,sort_order,transfer_id,schedule,imported_id",
                 "--format", "json"
             ]})
             if res.content and len(res.content) > 0:
@@ -984,6 +984,91 @@ async def update_actual_transaction_node(state: dict):
                 except Exception as e:
                     print(f"⚠️ Failed to resolve transfer account {transfer_acc_name}: {e}")
 
+        proposed_txs = state.get("parsed_data", {}).get("proposed_transactions", [])
+        if tx_data and not tx_data.get("cleared") and not tx_data.get("reconciled") and not tx_data.get("is_child") and len(proposed_txs) > 1:
+            print("  ➕ Transforming matched standalone transaction into a split transaction...")
+            update_payload["subtransactions"] = []
+            
+            cats = []
+            try:
+                import os
+                categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
+                if os.path.exists(categories_path):
+                    with open(categories_path, "r") as f:
+                        loaded_cats = json.load(f)
+                        if isinstance(loaded_cats, list):
+                            cats = loaded_cats
+            except Exception:
+                pass
+
+            try:
+                acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
+                all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
+                all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
+            except Exception as e:
+                print(f"  ⚠️ Failed to fetch accounts or payees for split resolution: {e}")
+                all_accounts = []
+                all_payees = []
+
+            def get_transfer_payee_update(transfer_name):
+                if not transfer_name:
+                    return None
+                clean_transfer = strip_emojis(transfer_name)
+                for acc in all_accounts:
+                    if strip_emojis(acc.get("name", "")) == clean_transfer:
+                        acc_id = acc.get("id")
+                        for p in all_payees:
+                            if p.get("transfer_acct") == acc_id:
+                                return p.get("id")
+                return None
+
+            for pt in proposed_txs:
+                sub_cents = int(round(-pt.get("amount", 0.0) * 100))
+                sub = {
+                    "amount": sub_cents,
+                    "notes": pt.get("notes", "")
+                }
+                
+                transfer_account = pt.get("transfer_account")
+                transfer_payee_id = get_transfer_payee_update(transfer_account)
+                
+                if transfer_payee_id:
+                    sub["payee"] = transfer_payee_id
+                else:
+                    pt_cat = pt.get("category")
+                    if pt_cat:
+                        cat_match = next((c for c in cats if c.get("name") == pt_cat or c.get("id") == pt_cat), None)
+                        sub["category"] = cat_match.get("id") if cat_match else pt_cat
+                        
+                update_payload["subtransactions"].append(sub)
+                
+            # Parent of a split should not have a category
+            if "category" in update_payload:
+                update_payload["category"] = None
+
+            try:
+                # Delete old standalone transaction
+                await session.call_tool("actual_transactions", {"args": ["delete", tx_id]})
+                
+                # Add new split transaction
+                add_res = await session.call_tool("actual_transactions", {"args": [
+                    "add", "--account", tx_data["account"],
+                    "--data", json.dumps([update_payload])
+                ]})
+                
+                try:
+                    added_ids = json.loads(add_res.content[0].text)
+                    if isinstance(added_ids, list) and len(added_ids) > 0:
+                        new_tx_id = added_ids[0]
+                        print(f"✅ Successfully converted transaction into a split (Old ID: {tx_id}, New ID: {new_tx_id})")
+                        return {"actual_tx_id": new_tx_id, "replaced_tx_id": tx_id}
+                except Exception as e:
+                    print(f"⚠️ Failed to parse new split transaction ID: {e}")
+            except Exception as e:
+                print(f"⚠️ Failed to recreate split transaction: {e}")
+            return {}
+
         mcp_tools = await load_mcp_tools(session)
         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
         if tx_tool:
@@ -991,7 +1076,7 @@ async def update_actual_transaction_node(state: dict):
                 "update", tx_id,
                 "--data", json.dumps(update_payload)
             ]})
-            print(f"✅ Tagged transaction {tx_id} with #receipt")
+            print(f"✅ Successfully updated transaction {tx_id} (Tagged with #receipt)")
             
     except Exception as e:
         print(f"⚠️ Failed to tag transaction (non-fatal): {e}")

@@ -43,6 +43,7 @@ class ReceiptState(TypedDict, total=False):
     ocr_text: str         # Text extracted by Gemini
     parsed_data: Dict[str, Any]
     actual_tx_id: str
+    replaced_tx_id: str   # If the tx_id changed (e.g. recreating as split), this holds the old ID
     actual_tx_id_transfer: str
     update_transaction: ProposedTransaction # Agent proposed updates
     status: WorkflowStatus
@@ -304,20 +305,26 @@ async def parse_receipt_node(state: ReceiptState):
         
         parse_attempts = state.get("parse_attempts", [])
         parse_retries = len(parse_attempts)
+        attempted_models = {attempt.get("model") for attempt in parse_attempts if attempt.get("model")}
+        available_models = {"deepseek-v4-flash", "deepseek-v4-pro"}
+        all_models_exhausted = available_models.issubset(attempted_models)
         
-        # Try cache first (only on first attempt)
+        # Try cache first (only on first attempt or if all models exhausted)
         parsed_dict = None
         model_name = None
-        if parse_retries == 0:
+        if len(parse_attempts) == 0 or all_models_exhausted:
             cached = get_parsed(file_path, prefix=prefix)
             if cached is None and prefix != "receipt_":
                 cached = get_parsed(file_path, prefix="receipt_")
             if cached is not None:
-                print("Using cached parsed data (Redis)...")
+                if all_models_exhausted:
+                    print("All models exhausted, using cached parsed data (Redis) as fallback...")
+                else:
+                    print("Using cached parsed data (Redis)...")
                 parsed_dict = cached
 
         if parsed_dict is None:
-            model_name = "deepseek-v4-pro" if parse_retries > 0 else "deepseek-v4-flash"
+            model_name = "deepseek-v4-pro" if "deepseek-v4-flash" in attempted_models else "deepseek-v4-flash"
             print(f"Parsing receipt with {model_name} (retry {parse_retries})...")
             
             llm = ChatOpenAI(
@@ -666,7 +673,7 @@ def router_after_search_deterministic(state: ReceiptState):
     if state.get("status") == WorkflowStatus.FALLBACK_TO_AGENT:
         return "fallback_to_agent"
     if state.get("actual_tx_id") != "unknown_id":
-        return "save_pocketbase"
+        return "update_actual"
     return "error"
 
 def router_after_search_agent(state: ReceiptState):
@@ -678,13 +685,13 @@ def router_after_search_agent(state: ReceiptState):
         if state.get("flag_create_missing"):
             return "save_actual"
         return "human_approval"
-    return "save_pocketbase"
+    return "update_actual"
 
 def router_after_human(state: ReceiptState):
     if state.get("flag_create_missing") and state.get("actual_tx_id") == "unknown_id":
         return "save_actual"
     if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
-        return "save_pocketbase"
+        return "update_actual"
     return "skip"
 
 # Build Graph
@@ -710,16 +717,16 @@ workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": EN
 workflow.add_conditional_edges("search_deterministic", router_after_search_deterministic, {
     "error": END, 
     "fallback_to_agent": "search_agent", 
-    "save_pocketbase": "save_pocketbase"
+    "update_actual": "update_actual"
 })
 workflow.add_conditional_edges("search_agent", router_after_search_agent, {
     "error": END, 
     "human_approval": "human_approval", 
     "save_actual": "save_actual",
-    "save_pocketbase": "save_pocketbase",
+    "update_actual": "update_actual",
     "retry_parse": "parse_receipt"
 })
-workflow.add_conditional_edges("human_approval", router_after_human, {"save_actual": "save_actual", "save_pocketbase": "save_pocketbase", "skip": END})
-workflow.add_edge("save_actual", "save_pocketbase")
-workflow.add_edge("save_pocketbase", "update_actual")
-workflow.add_edge("update_actual", END)
+workflow.add_conditional_edges("human_approval", router_after_human, {"save_actual": "save_actual", "update_actual": "update_actual", "skip": END})
+workflow.add_edge("save_actual", "update_actual")
+workflow.add_edge("update_actual", "save_pocketbase")
+workflow.add_edge("save_pocketbase", END)

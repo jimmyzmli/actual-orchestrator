@@ -143,6 +143,18 @@ def skip_if_processed(state: dict):
             
     return {}
 
+def update_replaced_tx_id(replaced_tx_id, new_tx_id):
+    """Update all receipts in PocketBase that referenced the old transaction ID to the new one"""
+    client = get_pb_client()
+    try:
+        records = client.collection("receipts").get_full_list(query_params={
+            "filter": f"tx_id='{replaced_tx_id}'",
+        })
+        for r in records:
+            client.collection("receipts").update(r.id, {"tx_id": new_tx_id})
+    except Exception as e:
+        print(f"Warning: Failed to update replaced_tx_id {replaced_tx_id} in PocketBase: {e}")
+
 def save_pocketbase_node(state: dict):
     """Save the receipt and items to PocketBase"""
     try:
@@ -150,12 +162,16 @@ def save_pocketbase_node(state: dict):
 
         parsed = state.get("parsed_data")
         tx_id = state.get("actual_tx_id")
+        replaced_tx_id = state.get("replaced_tx_id")
+        
+        if replaced_tx_id and tx_id and replaced_tx_id != tx_id:
+            update_replaced_tx_id(replaced_tx_id, tx_id)
         
         if not parsed or not tx_id or tx_id == "unknown_id":
             return {"status": "error", "error": "Missing parsed data or valid tx_id (was unknown_id)"}
             
         date = parsed["date"]
-        amount = parsed["total"]
+        amount = round(parsed["total"], 2) if parsed.get("total") is not None else 0.0
         payee = parsed["payee"]
         lines = parsed.get("items", [])
         
