@@ -38,8 +38,8 @@ class ProposedTransaction(TypedDict, total=False):
 
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF or PNG
-    source_ref: str       # Original source reference (e.g. gdrive path or email msg_id)
-    source: str           # Source type (e.g. gdrive, email)
+    source_ref: str       # Original source reference (e.g. rclone/local path or email msg_id)
+    source: str           # Source type (e.g. file, email, icloud, gdrive)
     ocr_text: str         # Text extracted by Gemini
     parsed_data: Dict[str, Any]
     actual_tx_id: str
@@ -228,7 +228,8 @@ def classify_input_node(state: ReceiptState):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
             except Exception as e:
                 print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
-            if state.get("source") == "email":
+            from actual_orch.shared.utils import get_receipt_type
+            if get_receipt_type(state.get("source")) == "email":
                 email_ctx = state.get("email_context", "")
                 if state.get('email_date'):
                     email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
@@ -337,13 +338,12 @@ async def parse_receipt_node(state: ReceiptState):
             from actual_orch.shared.peak_hours import pause_if_peak_hours
             pause_if_peak_hours("deepseek")
             
-            source_type = state.get("source")
-            if source_type == "gdrive":
-                source_desc = "OCR text from a paper receipt"
-            elif source_type == "email":
+            from actual_orch.shared.utils import get_receipt_type
+            source_type = get_receipt_type(state.get("source"))
+            if source_type == "email":
                 source_desc = "raw text from an email receipt"
             else:
-                source_desc = "OCR text from a receipt"
+                source_desc = "OCR text from a paper receipt or file"
                 
             system_prompt = (
                 "You are an expert at extracting structured data from {source_desc}. "
@@ -497,7 +497,8 @@ async def parse_receipt_node(state: ReceiptState):
                 return {"parse_attempts": parse_attempts}
         
         # Email date override logic
-        if state.get("source") == "email" and state.get("email_date"):
+        from actual_orch.shared.utils import get_receipt_type
+        if get_receipt_type(state.get("source")) == "email" and state.get("email_date"):
             if parse_retries == 0:
                 try:
                     email_dt = datetime.datetime.strptime(state["email_date"], "%Y-%m-%d")
@@ -573,7 +574,8 @@ async def parse_receipt_node(state: ReceiptState):
             try:
                 parsed_date = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d").date()
                 if datetime.date.today() < parsed_date:
-                    if state.get("source") == "email" and state.get("email_date"):
+                    from actual_orch.shared.utils import get_receipt_type
+                    if get_receipt_type(state.get("source")) == "email" and state.get("email_date"):
                         print(f"  ⚠️ Parsed date {parsed_date} is in the future. Falling back to email date {state['email_date']}.")
                         parsed_dict["date"] = state["email_date"]
                         for pt in proposed_list:

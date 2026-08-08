@@ -3,12 +3,12 @@ from pocketbase.models.file_upload import FileUpload
 from actual_orch.clients.pocketbase import get_pb_client
 from actual_orch.clients.cache import _file_hash
 
-def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None, tx_id_transfer=None, parsed=None, source="gdrive"):
+def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, source_hash, image_paths=None, tx_id_transfer=None, parsed=None, source="file"):
     """
     transaction_id: The original 36 char UUID from actual budget
     lines: list of extracted items
     tx_date: ISO date string
-    source_ref: gdrive path/filename
+    source_ref: file path/filename
     amount: total amount
     payee: store name
     source_hash: SHA-256 hash of the source file for dedup
@@ -112,11 +112,13 @@ def delete_receipt_by_hash(source_hash):
 
 def skip_if_processed(state: dict):
     """Check PocketBase source_hash or source_ref to skip already-processed files."""
-    source = state.get("source", "gdrive")
+    source = state.get("source", "file")
     
     # 1. Check source_ref
     source_ref = state.get("source_ref", "")
-    if source == "gdrive" and source_ref:
+    from actual_orch.shared.utils import get_receipt_type
+    receipt_type = get_receipt_type(source)
+    if receipt_type != "email" and source_ref:
         source_ref = source_ref.split("/")[-1]
         
     if source_ref:
@@ -175,9 +177,11 @@ def save_pocketbase_node(state: dict):
         payee = parsed["payee"]
         lines = parsed.get("items", [])
         
-        source = state.get("source", "gdrive")
-        source_ref = state.get("source_ref", state.get("gdrive_path", ""))
-        if source == "gdrive" and source_ref:
+        source = state.get("source", "file")
+        source_ref = state.get("source_ref", "")
+        from actual_orch.shared.utils import get_receipt_type
+        receipt_type = get_receipt_type(source)
+        if receipt_type != "email" and source_ref:
             source_ref = source_ref.split("/")[-1]
             
         image_paths = state.get("image_paths", [])

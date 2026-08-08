@@ -9,7 +9,7 @@ def clear_all_checkpoints(db_path: str, sources: List[str] = None) -> int:
     If sources is provided, instead of deleting the file, it connects to sqlite and deletes matching rows.
     Returns the number of files/rows deleted.
     """
-    if not sources or ("email" in sources and "gdrive" in sources):
+    if not sources or len(sources) == 0:
         files = glob.glob(f"{db_path}*")
         count = 0
         if files:
@@ -31,8 +31,9 @@ def clear_all_checkpoints(db_path: str, sources: List[str] = None) -> int:
         c.execute("DELETE FROM writes WHERE thread_id NOT LIKE '%/%'")
         deleted += c.rowcount
         
-    if "gdrive" in sources:
-        # GDrive thread_ids contain '/'
+    file_sources = [s for s in sources if s != "email"]
+    if file_sources:
+        # File thread_ids typically contain '/' (like source_path/filename)
         c.execute("DELETE FROM checkpoints WHERE thread_id LIKE '%/%'")
         c.execute("DELETE FROM writes WHERE thread_id LIKE '%/%'")
         deleted += c.rowcount

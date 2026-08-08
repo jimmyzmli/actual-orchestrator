@@ -273,7 +273,8 @@ async def search_deterministic_node(state: dict):
             if matched_candidate:
                 actual_amt = abs(matched_candidate.get("amount", 0))
                 
-                if state.get("source") == "email" and actual_amt != receipt_cents:
+                from actual_orch.shared.utils import get_receipt_type
+                if get_receipt_type(state.get("source")) == "email" and actual_amt != receipt_cents:
                     print(f"❌ VALIDATION FAILED: Email receipt amount ${amount:.2f} "
                           f"must exactly match bank amount ${actual_amt/100:.2f}. Rejecting.")
                     final_id = "unknown_id"
@@ -527,7 +528,8 @@ async def search_agent_node(state: dict):
                 print(f"  ⚠️ Failed to translate account_key: {e}")
                 parsed_prompt["account"] = strip_emojis(account_key)
 
-        if state.get("source") == "email" and state.get("email_context"):
+        from actual_orch.shared.utils import get_receipt_type
+        if get_receipt_type(state.get("source")) == "email" and state.get("email_context"):
             parsed_prompt["email_context"] = state.get("email_context")
             
         try:
