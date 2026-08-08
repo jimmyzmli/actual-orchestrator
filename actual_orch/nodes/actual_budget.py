@@ -950,12 +950,17 @@ async def update_actual_transaction_node(state: dict):
                 update_payload["amount"] = update_cents
                 print(f"Agent requested amount update to: {update_cents}")
             
-            if "payee" in update_transaction:
-                update_payload["payee_name"] = update_transaction["payee"]
-                print(f"Agent requested payee update to: {update_transaction['payee']}")
-                
-            if "transfer_account" in update_transaction:
-                transfer_acc_name = update_transaction["transfer_account"]
+            proposed_txs = state.get("parsed_data", {}).get("proposed_transactions", [])
+            parsed_payee = state.get("parsed_data", {}).get("payee")
+
+            target_transfer_account = update_transaction.get("transfer_account")
+            if not target_transfer_account and len(proposed_txs) == 1:
+                target_transfer_account = proposed_txs[0].get("transfer_account")
+
+            target_payee_name = update_transaction.get("payee") or parsed_payee
+
+            if target_transfer_account:
+                transfer_acc_name = target_transfer_account
                 try:
                     acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
                     payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
@@ -981,8 +986,23 @@ async def update_actual_transaction_node(state: dict):
                         if "payee_name" in update_payload:
                             del update_payload["payee_name"]
                         print(f"Agent requested transfer update to: {transfer_acc_name} ({transfer_payee_id})")
+                    elif target_payee_name:
+                        update_payload["payee_name"] = target_payee_name
+                        if "payee" in update_payload:
+                            del update_payload["payee"]
+                        print(f"Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
                 except Exception as e:
                     print(f"⚠️ Failed to resolve transfer account {transfer_acc_name}: {e}")
+                    if target_payee_name:
+                        update_payload["payee_name"] = target_payee_name
+                        if "payee" in update_payload:
+                            del update_payload["payee"]
+                        print(f"Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
+            elif target_payee_name:
+                update_payload["payee_name"] = target_payee_name
+                if "payee" in update_payload:
+                    del update_payload["payee"]
+                print(f"Agent requested payee update to: {target_payee_name}")
 
         proposed_txs = state.get("parsed_data", {}).get("proposed_transactions", [])
         if tx_data and not tx_data.get("cleared") and not tx_data.get("reconciled") and not tx_data.get("is_child") and len(proposed_txs) > 1:
