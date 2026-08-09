@@ -479,23 +479,45 @@ async def search_agent_node(state: dict):
         structured_candidates.sort(key=get_sort_key)
         structured_candidates = structured_candidates[:50]
         
-        parse_attempts = state.get("parse_attempts", [])
-        already_retried = any(a.get("model") == "search_agent" for a in parse_attempts)
+        agent_attempts = state.get("agent_attempts", [])
+        search_attempts = [a for a in agent_attempts if a.get("node") == "search_agent"]
+        already_retried = len(search_attempts) > 0
         
+        from actual_orch.shared.utils import get_agent_config
+                
+        def should_retry_parse():
+            if state.get("flag_create_missing"):
+                parse_attempts_cfg = get_agent_config("receipt_parse").get("attempts", [])
+                parse_retries = len([a for a in agent_attempts if a.get("node") == "receipt_parse"])
+                if parse_retries < len(parse_attempts_cfg):
+                    if parse_attempts_cfg[parse_retries].get("skip_for_create"):
+                        return False
+            return True
+
         if not structured_candidates:
             print("  ❌ No candidates available for agent to search. Failing immediately.")
-            if not already_retried:
+            if not already_retried and should_retry_parse():
                 print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
                 return {
-                    "parse_attempts": parse_attempts + [{"model": "search_agent", "success": False, "error": "No candidates"}],
+                    "agent_attempts": agent_attempts + [{"node": "search_agent", "model": "search_agent", "success": False, "error": "No candidates"}],
                     "status": "retry_parse",
                     "actual_tx_id": "unknown_id"
                 }
             else:
-                print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
-                return {"status": "human_approval", "actual_tx_id": "unknown_id"}
+                if not already_retried:
+                    print(f"  ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
+                else:
+                    print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
+                return {
+                    "agent_attempts": agent_attempts + [{"node": "search_agent", "model": "search_agent", "success": False, "error": "No candidates"}],
+                    "status": "human_approval", 
+                    "actual_tx_id": "unknown_id"
+                }
         
-        model_name = "deepseek-v4-pro" if already_retried else "deepseek-v4-flash"
+        search_attempts_cfg = get_agent_config("budget_search").get("attempts", [])
+        
+        current_attempt = search_attempts_cfg[min(len(search_attempts), len(search_attempts_cfg) - 1)] if search_attempts_cfg else {}
+        model_name = current_attempt.get("model", "deepseek-v4-pro" if already_retried else "deepseek-v4-flash")
         
         print(f"  🔄 Retrying match with model ({model_name})...")
         
@@ -568,7 +590,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
             base_url="https://api.deepseek.com/v1"
         )
         
-        structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode")
+        structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode", include_raw=True)
         
         if state.get("flag_log_agent"):
             print(f"\n--- AGENT PROMPT ({model_name}) ---")
@@ -576,12 +598,26 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
             print("---------------------------------------\n")
             
         final_id = "unknown_id"
+        result = None
+        prompt_tokens = None
+        completion_tokens = None
+        response_time_ms = None
         try:
-            result = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
+            import time
+            start_time = time.time()
+            result_wrapper = await structured_llm.ainvoke([HumanMessage(content=prompt_text)])
+            response_time_ms = int((time.time() - start_time) * 1000)
+            
+            result = result_wrapper.get("parsed")
+            raw_msg = result_wrapper.get("raw")
+            if raw_msg and hasattr(raw_msg, "usage_metadata") and raw_msg.usage_metadata:
+                prompt_tokens = raw_msg.usage_metadata.get("input_tokens")
+                completion_tokens = raw_msg.usage_metadata.get("output_tokens")
             
             if state.get("flag_log_agent"):
                 print(f"\n--- AGENT RESPONSE ({model_name}) ---")
-                print(result.dict())
+                print(result.dict() if result else None)
+                print(f"[Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
                 print("---------------------------------------\n")
                 
             if result.matched_id:
@@ -626,17 +662,34 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
             print(f"Warning: Failed to parse structured output from {model_name}: {e}")
             final_id = "unknown_id"
 
-        if final_id == "unknown_id":
-            if not already_retried:
-                print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
+        if final_id == "unknown_id" or not result:
+            print(f"  ❌ Agent failed to match with any candidate.")
+            attempt_log = {
+                "node": "search_agent", 
+                "model": model_name, 
+                "success": False, 
+                "error": "Match failed",
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "response_time_ms": response_time_ms
+            }
+            if not already_retried and should_retry_parse():
+                print(f"  ❌ Triggering parse_receipt retry...")
                 return {
-                    "parse_attempts": parse_attempts + [{"model": "search_agent", "success": False, "error": "Match failed"}],
+                    "agent_attempts": agent_attempts + [attempt_log],
                     "status": "retry_parse",
                     "actual_tx_id": "unknown_id"
                 }
             else:
-                print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
-                return {"status": "human_approval", "actual_tx_id": "unknown_id"}
+                if not already_retried:
+                    print(f"  ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
+                else:
+                    print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
+                return {
+                    "agent_attempts": agent_attempts + [attempt_log],
+                    "status": "human_approval", 
+                    "actual_tx_id": "unknown_id"
+                }
                 
         transfer_id = None
         matched_full = next((c for c in clean_candidates if c["id"] == final_id), None)
@@ -654,7 +707,20 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
             if getattr(result, "updated_transfer_account", None) is not None:
                 update_transaction["transfer_account"] = result.updated_transfer_account
 
-        return {"actual_tx_id": final_id, "actual_tx_id_transfer": transfer_id, "update_transaction": update_transaction}
+        return {
+            "actual_tx_id": final_id,
+            "actual_tx_id_transfer": transfer_id,
+            "update_transaction": update_transaction,
+            "agent_attempts": agent_attempts + [{
+                "node": "search_agent", 
+                "model": model_name, 
+                "success": True, 
+                "error": None,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "response_time_ms": response_time_ms
+            }]
+        }
         
     except Exception as e:
         import traceback

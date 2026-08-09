@@ -36,6 +36,15 @@ class ProposedTransaction(TypedDict, total=False):
     amount: float
     transfer_account: str
 
+class AgentAttempt(TypedDict, total=False):
+    node: str
+    model: str
+    success: bool
+    error: Optional[str]
+    prompt_tokens: Optional[int]
+    completion_tokens: Optional[int]
+    response_time_ms: Optional[int]
+
 class ReceiptState(TypedDict, total=False):
     file_path: str        # Local path to the downloaded PDF or PNG
     source_ref: str       # Original source reference (e.g. rclone/local path or email msg_id)
@@ -52,7 +61,7 @@ class ReceiptState(TypedDict, total=False):
     email_context: str    # Context string containing sender, subject, folder, etc.
     image_paths: List[str] # Paths to extracted JPEG images
     proposed_transactions: List[ProposedTransaction] 
-    parse_attempts: List[Dict[str, Any]] # History of parsing attempts (model, success, error)
+    agent_attempts: List[AgentAttempt] # History of all agent attempts (node, model, success, error)
     flag_log_agent: bool       # True if agent logs should be printed
     flag_create_missing: bool  # True if we should auto-create a transaction on no-match
     classification: str   # The result of the LLM classification (e.g. RECEIPT, INVOICE)
@@ -124,8 +133,12 @@ def extract_ocr_node(state: ReceiptState):
         import time
         time.sleep(4.1) 
         
+        from actual_orch.shared.utils import get_agent_config
+        attempts = get_agent_config("receipt_extract").get("attempts", [])
+        model_name = attempts[0].get("model", "gemini-3.1-flash-lite") if attempts else "gemini-3.1-flash-lite"
+
         llm = ChatGoogleGenerativeAI(
-            model="gemini-3.1-flash-lite",
+            model=model_name,
             api_key=os.environ.get("GEMINI_API_KEY", ""),
             temperature=0
         )
@@ -198,8 +211,12 @@ def classify_input_node(state: ReceiptState):
                 classification = get_classify(file_path, prefix="receipt_")
                 
         if not classification or not classification.strip():
+            from actual_orch.shared.utils import get_agent_config
+            attempts = get_agent_config("receipt_classify").get("attempts", [])
+            model_name = attempts[0].get("model", "deepseek-v4-flash") if attempts else "deepseek-v4-flash"
+
             llm = ChatOpenAI(
-                model="deepseek-v4-flash", 
+                model=model_name, 
                 api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
                 base_url="https://api.deepseek.com/v1",
                 max_tokens=64
@@ -304,16 +321,20 @@ async def parse_receipt_node(state: ReceiptState):
         file_path = state["file_path"]
         prefix = f"receipt_{state.get('source', '')}_" if state.get('source') else "receipt_"
         
-        parse_attempts = state.get("parse_attempts", [])
+        agent_attempts = state.get("agent_attempts", [])
+        parse_attempts = [a for a in agent_attempts if a.get("node") == "receipt_parse"]
         parse_retries = len(parse_attempts)
-        attempted_models = {attempt.get("model") for attempt in parse_attempts if attempt.get("model")}
-        available_models = {"deepseek-v4-flash", "deepseek-v4-pro"}
-        all_models_exhausted = available_models.issubset(attempted_models)
+        
+        from actual_orch.shared.utils import get_agent_config
+        parsing_config = get_agent_config("receipt_parse")
+        attempts_config = parsing_config.get("attempts", [{"model": "deepseek-v4-pro"}])
+        max_attempts = len(attempts_config) if attempts_config else 1
+        all_models_exhausted = parse_retries >= max_attempts
         
         # Try cache first (only on first attempt or if all models exhausted)
         parsed_dict = None
         model_name = None
-        if len(parse_attempts) == 0 or all_models_exhausted:
+        if parse_retries == 0 or all_models_exhausted:
             cached = get_parsed(file_path, prefix=prefix)
             if cached is None and prefix != "receipt_":
                 cached = get_parsed(file_path, prefix="receipt_")
@@ -325,7 +346,8 @@ async def parse_receipt_node(state: ReceiptState):
                 parsed_dict = cached
 
         if parsed_dict is None:
-            model_name = "deepseek-v4-pro" if "deepseek-v4-flash" in attempted_models else "deepseek-v4-flash"
+            current_attempt = attempts_config[min(parse_retries, max_attempts - 1)] if attempts_config else {"model": "deepseek-v4-pro"}
+            model_name = current_attempt.get("model", "deepseek-v4-pro")
             print(f"Parsing receipt with {model_name} (retry {parse_retries})...")
             
             llm = ChatOpenAI(
@@ -426,9 +448,10 @@ async def parse_receipt_node(state: ReceiptState):
                 except Exception as e:
                     print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
 
-            if parse_retries > 0:
+            if current_attempt.get("append_prompt"):
                 prev_date = state.get("parsed_data", {}).get("date", "unknown")
-                system_prompt += f"\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction."
+                prompt_addition = current_attempt["append_prompt"].replace("{prev_date}", str(prev_date))
+                system_prompt += prompt_addition
 
             prompt = ChatPromptTemplate.from_messages([
                 ("system", system_prompt),
@@ -445,14 +468,28 @@ async def parse_receipt_node(state: ReceiptState):
                 print("---------------------------------------\n")
 
             try:
-                structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode")
+                import time
+                start_time = time.time()
+                structured_llm = llm.with_structured_output(ParsedReceipt, method="json_mode", include_raw=True)
                 chain = prompt | structured_llm
-                result = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc, "todays_date": todays_date})
+                result_wrapper = await chain.ainvoke({"ocr_text": state["ocr_text"], "source_desc": source_desc, "todays_date": todays_date})
+                response_time_ms = int((time.time() - start_time) * 1000)
+                
+                result = result_wrapper.get("parsed")
+                raw_msg = result_wrapper.get("raw")
+                
+                prompt_tokens = None
+                completion_tokens = None
+                if raw_msg and hasattr(raw_msg, "usage_metadata") and raw_msg.usage_metadata:
+                    prompt_tokens = raw_msg.usage_metadata.get("input_tokens")
+                    completion_tokens = raw_msg.usage_metadata.get("output_tokens")
+                
                 parsed_dict = result.dict()
                 
                 if state.get("flag_log_agent"):
                     print(f"\n--- AGENT RESPONSE ({model_name}) ---")
                     print(json.dumps(parsed_dict, indent=2))
+                    print(f"[Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
                     print("---------------------------------------\n")
             except Exception as e:
                 error_msg = str(e)
@@ -493,8 +530,16 @@ async def parse_receipt_node(state: ReceiptState):
                     except Exception:
                         print(f"  Agent response was:\n{llm_out}")
 
-                parse_attempts.append({"model": model_name, "success": False, "error": error_msg})
-                return {"parse_attempts": parse_attempts}
+                agent_attempts.append({
+                    "node": "receipt_parse", 
+                    "model": model_name, 
+                    "success": False, 
+                    "error": error_msg,
+                    "prompt_tokens": prompt_tokens if 'prompt_tokens' in locals() else None,
+                    "completion_tokens": completion_tokens if 'completion_tokens' in locals() else None,
+                    "response_time_ms": response_time_ms if 'response_time_ms' in locals() else None
+                })
+                return {"agent_attempts": agent_attempts}
         
         # Email date override logic
         from actual_orch.shared.utils import get_receipt_type
@@ -587,7 +632,15 @@ async def parse_receipt_node(state: ReceiptState):
                 pass
             
         if model_name:
-            parse_attempts.append({"model": model_name, "success": True, "error": None})
+            agent_attempts.append({
+                "node": "receipt_parse", 
+                "model": model_name, 
+                "success": True, 
+                "error": None,
+                "prompt_tokens": prompt_tokens if 'prompt_tokens' in locals() else None,
+                "completion_tokens": completion_tokens if 'completion_tokens' in locals() else None,
+                "response_time_ms": response_time_ms if 'response_time_ms' in locals() else None
+            })
         
         # Build proposed_transactions for state (resolve display names, copy date/payee/account)
         proposed_list = []
@@ -634,7 +687,7 @@ async def parse_receipt_node(state: ReceiptState):
                 
             proposed_list.append(p)
             
-        return {"parsed_data": parsed_dict, "parse_attempts": parse_attempts, "proposed_transactions": proposed_list}
+        return {"parsed_data": parsed_dict, "agent_attempts": agent_attempts, "proposed_transactions": proposed_list}
     except Exception as e:
         return {"status": WorkflowStatus.ERROR, "error": f"Parsing failed: {str(e)}"}
 
@@ -664,7 +717,7 @@ def router_after_classify(state: ReceiptState):
 def router_after_parse(state: ReceiptState):
     if state.get("status") == WorkflowStatus.ERROR:
         return "error"
-    attempts = state.get("parse_attempts", [])
+    attempts = [a for a in state.get("agent_attempts", []) if a.get("node") == "receipt_parse"]
     if attempts and not attempts[-1].get("success", False):
         return "human_approval"
     return "continue"

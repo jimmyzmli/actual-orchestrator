@@ -97,8 +97,12 @@ def parse_statement_node(state: StatementState):
 
         print(f"Parsing statement with DeepSeek-V4-Pro...")
         
+        from actual_orch.shared.utils import get_agent_config
+        attempts = get_agent_config("statement_parse").get("attempts", [])
+        model_name = attempts[0].get("model", "deepseek-chat") if attempts else "deepseek-chat"
+
         llm = ChatOpenAI(
-            model="deepseek-chat", # API identifier for DeepSeek-V4-Pro
+            model=model_name, # API identifier for DeepSeek-V4-Pro
             api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
             base_url="https://api.deepseek.com/v1",
             max_tokens=8000
@@ -167,8 +171,12 @@ def extract_and_parse_statement_node(state: StatementState):
         import time
         time.sleep(4.1) # Respect Gemini free tier limits
         
+        from actual_orch.shared.utils import get_agent_config
+        attempts = get_agent_config("statement_holistic").get("attempts", [])
+        model_name = attempts[0].get("model", "gemini-3.1-pro") if attempts else "gemini-3.1-pro"
+
         llm = ChatGoogleGenerativeAI(
-            model="gemini-3.1-pro", # Use the pro model for complex extraction
+            model=model_name, # Use the pro model for complex extraction
             api_key=os.environ.get("GEMINI_API_KEY", ""),
             temperature=0
         )

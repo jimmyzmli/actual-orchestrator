@@ -1,0 +1,52 @@
+{
+  "receipt_extract": {
+    "attempts": [
+      {
+        "model": "gemini-3.1-flash-lite"
+      }
+    ]
+  },
+  "receipt_classify": {
+    "attempts": [
+      {
+        "model": "deepseek-v4-flash"
+      }
+    ]
+  },
+  "receipt_parse": {
+    "attempts": [
+      {
+        "model": "deepseek-v4-pro"
+      },
+      {
+        "model": "deepseek-v4-pro",
+        "append_prompt": "\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction.",
+        "skip_for_create": true
+      }
+    ]
+  },
+  "budget_search": {
+    "attempts": [
+      {
+        "model": "deepseek-v4-flash"
+      },
+      {
+        "model": "deepseek-v4-pro"
+      }
+    ]
+  },
+  "statement_parse": {
+    "attempts": [
+      {
+        "model": "deepseek-chat"
+      }
+    ]
+  },
+  "statement_holistic": {
+    "attempts": [
+      {
+        "model": "gemini-3.1-pro"
+      }
+    ]
+  }
+}
