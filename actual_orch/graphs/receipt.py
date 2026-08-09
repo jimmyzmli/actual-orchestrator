@@ -286,7 +286,7 @@ def classify_input_node(state: ReceiptState):
             if not state.get("override_classification"):
                 print(f"Using cached classification data (Redis): [{classification.strip()}]")
         
-        if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
+        if "NOT_RECEIPT" in classification or "INVOICE" in classification:
             print(f"  [Parse] Document classified as {classification}. Skipping completely.")
             return {"classification": classification}
             
@@ -710,7 +710,7 @@ def router_after_classify(state: ReceiptState):
     if state.get("status") == WorkflowStatus.ERROR:
         return "error"
     classification = state.get("classification", "")
-    if "NOT_RECEIPT" in classification or "ORDER_CONFIRMATION" in classification or "INVOICE" in classification:
+    if "NOT_RECEIPT" in classification or "INVOICE" in classification:
         return "skip"
     return "continue"
 
