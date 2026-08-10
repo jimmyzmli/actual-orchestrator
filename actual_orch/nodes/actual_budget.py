@@ -1142,21 +1142,50 @@ async def update_actual_transaction_node(state: dict):
                 # Add new split transaction
                 add_res = await session.call_tool("actual_transactions", {"args": [
                     "add", "--account", tx_data["account"],
+                    "--format", "json",
                     "--data", json.dumps([update_payload])
                 ]})
                 
+                new_tx_id = None
+                
                 try:
-                    added_ids = json.loads(add_res.content[0].text)
-                    if isinstance(added_ids, list) and len(added_ids) > 0:
-                        new_tx_id = added_ids[0]
-                        print(f"[update_actual_transaction] ✅ Successfully converted transaction into a split (Old ID: {tx_id}, New ID: {new_tx_id})")
-                        return {"actual_tx_id": new_tx_id, "replaced_tx_id": tx_id}
+                    if add_res.content:
+                        added_ids = json.loads(add_res.content[0].text)
+                        if isinstance(added_ids, list) and len(added_ids) > 0:
+                            new_tx_id = added_ids[0]
+                    if not new_tx_id:
+                        print(f"[update_actual_transaction][error] ⚠️ Response from add was not a non-empty list: {add_res.content[0].text if add_res.content else 'Empty'}")
                 except Exception as e:
                     print(f"[update_actual_transaction][error] ⚠️ Failed to parse new split transaction ID: {e}")
+                    
+                if not new_tx_id:
+                    print(f"[update_actual_transaction] 🔄 Falling back to querying the new split transaction ID...")
+                    # Fallback to query
+                    filter_obj = {
+                        "account": tx_data["account"],
+                        "date": tx_data["date"]
+                    }
+                    q_res = await session.call_tool("actual_query", {"args": [
+                        "run", "--table", "transactions",
+                        "--filter", json.dumps(filter_obj),
+                        "--select", "id,amount,payee.name,notes,is_child,parent_id",
+                        "--format", "json"
+                    ]})
+                    if q_res.content and len(q_res.content) > 0:
+                        txs = json.loads(q_res.content[0].text)
+                        for t in txs:
+                            if t.get("is_child") and t.get("parent_id") and t.get("notes") and "#receipt" in t["notes"]:
+                                new_tx_id = t["parent_id"]
+                                break
+                                
+                if new_tx_id:
+                    print(f"[update_actual_transaction] ✅ Successfully converted transaction into a split (Old ID: {tx_id}, New ID: {new_tx_id})")
+                    return {"actual_tx_id": new_tx_id, "replaced_tx_id": tx_id}
+                else:
+                    print(f"[update_actual_transaction][error] ❌ Failed to retrieve the new split transaction ID!")
             except Exception as e:
                 print(f"[update_actual_transaction][error] ⚠️ Failed to recreate split transaction: {e}")
             return {}
-
         mcp_tools = await load_mcp_tools(session)
         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
         if tx_tool:
