@@ -1,0 +1,18 @@
+{
+  "classifications": {
+    "RECEIPT": "A document confirming a completed payment, charge, or money transfer. Examples: store receipts, payment confirmations, Interac e-Transfer confirmations, ATM receipts, bank transfer records, money transfer screenshots.",
+    "INVOICE": "A bill or notice showing an amount owed that has NOT been charged or paid yet. Examples: utility bills, tax bills, property tax notices, insurance statements, subscription invoices with a due date.",
+    "ORDER_CONFIRMATION": "An order acknowledgment or shipping notification. Examples: online order confirmations, delivery notifications, booking confirmations.",
+    "SHIPPING_CONFIRMATION": "A shipping confirmation or tracking update. Examples: shipping confirmation, out for delivery, package delivered.",
+    "NOT_RECEIPT": "Anything that is not a financial document. Examples: newsletters, advertisements, general correspondence, account statements with no actionable amount."
+  },
+  "parse_classifications": [
+    "RECEIPT",
+    "ORDER_CONFIRMATION"
+  ],
+  "skip_classifications": [
+    "INVOICE",
+    "SHIPPING_CONFIRMATION",
+    "NOT_RECEIPT"
+  ]
+}

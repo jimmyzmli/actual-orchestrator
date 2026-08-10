@@ -66,6 +66,7 @@ class ReceiptState(TypedDict, total=False):
     flag_create_missing: bool  # True if we should auto-create a transaction on no-match
     classification: str   # The result of the LLM classification (e.g. RECEIPT, INVOICE)
     override_classification: str # Explicit override for classification
+    flag_skip_cache_types: List[str] # Cache types to bypass (e.g. 'ocr', 'classify', 'parsed')
     
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -120,9 +121,12 @@ def extract_ocr_node(state: ReceiptState):
             return {"ocr_text": state["ocr_text"], "image_paths": image_paths}
 
         # Check Redis cache
-        cached = get_ocr(file_path, prefix=prefix)
-        if cached is None and prefix != "receipt_":
-            cached = get_ocr(file_path, prefix="receipt_")
+        cached = None
+        if "ocr" not in state.get("flag_skip_cache_types", []):
+            cached = get_ocr(file_path, prefix=prefix)
+            if cached is None and prefix != "receipt_":
+                cached = get_ocr(file_path, prefix="receipt_")
+        
         if cached is not None:
             print("[extract_ocr][cache] " + "Using cached OCR text (Redis)...")
             return {"ocr_text": cached, "image_paths": image_paths}
@@ -206,9 +210,10 @@ def classify_input_node(state: ReceiptState):
         if classification:
             print(f"[classify_input] Using override classification: [{classification}]")
         else:
-            classification = get_classify(file_path, prefix=prefix)
-            if (not classification or not classification.strip()) and prefix != "receipt_":
-                classification = get_classify(file_path, prefix="receipt_")
+            if "classify" not in state.get("flag_skip_cache_types", []):
+                classification = get_classify(file_path, prefix=prefix)
+                if (not classification or not classification.strip()) and prefix != "receipt_":
+                    classification = get_classify(file_path, prefix="receipt_")
                 
         if not classification or not classification.strip():
             from actual_orch.shared.utils import get_agent_config
@@ -222,20 +227,22 @@ def classify_input_node(state: ReceiptState):
                 max_tokens=64
             )
             
-            system_prompt = (
-                "You are a document classifier. Given raw OCR text, classify the document into EXACTLY one of these categories:\n\n"
-                "RECEIPT - A document confirming a completed payment, charge, or money transfer. "
-                "Examples: store receipts, payment confirmations, Interac e-Transfer confirmations, ATM receipts, bank transfer records, money transfer screenshots.\n\n"
-                "INVOICE - A bill or notice showing an amount owed that has NOT been charged or paid yet. "
-                "Examples: utility bills, tax bills, property tax notices, insurance statements, subscription invoices with a due date.\n\n"
-                "ORDER_CONFIRMATION - An order acknowledgment or shipping notification. "
-                "Examples: online order confirmations, delivery notifications, booking confirmations.\n\n"
-                "SHIPPING_CONFIRMATION - A shipping confirmation or tracking update. "
-                "Examples: shipping confirmation, out for delivery, package delivered.\n\n"
-                "NOT_RECEIPT - Anything that is not a financial document. "
-                "Examples: newsletters, advertisements, general correspondence, account statements with no actionable amount.\n\n"
-                "Respond with EXACTLY one of: RECEIPT, INVOICE, ORDER_CONFIRMATION, SHIPPING_CONFIRMATION, or NOT_RECEIPT. Do not explain."
-            )
+            config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+            classifications = {}
+            if os.path.exists(config_path_class):
+                with open(config_path_class, "r") as f:
+                    class_data = json.load(f)
+                    classifications = class_data.get("classifications", {})
+            else:
+                print(f"[classify_input][error] Missing {config_path_class}")
+            
+            system_prompt = "You are a document classifier. Given raw OCR text, classify the document into EXACTLY one of these categories:\n\n"
+            for k, v in classifications.items():
+                system_prompt += f"{k} - {v}\n\n"
+            
+            class_list = list(classifications.keys())
+            class_str = ", ".join(class_list[:-1]) + f", or {class_list[-1]}" if len(class_list) > 1 else (class_list[0] if class_list else "")
+            system_prompt += f"Respond with EXACTLY one of: {class_str}. Do not explain."
             
             client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
             try:
@@ -288,7 +295,14 @@ def classify_input_node(state: ReceiptState):
             if not state.get("override_classification"):
                 print(f"[classify_input][cache] Using cached classification data (Redis): [{classification.strip()}]")
         
-        if "NOT_RECEIPT" in classification or "INVOICE" in classification:
+        config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+        skip_classes = ["NOT_RECEIPT", "INVOICE", "SHIPPING_CONFIRMATION"]
+        if os.path.exists(config_path_class):
+            with open(config_path_class, "r") as f:
+                class_data = json.load(f)
+                skip_classes = class_data.get("skip_classifications", skip_classes)
+                
+        if any(skip_cls in classification for skip_cls in skip_classes):
             print(f"[classify_input][skip]   Document classified as {classification}. Skipping completely.")
             return {"classification": classification}
             
@@ -296,9 +310,11 @@ def classify_input_node(state: ReceiptState):
 
         parsed_data = state.get("parsed_data")
         if not parsed_data:
-            cached_parsed = get_parsed(file_path, prefix=prefix)
-            if cached_parsed is None and prefix != "receipt_":
-                cached_parsed = get_parsed(file_path, prefix="receipt_")
+            cached_parsed = None
+            if "parsed" not in state.get("flag_skip_cache_types", []):
+                cached_parsed = get_parsed(file_path, prefix=prefix)
+                if cached_parsed is None and prefix != "receipt_":
+                    cached_parsed = get_parsed(file_path, prefix="receipt_")
             parsed_data = cached_parsed
             
         if parsed_data and parsed_data.get("date"):
@@ -338,9 +354,12 @@ async def parse_receipt_node(state: ReceiptState):
         parsed_dict = None
         model_name = None
         if parse_retries == 0 or all_models_exhausted:
-            cached = get_parsed(file_path, prefix=prefix)
-            if cached is None and prefix != "receipt_":
-                cached = get_parsed(file_path, prefix="receipt_")
+            cached = None
+            if "parsed" not in state.get("flag_skip_cache_types", []):
+                cached = get_parsed(file_path, prefix=prefix)
+                if cached is None and prefix != "receipt_":
+                    cached = get_parsed(file_path, prefix="receipt_")
+                    
             if cached is not None:
                 if all_models_exhausted:
                     print("[parse_receipt][cache] " + "All models exhausted, using cached parsed data (Redis) as fallback...")
@@ -713,7 +732,14 @@ def router_after_classify(state: ReceiptState):
     if state.get("status") == WorkflowStatus.ERROR:
         return "error"
     classification = state.get("classification", "")
-    if "NOT_RECEIPT" in classification or "INVOICE" in classification:
+    config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+    skip_classes = ["NOT_RECEIPT", "INVOICE", "SHIPPING_CONFIRMATION"]
+    if os.path.exists(config_path_class):
+        with open(config_path_class, "r") as f:
+            class_data = json.load(f)
+            skip_classes = class_data.get("skip_classifications", skip_classes)
+            
+    if any(skip_cls in classification for skip_cls in skip_classes):
         return "skip"
     return "continue"
 
