@@ -124,10 +124,10 @@ def extract_ocr_node(state: ReceiptState):
         if cached is None and prefix != "receipt_":
             cached = get_ocr(file_path, prefix="receipt_")
         if cached is not None:
-            print("Using cached OCR text (Redis)...")
+            print("[extract_ocr][cache] " + "Using cached OCR text (Redis)...")
             return {"ocr_text": cached, "image_paths": image_paths}
 
-        print(f"Extracting OCR with Gemini Vision for {file_path}...")
+        print(f"[extract_ocr] Extracting OCR with Gemini Vision for {file_path}...")
         
         # Respect Gemini's 15 Requests Per Minute (RPM) free tier rate limit
         import time
@@ -164,10 +164,10 @@ def extract_ocr_node(state: ReceiptState):
         ]
         
         if state.get("flag_log_agent"):
-            print(f"\n--- AGENT PROMPT (gemini-3.1-flash-lite) ---")
-            print("Extract all the text from this receipt accurately, line by line. Output ONLY the raw text without any markdown formatting or extra commentary.")
-            print(f"[{len(image_paths)} images attached]")
-            print("---------------------------------------\n")
+            print(f"\n[extract_ocr][agent] --- AGENT PROMPT (gemini-3.1-flash-lite) ---")
+            print("[extract_ocr] " + "Extract all the text from this receipt accurately, line by line. Output ONLY the raw text without any markdown formatting or extra commentary.")
+            print(f"[extract_ocr] [{len(image_paths)} images attached]")
+            print("[extract_ocr] " + "---------------------------------------\n")
         
         result = llm.invoke(messages)
         ocr_text = result.content
@@ -177,9 +177,9 @@ def extract_ocr_node(state: ReceiptState):
             ocr_text = str(ocr_text)
             
         if state.get("flag_log_agent"):
-            print(f"\n--- AGENT RESPONSE (gemini-3.1-flash-lite) ---")
-            print(ocr_text)
-            print("---------------------------------------\n")
+            print(f"\n[extract_ocr][agent] --- AGENT RESPONSE (gemini-3.1-flash-lite) ---")
+            print(f"[extract_ocr] {ocr_text}")
+            print("[extract_ocr] " + "---------------------------------------\n")
             
         meta = {
             "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -204,7 +204,7 @@ def classify_input_node(state: ReceiptState):
         classification = state.get("override_classification")
         
         if classification:
-            print(f"Using override classification: [{classification}]")
+            print(f"[classify_input] Using override classification: [{classification}]")
         else:
             classification = get_classify(file_path, prefix=prefix)
             if (not classification or not classification.strip()) and prefix != "receipt_":
@@ -230,9 +230,11 @@ def classify_input_node(state: ReceiptState):
                 "Examples: utility bills, tax bills, property tax notices, insurance statements, subscription invoices with a due date.\n\n"
                 "ORDER_CONFIRMATION - An order acknowledgment or shipping notification. "
                 "Examples: online order confirmations, delivery notifications, booking confirmations.\n\n"
+                "SHIPPING_CONFIRMATION - A shipping confirmation or tracking update. "
+                "Examples: shipping confirmation, out for delivery, package delivered.\n\n"
                 "NOT_RECEIPT - Anything that is not a financial document. "
                 "Examples: newsletters, advertisements, general correspondence, account statements with no actionable amount.\n\n"
-                "Respond with EXACTLY one of: RECEIPT, INVOICE, ORDER_CONFIRMATION, or NOT_RECEIPT. Do not explain."
+                "Respond with EXACTLY one of: RECEIPT, INVOICE, ORDER_CONFIRMATION, SHIPPING_CONFIRMATION, or NOT_RECEIPT. Do not explain."
             )
             
             client_ctx = "\n\nCLIENT CONTEXT:\nThe client lives in Toronto, Ontario and mainly uses CAD."
@@ -244,7 +246,7 @@ def classify_input_node(state: ReceiptState):
                     if config_data.get("AGENT_USER_CONTEXT"):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
             except Exception as e:
-                print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
+                print(f"[classify_input][error]   ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
             from actual_orch.shared.utils import get_receipt_type
             if get_receipt_type(state.get("source")) == "email":
                 email_ctx = state.get("email_context", "")
@@ -261,20 +263,20 @@ def classify_input_node(state: ReceiptState):
             classify_chain = classify_prompt | llm
             
             prompt_val = classify_prompt.format_prompt(ocr_text=state["ocr_text"])
-            print(f"  [Token Est] Classify prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+            print(f"[classify_input][agent]  Classify prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
             
             if state.get("flag_log_agent"):
-                print(f"\n--- AGENT PROMPT (deepseek-v4-flash) ---")
-                print(prompt_val.to_string())
-                print("---------------------------------------\n")
+                print(f"\n[classify_input][agent] --- AGENT PROMPT (deepseek-v4-flash) ---")
+                print(f"[classify_input] {prompt_val.to_string()}")
+                print("[classify_input] " + "---------------------------------------\n")
             
             classify_result = classify_chain.invoke({"ocr_text": state["ocr_text"]})
             classification = classify_result.content.strip().upper()
             
             if state.get("flag_log_agent"):
-                print(f"\n--- AGENT RESPONSE (deepseek-v4-flash) ---")
-                print(classification)
-                print("---------------------------------------\n")
+                print(f"\n[classify_input][agent] --- AGENT RESPONSE (deepseek-v4-flash) ---")
+                print(f"[classify_input] {classification}")
+                print("[classify_input] " + "---------------------------------------\n")
             
             meta = {
                 "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -284,10 +286,10 @@ def classify_input_node(state: ReceiptState):
             set_classify(file_path, classification, meta, prefix=prefix)
         else:
             if not state.get("override_classification"):
-                print(f"Using cached classification data (Redis): [{classification.strip()}]")
+                print(f"[classify_input][cache] Using cached classification data (Redis): [{classification.strip()}]")
         
         if "NOT_RECEIPT" in classification or "INVOICE" in classification:
-            print(f"  [Parse] Document classified as {classification}. Skipping completely.")
+            print(f"[classify_input][skip]   Document classified as {classification}. Skipping completely.")
             return {"classification": classification}
             
         is_future_date = False
@@ -308,9 +310,10 @@ def classify_input_node(state: ReceiptState):
                 pass
                 
         if is_future_date:
-            print(f"  ⏭️  Skipped {state.get('source_ref')}: Receipt date is in the future. (Classified as: {classification})")
+            print(f"[classify_input][skip]   ⏭️  Skipped {state.get('source_ref')}: Receipt date is in the future. (Classified as: {classification})")
             return {"classification": classification}
             
+        print(f"[classify_input]   Document classified as: {classification}")
         return {"classification": classification}
     except Exception as e:
         return {"status": WorkflowStatus.ERROR, "error": f"Classification failed: {str(e)}"}
@@ -340,15 +343,15 @@ async def parse_receipt_node(state: ReceiptState):
                 cached = get_parsed(file_path, prefix="receipt_")
             if cached is not None:
                 if all_models_exhausted:
-                    print("All models exhausted, using cached parsed data (Redis) as fallback...")
+                    print("[parse_receipt][cache] " + "All models exhausted, using cached parsed data (Redis) as fallback...")
                 else:
-                    print("Using cached parsed data (Redis)...")
+                    print("[parse_receipt][cache] " + "Using cached parsed data (Redis)...")
                 parsed_dict = cached
 
         if parsed_dict is None:
             current_attempt = attempts_config[min(parse_retries, max_attempts - 1)] if attempts_config else {"model": "deepseek-v4-pro"}
             model_name = current_attempt.get("model", "deepseek-v4-pro")
-            print(f"Parsing receipt with {model_name} (retry {parse_retries})...")
+            print(f"[parse_receipt] Parsing receipt with {model_name} (retry {parse_retries})...")
             
             llm = ChatOpenAI(
                 model=model_name, 
@@ -395,7 +398,7 @@ async def parse_receipt_node(state: ReceiptState):
                     if config_data.get("AGENT_USER_CONTEXT"):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
             except Exception as e:
-                print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
+                print(f"[parse_receipt][error]   ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
             if source_type == "email":
                 email_ctx = state.get("email_context", "")
                 if state.get('email_date'):
@@ -432,7 +435,7 @@ async def parse_receipt_node(state: ReceiptState):
                             all_accounts_json = json.dumps(all_account_names).replace("{", "{{").replace("}", "}}")
                             system_prompt += f"\n\nTRANSFER ACCOUNTS:\nIf a proposed transaction is actually a transfer of money to another account (e.g., an e-transfer to yourself is a transfer to another chequing account, an Uber redemption is a transfer to the Credits account), omit the 'category' field and instead provide 'transfer_account' matching EXACTLY one of these account names: {all_accounts_json}"
                         except Exception as json_e:
-                            print(f"  ⚠️ Failed to parse accounts JSON: {json_e}")
+                            print(f"[parse_receipt][error]   ⚠️ Failed to parse accounts JSON: {json_e}")
                     
                     categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
                     if os.path.exists(categories_path):
@@ -446,7 +449,7 @@ async def parse_receipt_node(state: ReceiptState):
                                 income_json = json.dumps(income_categories).replace("{", "{{").replace("}", "}}") if income_categories else "[]"
                                 system_prompt += f"\n\nCATEGORY SELECTION:\nEach proposed_transaction must have a 'category' (unless it's a transfer). Pick from these expense categories: {expense_json}\nFor deposits, refunds, credits, or points redemptions (negative amounts), use one of these income categories instead: {income_json}\nIf unsure, pick the most generic expense category."
                 except Exception as e:
-                    print(f"  ⚠️ Failed to load on-budget accounts for prompt: {e}")
+                    print(f"[parse_receipt][error]   ⚠️ Failed to load on-budget accounts for prompt: {e}")
 
             if current_attempt.get("append_prompt"):
                 prev_date = state.get("parsed_data", {}).get("date", "unknown")
@@ -460,12 +463,12 @@ async def parse_receipt_node(state: ReceiptState):
             
             todays_date = datetime.date.today().isoformat()
             prompt_val = prompt.format_prompt(source_desc=source_desc, ocr_text=state["ocr_text"], todays_date=todays_date)
-            print(f"  [Token Est] Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
+            print(f"[parse_receipt][agent]  Extract prompt: ~{estimate_tokens(prompt_val.to_string())} tokens")
             
             if state.get("flag_log_agent"):
-                print(f"\n--- AGENT PROMPT ({model_name}) ---")
-                print(prompt_val.to_string())
-                print("---------------------------------------\n")
+                print(f"\n[parse_receipt][agent] --- AGENT PROMPT ({model_name}) ---")
+                print(f"[parse_receipt] {prompt_val.to_string()}")
+                print("[parse_receipt] " + "---------------------------------------\n")
 
             try:
                 import time
@@ -487,10 +490,10 @@ async def parse_receipt_node(state: ReceiptState):
                 parsed_dict = result.dict()
                 
                 if state.get("flag_log_agent"):
-                    print(f"\n--- AGENT RESPONSE ({model_name}) ---")
-                    print(json.dumps(parsed_dict, indent=2))
-                    print(f"[Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
-                    print("---------------------------------------\n")
+                    print(f"\n[parse_receipt][agent] --- AGENT RESPONSE ({model_name}) ---")
+                    print(f"[parse_receipt] {json.dumps(parsed_dict, indent=2)}")
+                    print(f"[parse_receipt] [Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
+                    print("[parse_receipt] " + "---------------------------------------\n")
             except Exception as e:
                 error_msg = str(e)
                 try:
@@ -512,7 +515,7 @@ async def parse_receipt_node(state: ReceiptState):
                 except Exception:
                     pass
 
-                print(f"  ❌ Parsing failed: {error_msg}. Flagging for review.")
+                print(f"[parse_receipt][error]   ❌ Parsing failed: {error_msg}. Flagging for review.")
                 llm_out = getattr(e, "llm_output", None)
                 if not llm_out and "from completion " in str(e):
                     import re
@@ -526,9 +529,9 @@ async def parse_receipt_node(state: ReceiptState):
                     try:
                         parsed_out = json.loads(llm_out)
                         llm_out_fmt = json.dumps(parsed_out, indent=2)
-                        print(f"  Agent response was:\n{llm_out_fmt}")
+                        print(f"[parse_receipt][agent]   Agent response was:\n{llm_out_fmt}")
                     except Exception:
-                        print(f"  Agent response was:\n{llm_out}")
+                        print(f"[parse_receipt][agent]   Agent response was:\n{llm_out}")
 
                 agent_attempts.append({
                     "node": "receipt_parse", 
@@ -550,12 +553,12 @@ async def parse_receipt_node(state: ReceiptState):
                     if parsed_dict.get("date"):
                         parsed_dt = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d")
                         if (email_dt - parsed_dt).days > 3:
-                            print(f"  [Date] Overriding parsed date {parsed_dict['date']} with email date {state['email_date']} (>3 days older)")
+                            print(f"[parse_receipt]  Overriding parsed date {parsed_dict['date']} with email date {state['email_date']} (>3 days older)")
                             parsed_dict["date"] = state["email_date"]
                     else:
                         parsed_dict["date"] = state["email_date"]
                 except Exception as e:
-                    print(f"  ⚠️ Could not compare dates for override: {e}")
+                    print(f"[parse_receipt][error]   ⚠️ Could not compare dates for override: {e}")
         
         # Validate proposed_transactions — each must have amount, notes, category_id
         parsed_pts = parsed_dict.get("proposed_transactions") or []
@@ -572,9 +575,9 @@ async def parse_receipt_node(state: ReceiptState):
         for i, pt in enumerate(parsed_pts):
             missing = [f for f in ("amount", "notes") if not pt.get(f) and pt.get(f) != 0]
             if missing:
-                print(f"  ⚠️ proposed_transaction[{i}] missing fields: {missing} — {pt}")
+                print(f"[parse_receipt][error]   ⚠️ proposed_transaction[{i}] missing fields: {missing} — {pt}")
             if not pt.get("category") and not pt.get("transfer_account"):
-                print(f"  ⚠️ proposed_transaction[{i}] missing both category and transfer_account — {pt}")
+                print(f"[parse_receipt][error]   ⚠️ proposed_transaction[{i}] missing both category and transfer_account — {pt}")
         
         # Calculate total from sum of proposed transaction amounts (in receipt currency)
         receipt_total = sum(pt.get("amount", 0.0) for pt in parsed_pts)
@@ -597,11 +600,11 @@ async def parse_receipt_node(state: ReceiptState):
                     price, _ = get_price(currency, parsed_dict.get("date"))
                     if price:
                         parsed_dict["total"] = round(receipt_total * price, 2)
-                        print(f"  [Forex] Converted {receipt_total} {currency} to approx {parsed_dict['total']} CAD")
+                        print(f"[parse_receipt]  Converted {receipt_total} {currency} to approx {parsed_dict['total']} CAD")
                     else:
                         parsed_dict["total"] = receipt_total
                 except Exception as e:
-                    print(f"  ⚠️ Could not convert foreign amount to CAD: {e}")
+                    print(f"[parse_receipt][error]   ⚠️ Could not convert foreign amount to CAD: {e}")
                     parsed_dict["total"] = receipt_total
             else:
                 parsed_dict["total"] = receipt_total
@@ -621,12 +624,12 @@ async def parse_receipt_node(state: ReceiptState):
                 if datetime.date.today() < parsed_date:
                     from actual_orch.shared.utils import get_receipt_type
                     if get_receipt_type(state.get("source")) == "email" and state.get("email_date"):
-                        print(f"  ⚠️ Parsed date {parsed_date} is in the future. Falling back to email date {state['email_date']}.")
+                        print(f"[parse_receipt][error]   ⚠️ Parsed date {parsed_date} is in the future. Falling back to email date {state['email_date']}.")
                         parsed_dict["date"] = state["email_date"]
                         for pt in proposed_list:
                             pt["date"] = state["email_date"]
                     else:
-                        print(f"  ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
+                        print(f"[parse_receipt][error]   ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
                         return {"status": WorkflowStatus.ERROR, "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
             except Exception:
                 pass
@@ -665,7 +668,7 @@ async def parse_receipt_node(state: ReceiptState):
                             if acct_match:
                                 account_name = acct_match.get("name", account_key)
             except Exception as e:
-                print(f"  ⚠️ Failed to resolve account name: {e}")
+                print(f"[parse_receipt][error]   ⚠️ Failed to resolve account name: {e}")
                 
         for pt in parsed_pts:
             p = {

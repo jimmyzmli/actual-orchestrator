@@ -45,14 +45,12 @@ class ActualMCPClient:
         last_error = None
         for attempt in range(1, self.MAX_RETRIES + 1):
             try:
-                print(f"🚀 Connecting to Actual Budget MCP server via StreamableHTTP at {mcp_endpoint}... (attempt {attempt}/{self.MAX_RETRIES})")
                 ctx = streamablehttp_client(mcp_endpoint, timeout=60.0)
                 read, write, _ = await self.stack.enter_async_context(ctx)
 
                 session_ctx = ClientSession(read, write)
                 self.session = await self.stack.enter_async_context(session_ctx)
                 await self.session.initialize()
-                print("✅ MCP session established")
                 return
             except Exception as e:
                 last_error = e

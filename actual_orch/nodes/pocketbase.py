@@ -160,7 +160,7 @@ def update_replaced_tx_id(replaced_tx_id, new_tx_id):
 def save_pocketbase_node(state: dict):
     """Save the receipt and items to PocketBase"""
     try:
-        print("Saving to PocketBase...")
+        print("[save_pocketbase] " + "Saving to PocketBase...")
 
         parsed = state.get("parsed_data")
         tx_id = state.get("actual_tx_id")
@@ -205,7 +205,7 @@ def save_pocketbase_node(state: dict):
                     try:
                         os.remove(path)
                     except Exception as e:
-                        print(f"Warning: Failed to clean up {path}: {e}")
+                        print(f"[save_pocketbase][error] Warning: Failed to clean up {path}: {e}")
                         
         return {"status": "success"}
     except Exception as e:

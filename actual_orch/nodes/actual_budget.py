@@ -207,7 +207,7 @@ async def search_deterministic_node(state: dict):
     Node 1: Deterministic matching and tiebreaker.
     """
     try:
-        print("Matching transaction in Actual Budget (Deterministic)...")
+        print("[search_deterministic] " + "Matching transaction in Actual Budget (Deterministic)...")
         parsed = state.get("parsed_data")
         if not parsed:
             return {"status": "error", "error": "No parsed data found"}
@@ -241,7 +241,7 @@ async def search_deterministic_node(state: dict):
         
         candidates = await get_actual_candidates(session, date)
         if not candidates:
-            print("  No candidates found in date range, falling through to agent...")
+            print("[search_deterministic] " + "  No candidates found in date range, falling through to agent...")
             return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
             
         # Score and filter
@@ -253,7 +253,7 @@ async def search_deterministic_node(state: dict):
         scored.sort(key=lambda x: x["match_score"], reverse=True)
         
         if not scored:
-            print("  All candidates already tagged or none valid, falling through to agent...")
+            print("[search_deterministic] " + "  All candidates already tagged or none valid, falling through to agent...")
             return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
             
         top = scored[0]
@@ -262,10 +262,10 @@ async def search_deterministic_node(state: dict):
         
         if top_score >= SCORE_AUTO_ACCEPT:
             final_id = top["id"]
-            print(f"✅ Auto-matched (score {top_score:.3f}): {final_id}")
+            print(f"[search_deterministic] ✅ Auto-matched (score {top_score:.3f}): {final_id}")
             print_matched_transaction(top)
         else:
-            print(f"  No candidate scored ≥ {SCORE_AUTO_ACCEPT}, falling through to agent...")
+            print(f"[search_deterministic]   No candidate scored ≥ {SCORE_AUTO_ACCEPT}, falling through to agent...")
             
         # Validate deterministic match
         if final_id != "unknown_id":
@@ -305,7 +305,7 @@ async def search_agent_node(state: dict):
     Node 2: Agent fallback. Runs when deterministic matching fails.
     """
     try:
-        print("  🔄 Falling back to LLM structured selection (Agent Node)...")
+        print("[search_agent] " + "  🔄 Falling back to LLM structured selection (Agent Node)...")
         parsed = state.get("parsed_data")
         if not parsed:
             return {"status": "error", "error": "No parsed data found"}
@@ -338,9 +338,9 @@ async def search_agent_node(state: dict):
                         if receipts:
                             previously_attached_receipts_map[cid] = receipts
                     except Exception as e:
-                        print(f"  ⚠️ Warning: Failed to fetch receipts for candidate {cid}: {e}")
+                        print(f"[search_agent][error]   ⚠️ Warning: Failed to fetch receipts for candidate {cid}: {e}")
             except Exception as e:
-                print(f"  ⚠️ Warning: Could not import or use pocketbase client: {e}")
+                print(f"[search_agent][error]   ⚠️ Warning: Could not import or use pocketbase client: {e}")
         
         narrowed_candidates = []
         entries_by_id = {}
@@ -495,9 +495,9 @@ async def search_agent_node(state: dict):
             return True
 
         if not structured_candidates:
-            print("  ❌ No candidates available for agent to search. Failing immediately.")
+            print("[search_agent][error] " + "  ❌ No candidates available for agent to search. Failing immediately.")
             if not already_retried and should_retry_parse():
-                print(f"  ❌ Matching failed completely. Triggering parse_receipt retry...")
+                print(f"[search_agent][error]   ❌ Matching failed completely. Triggering parse_receipt retry...")
                 return {
                     "agent_attempts": agent_attempts + [{"node": "search_agent", "model": "search_agent", "success": False, "error": "No candidates"}],
                     "status": "retry_parse",
@@ -505,9 +505,9 @@ async def search_agent_node(state: dict):
                 }
             else:
                 if not already_retried:
-                    print(f"  ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
+                    print(f"[search_agent][error]   ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
                 else:
-                    print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
+                    print(f"[search_agent][error]   ❌ Matching failed completely after retry. Routing to human approval.")
                 return {
                     "agent_attempts": agent_attempts + [{"node": "search_agent", "model": "search_agent", "success": False, "error": "No candidates"}],
                     "status": "human_approval", 
@@ -519,7 +519,7 @@ async def search_agent_node(state: dict):
         current_attempt = search_attempts_cfg[min(len(search_attempts), len(search_attempts_cfg) - 1)] if search_attempts_cfg else {}
         model_name = current_attempt.get("model", "deepseek-v4-pro" if already_retried else "deepseek-v4-flash")
         
-        print(f"  🔄 Retrying match with model ({model_name})...")
+        print(f"[search_agent]   🔄 Retrying match with model ({model_name})...")
         
         # Prepare receipt details for the prompt
         parsed_prompt = dict(parsed)
@@ -547,7 +547,7 @@ async def search_agent_node(state: dict):
                 else:
                     parsed_prompt["account"] = strip_emojis(account_key)
             except Exception as e:
-                print(f"  ⚠️ Failed to translate account_key: {e}")
+                print(f"[search_agent][error]   ⚠️ Failed to translate account_key: {e}")
                 parsed_prompt["account"] = strip_emojis(account_key)
 
         from actual_orch.shared.utils import get_receipt_type
@@ -562,7 +562,7 @@ async def search_agent_node(state: dict):
                 if config_data.get("AGENT_USER_CONTEXT"):
                     parsed_prompt["AGENT_USER_CONTEXT"] = config_data["AGENT_USER_CONTEXT"]
         except Exception as e:
-            print(f"  ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
+            print(f"[search_agent][error]   ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
 
         prompt_text = f"""You are a financial matching assistant.
 
@@ -593,9 +593,9 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode", include_raw=True)
         
         if state.get("flag_log_agent"):
-            print(f"\n--- AGENT PROMPT ({model_name}) ---")
-            print(prompt_text)
-            print("---------------------------------------\n")
+            print(f"\n[search_agent][agent] --- AGENT PROMPT ({model_name}) ---")
+            print(f"[search_agent] {prompt_text}")
+            print("[search_agent] " + "---------------------------------------\n")
             
         final_id = "unknown_id"
         result = None
@@ -615,19 +615,19 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                 completion_tokens = raw_msg.usage_metadata.get("output_tokens")
             
             if state.get("flag_log_agent"):
-                print(f"\n--- AGENT RESPONSE ({model_name}) ---")
-                print(result.dict() if result else None)
-                print(f"[Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
-                print("---------------------------------------\n")
+                print(f"\n[search_agent][agent] --- AGENT RESPONSE ({model_name}) ---")
+                print(f"[search_agent] {result.dict() if result else None}")
+                print(f"[search_agent] [Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
+                print("[search_agent] " + "---------------------------------------\n")
                 
             if result.matched_id:
                 final_id = result.matched_id
-                print(f"Agent matched tx: {final_id} with {model_name}")
+                print(f"[search_agent] Agent matched tx: {final_id} with {model_name}")
                 # Validate case-insensitively and use the exact casing from the candidate list
                 matched = next((c for c in clean_candidates if c["id"].lower() == final_id.lower()), None)
                 if matched:
                     final_id = matched["id"]
-                    print(f"✅ Agent selected valid candidate: {final_id}")
+                    print(f"[search_agent] ✅ Agent selected valid candidate: {final_id}")
                     print_matched_transaction(matched)
                     
                     # Validate amount (clean_candidates has amount in cents)
@@ -635,7 +635,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                     min_allowed = receipt_cents * 0.90
                     max_allowed = receipt_cents * 1.30
                     if getattr(result, "updated_amount", None) is not None:
-                        print(f"  Agent updating amount to ${result.updated_amount:.2f} (original: ${actual_amt/100:.2f})")
+                        print(f"[search_agent]   Agent updating amount to ${result.updated_amount:.2f} (original: ${actual_amt/100:.2f})")
                     elif not (min_allowed <= actual_amt <= max_allowed):
                         print(f"❌ VALIDATION FAILED: Agent amount ${actual_amt/100:.2f} "
                               f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
@@ -647,23 +647,23 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                             rd = datetime.strptime(date, "%Y-%m-%d")
                             cd = datetime.strptime(matched.get("date"), "%Y-%m-%d")
                             if abs((rd - cd).days) > 1:
-                                print(f"❌ VALIDATION FAILED: Agent date {matched.get('date')} "
+                                print(f"[search_agent][error] ❌ VALIDATION FAILED: Agent date {matched.get('date')} "
                                       f"is >1 days from receipt {date}. Rejecting.")
                                 final_id = "unknown_id"
                         except Exception:
                             pass
                 else:
-                    print(f"❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the candidates.")
+                    print(f"[search_agent][error] ❌ VALIDATION FAILED: Agent claimed to find tx {final_id}, but it was not in the candidates.")
                     final_id = "unknown_id"
             else:
-                print(f"Agent ({model_name}) output didn't contain matched_id")
+                print(f"[search_agent] Agent ({model_name}) output didn't contain matched_id")
                 final_id = "unknown_id"
         except Exception as e:
-            print(f"Warning: Failed to parse structured output from {model_name}: {e}")
+            print(f"[search_agent][error] Warning: Failed to parse structured output from {model_name}: {e}")
             final_id = "unknown_id"
 
         if final_id == "unknown_id" or not result:
-            print(f"  ❌ Agent failed to match with any candidate.")
+            print(f"[search_agent][error]   ❌ Agent failed to match with any candidate.")
             attempt_log = {
                 "node": "search_agent", 
                 "model": model_name, 
@@ -674,7 +674,7 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                 "response_time_ms": response_time_ms
             }
             if not already_retried and should_retry_parse():
-                print(f"  ❌ Triggering parse_receipt retry...")
+                print(f"[search_agent][error]   ❌ Triggering parse_receipt retry...")
                 return {
                     "agent_attempts": agent_attempts + [attempt_log],
                     "status": "retry_parse",
@@ -682,9 +682,9 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                 }
             else:
                 if not already_retried:
-                    print(f"  ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
+                    print(f"[search_agent][error]   ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
                 else:
-                    print(f"  ❌ Matching failed completely after retry. Routing to human approval.")
+                    print(f"[search_agent][error]   ❌ Matching failed completely after retry. Routing to human approval.")
                 return {
                     "agent_attempts": agent_attempts + [attempt_log],
                     "status": "human_approval", 
@@ -735,7 +735,7 @@ async def save_actual_transaction_node(state: dict):
         return {}
         
     try:
-        print("  ➕ Auto-creating missing transaction (save_actual_transaction_node)...")
+        print("[save_actual_transaction] " + "  ➕ Auto-creating missing transaction (save_actual_transaction_node)...")
         parsed = state.get("parsed_data")
         if not parsed:
             return {"status": "error", "error": "No parsed data found for auto-creation"}
@@ -761,16 +761,16 @@ async def save_actual_transaction_node(state: dict):
                 mapping = json.load(f)
                 
         if not mapping:
-            print("  ⚠️ account-mapping.json not found or empty.")
+            print("[save_actual_transaction][error] " + "  ⚠️ account-mapping.json not found or empty.")
             return {"status": "human_approval"}
             
         selected_key = parsed.get("account_key")
         if not selected_key or selected_key not in mapping:
-            print(f"  ⚠️ Parsed account key '{selected_key}' is invalid or missing. Falling back to human approval.")
+            print(f"[save_actual_transaction][error]   ⚠️ Parsed account key '{selected_key}' is invalid or missing. Falling back to human approval.")
             return {"status": "human_approval"}
             
         account_id = mapping[selected_key]
-        print(f"  ✅ Extracted account key '{selected_key}' -> {account_id}")
+        print(f"[save_actual_transaction]   ✅ Extracted account key '{selected_key}' -> {account_id}")
             
         session = await ActualMCPClient.get_session()
         
@@ -799,7 +799,7 @@ async def save_actual_transaction_node(state: dict):
             all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
             all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
         except Exception as e:
-            print(f"  ⚠️ Failed to fetch accounts or payees for transfer resolution: {e}")
+            print(f"[save_actual_transaction][error]   ⚠️ Failed to fetch accounts or payees for transfer resolution: {e}")
             all_accounts = []
             all_payees = []
 
@@ -820,7 +820,7 @@ async def save_actual_transaction_node(state: dict):
             return None
         
         if len(proposed_txs) > 1:
-            print("  ➕ Detected multiple proposed transactions. Creating split transaction...")
+            print("[save_actual_transaction] " + "  ➕ Detected multiple proposed transactions. Creating split transaction...")
             new_tx = {
                 "date": date,
                 "amount": expense_cents,
@@ -883,7 +883,7 @@ async def save_actual_transaction_node(state: dict):
                 "--run-transfers",
                 "--data", json.dumps([new_tx])
             ]})
-            print(f"  ✅ Created transaction for {payee} on {date} for {amount}")
+            print(f"[save_actual_transaction]   ✅ Created transaction for {payee} on {date} for {amount}")
             
             # Query back the ID
             filter_obj = {
@@ -902,7 +902,7 @@ async def save_actual_transaction_node(state: dict):
                     # 1. Try to find the exact parent transaction match (for single/normal tx)
                     for tx in txs:
                         if not tx.get("is_child") and tx.get("amount") == expense_cents and tx.get("notes") and "#receipt" in tx["notes"]:
-                            print(f"  ✅ Retrieved new transaction ID: {tx['id']}")
+                            print(f"[save_actual_transaction]   ✅ Retrieved new transaction ID: {tx['id']}")
                             return {"actual_tx_id": tx["id"], "actual_tx_id_transfer": tx.get("transfer_id"), "status": "continue"}
                             
                     # 2. Try to find a child transaction match (for split tx)
@@ -911,7 +911,7 @@ async def save_actual_transaction_node(state: dict):
                             # Match if payee is the same and amount matches one of the subtransactions
                             sub_amounts = [int(round(-pt.get("amount", 0.0) * 100)) for pt in proposed_txs]
                             if (payee and tx.get("payee.name") == payee) or (tx.get("amount") in sub_amounts):
-                                print(f"  ✅ Retrieved new split transaction parent ID: {tx['parent_id']}")
+                                print(f"[save_actual_transaction]   ✅ Retrieved new split transaction parent ID: {tx['parent_id']}")
                                 # A split sub-transaction might be a transfer, but Actual maps transfer_id on the child. We need to query parent or just pass child transfer_id if present.
                                 # Since Pocketbase maps to parent, we'll try to find any transfer_id in siblings.
                                 transfer_id = None
@@ -930,10 +930,10 @@ async def save_actual_transaction_node(state: dict):
                             if sibling.get("parent_id") == fallback_id and sibling.get("transfer_id"):
                                 transfer_id = sibling.get("transfer_id")
                                 break
-                    print(f"  ✅ Retrieved new transaction ID (fallback): {fallback_id}")
+                    print(f"[save_actual_transaction]   ✅ Retrieved new transaction ID (fallback): {fallback_id}")
                     return {"actual_tx_id": fallback_id, "actual_tx_id_transfer": transfer_id, "status": "continue"}
             
-            print("  ⚠️ Created transaction but couldn't query its ID. PocketBase won't have the ID.")
+            print("[save_actual_transaction][error] " + "  ⚠️ Created transaction but couldn't query its ID. PocketBase won't have the ID.")
             return {"actual_tx_id": "unknown_id", "status": "continue"}
             
     except Exception as e:
@@ -948,7 +948,7 @@ async def update_actual_transaction_node(state: dict):
         return {}
 
     try:
-        print(f"Tagging transaction {tx_id} with #receipt...")
+        print(f"[update_actual_transaction] Tagging transaction {tx_id} with #receipt...")
         session = await ActualMCPClient.get_session()
         
         # Fetch the transaction to get its current notes and full data
@@ -967,10 +967,10 @@ async def update_actual_transaction_node(state: dict):
                     tx_data = query_data[0]
                     existing_notes = tx_data.get("notes") or ""
                     if tx_data.get("is_child"):
-                        print(f"Matched child transaction {tx_id} (parent: {tx_data.get('parent_id')}). Tagging child directly.")
+                        print(f"[update_actual_transaction] Matched child transaction {tx_id} (parent: {tx_data.get('parent_id')}). Tagging child directly.")
                 # else: tx_id is a parent row (actual_query filters these out) — tag it directly anyway
         except Exception as e:
-            print(f"Failed to fetch transaction details: {e}")
+            print(f"[update_actual_transaction][error] Failed to fetch transaction details: {e}")
         
         update_transaction = state.get("update_transaction") or {}
 
@@ -987,7 +987,7 @@ async def update_actual_transaction_node(state: dict):
                         parts.append(f"amount → ${v:.2f}")
                     else:
                         parts.append(f"{k} → {v}")
-                print(f"  ✏️  Agent updates: {', '.join(parts)}")
+                print(f"[update_actual_transaction]   ✏️  Agent updates: {', '.join(parts)}")
         
         # Determine base notes and append #receipt
         base_notes = update_transaction.get("notes", existing_notes)
@@ -1016,7 +1016,7 @@ async def update_actual_transaction_node(state: dict):
                 update_amount = update_transaction["amount"]
                 update_cents = int(round(-update_amount * 100))
                 update_payload["amount"] = update_cents
-                print(f"Agent requested amount update to: {update_cents}")
+                print(f"[update_actual_transaction] Agent requested amount update to: {update_cents}")
             
             proposed_txs = state.get("parsed_data", {}).get("proposed_transactions", [])
             parsed_payee = state.get("parsed_data", {}).get("payee")
@@ -1053,28 +1053,28 @@ async def update_actual_transaction_node(state: dict):
                         update_payload["payee"] = transfer_payee_id
                         if "payee_name" in update_payload:
                             del update_payload["payee_name"]
-                        print(f"Agent requested transfer update to: {transfer_acc_name} ({transfer_payee_id})")
+                        print(f"[update_actual_transaction] Agent requested transfer update to: {transfer_acc_name} ({transfer_payee_id})")
                     elif target_payee_name:
                         update_payload["payee_name"] = target_payee_name
                         if "payee" in update_payload:
                             del update_payload["payee"]
-                        print(f"Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
+                        print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
                 except Exception as e:
-                    print(f"⚠️ Failed to resolve transfer account {transfer_acc_name}: {e}")
+                    print(f"[update_actual_transaction][error] ⚠️ Failed to resolve transfer account {transfer_acc_name}: {e}")
                     if target_payee_name:
                         update_payload["payee_name"] = target_payee_name
                         if "payee" in update_payload:
                             del update_payload["payee"]
-                        print(f"Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
+                        print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
             elif target_payee_name:
                 update_payload["payee_name"] = target_payee_name
                 if "payee" in update_payload:
                     del update_payload["payee"]
-                print(f"Agent requested payee update to: {target_payee_name}")
+                print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name}")
 
         proposed_txs = state.get("parsed_data", {}).get("proposed_transactions", [])
         if tx_data and not tx_data.get("cleared") and not tx_data.get("reconciled") and not tx_data.get("is_child") and len(proposed_txs) > 1:
-            print("  ➕ Transforming matched standalone transaction into a split transaction...")
+            print("[update_actual_transaction] " + "  ➕ Transforming matched standalone transaction into a split transaction...")
             update_payload["subtransactions"] = []
             
             cats = []
@@ -1095,7 +1095,7 @@ async def update_actual_transaction_node(state: dict):
                 all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
                 all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
             except Exception as e:
-                print(f"  ⚠️ Failed to fetch accounts or payees for split resolution: {e}")
+                print(f"[update_actual_transaction][error]   ⚠️ Failed to fetch accounts or payees for split resolution: {e}")
                 all_accounts = []
                 all_payees = []
 
@@ -1149,12 +1149,12 @@ async def update_actual_transaction_node(state: dict):
                     added_ids = json.loads(add_res.content[0].text)
                     if isinstance(added_ids, list) and len(added_ids) > 0:
                         new_tx_id = added_ids[0]
-                        print(f"✅ Successfully converted transaction into a split (Old ID: {tx_id}, New ID: {new_tx_id})")
+                        print(f"[update_actual_transaction] ✅ Successfully converted transaction into a split (Old ID: {tx_id}, New ID: {new_tx_id})")
                         return {"actual_tx_id": new_tx_id, "replaced_tx_id": tx_id}
                 except Exception as e:
-                    print(f"⚠️ Failed to parse new split transaction ID: {e}")
+                    print(f"[update_actual_transaction][error] ⚠️ Failed to parse new split transaction ID: {e}")
             except Exception as e:
-                print(f"⚠️ Failed to recreate split transaction: {e}")
+                print(f"[update_actual_transaction][error] ⚠️ Failed to recreate split transaction: {e}")
             return {}
 
         mcp_tools = await load_mcp_tools(session)
@@ -1164,8 +1164,8 @@ async def update_actual_transaction_node(state: dict):
                 "update", tx_id,
                 "--data", json.dumps(update_payload)
             ]})
-            print(f"✅ Successfully updated transaction {tx_id} (Tagged with #receipt)")
+            print(f"[update_actual_transaction] ✅ Successfully updated transaction {tx_id} (Tagged with #receipt)")
             
     except Exception as e:
-        print(f"⚠️ Failed to tag transaction (non-fatal): {e}")
+        print(f"[update_actual_transaction][error] ⚠️ Failed to tag transaction (non-fatal): {e}")
     return {}

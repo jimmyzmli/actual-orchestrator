@@ -45,11 +45,11 @@ def extract_ocr_node(state: StatementState):
 
         cached = get_ocr(file_path, prefix="statement_")
         if cached is not None:
-            print("Using cached OCR text...")
+            print("[extract_ocr][cache] " + "Using cached OCR text...")
             return {"ocr_text": cached, "image_paths": image_paths}
 
         ocr_tool = state.get("ocr_tool", "docling")
-        print(f"Extracting text with {ocr_tool} for {file_path}...")
+        print(f"[extract_ocr] Extracting text with {ocr_tool} for {file_path}...")
         
         if ocr_tool == "pdfplumber":
             import pdfplumber
@@ -62,7 +62,7 @@ def extract_ocr_node(state: StatementState):
             ocr_text = result.document.export_to_markdown()
             
         if not ocr_text or not ocr_text.strip():
-            print(f"  -> WARNING: OCR text is empty!")
+            print(f"[extract_ocr]   -> WARNING: OCR text is empty!")
             
         meta = {
             "source_file": f"file://{os.path.abspath(file_path)}",
@@ -92,10 +92,10 @@ def parse_statement_node(state: StatementState):
 
         cached = get_parsed(file_path, prefix="statement_")
         if cached is not None:
-            print("Using cached parsed statement data...")
+            print("[parse_statement][cache] " + "Using cached parsed statement data...")
             return {"parsed_data": cached}
 
-        print(f"Parsing statement with DeepSeek-V4-Pro...")
+        print(f"[parse_statement] Parsing statement with DeepSeek-V4-Pro...")
         
         from actual_orch.shared.utils import get_agent_config
         attempts = get_agent_config("statement_parse").get("attempts", [])
@@ -120,10 +120,10 @@ def parse_statement_node(state: StatementState):
             from langchain_community.callbacks.manager import get_openai_callback
             with get_openai_callback() as cb:
                 result = chain.invoke({"ocr_text": state["ocr_text"]})
-                print(f"  -> DeepSeek Tokens Used: {cb.total_tokens} (Prompt: {cb.prompt_tokens}, Completion: {cb.completion_tokens})")
+                print(f"[parse_statement]   -> DeepSeek Tokens Used: {cb.total_tokens} (Prompt: {cb.prompt_tokens}, Completion: {cb.completion_tokens})")
         except ImportError:
             result = chain.invoke({"ocr_text": state["ocr_text"]})
-            print("  -> DeepSeek parsing completed (token usage unavailable without langchain-community)")
+            print("[parse_statement] " + "  -> DeepSeek parsing completed (token usage unavailable without langchain-community)")
         
         parsed_dict = result.dict()
         meta = {
@@ -148,7 +148,7 @@ def extract_and_parse_statement_node(state: StatementState):
 
         cached = get_parsed(file_path)
         if cached is not None:
-            print("Using cached parsed statement data...")
+            print("[extract_and_parse_statement][cache] " + "Using cached parsed statement data...")
             return {"parsed_data": cached}
 
         image_paths = state.get("image_paths", [])
@@ -166,7 +166,7 @@ def extract_and_parse_statement_node(state: StatementState):
             else:
                 image_paths.append(file_path)
 
-        print(f"Holistic extraction and parsing with Gemini for {file_path}...")
+        print(f"[extract_and_parse_statement] Holistic extraction and parsing with Gemini for {file_path}...")
         
         import time
         time.sleep(4.1) # Respect Gemini free tier limits
