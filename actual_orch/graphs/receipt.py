@@ -2,7 +2,6 @@ import os
 import json
 import base64
 from typing import TypedDict, Dict, Any, List, Optional
-from enum import Enum
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
@@ -16,9 +15,9 @@ from actual_orch.nodes.pocketbase import skip_if_processed, save_pocketbase_node
 from actual_orch.nodes.actual_budget import search_deterministic_node, search_agent_node, update_actual_transaction_node, save_actual_transaction_node, estimate_tokens
 import datetime
 
-class WorkflowStatus(str, Enum):
+class WorkflowStatus:
     """
-    Enum representing the flow control state for the LangGraph workflow.
+    Class representing the flow control state for the LangGraph workflow.
     """
     CONTINUE = "continue"                     # Default state, proceed to the next logical node
     ERROR = "error"                           # An error occurred, routing to END or an error handler
@@ -55,7 +54,7 @@ class ReceiptState(TypedDict, total=False):
     replaced_tx_id: str   # If the tx_id changed (e.g. recreating as split), this holds the old ID
     actual_tx_id_transfer: str
     update_transaction: ProposedTransaction # Agent proposed updates
-    status: WorkflowStatus
+    status: str
     error: str
     email_date: str
     email_context: str    # Context string containing sender, subject, folder, etc.
