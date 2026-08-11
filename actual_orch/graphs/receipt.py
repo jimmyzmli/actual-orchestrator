@@ -232,7 +232,7 @@ def classify_input_node(state: ReceiptState):
             if os.path.exists(config_path_class):
                 with open(config_path_class, "r") as f:
                     class_data = json.load(f)
-                    classifications = class_data.get("classifications", {})
+                    classifications = {k: v.get("prompt_description", "") for k, v in class_data.items() if isinstance(v, dict)}
             else:
                 print(f"[classify_input][error] Missing {config_path_class}")
             
@@ -296,15 +296,21 @@ def classify_input_node(state: ReceiptState):
                 print(f"[classify_input][cache] Using cached classification data (Redis): [{classification.strip()}]")
         
         config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
-        skip_classes = ["NOT_RECEIPT", "INVOICE", "SHIPPING_CONFIRMATION"]
+        should_parse = True
+        skip_if_future_date = False
+        
         if os.path.exists(config_path_class):
             with open(config_path_class, "r") as f:
                 class_data = json.load(f)
-                skip_classes = class_data.get("skip_classifications", skip_classes)
+                for cls_name, cls_config in class_data.items():
+                    if cls_name == classification.strip():
+                        should_parse = cls_config.get("parse", True)
+                        skip_if_future_date = cls_config.get("skip_if_future_date", False)
+                        break
                 
-        if any(skip_cls in classification for skip_cls in skip_classes):
+        if not should_parse:
             print(f"[classify_input][skip]   Document classified as {classification}. Skipping completely.")
-            return {"classification": classification}
+            return {"classification": classification, "status": WorkflowStatus.ALREADY_PROCESSED}
             
         is_future_date = False
 
@@ -325,9 +331,9 @@ def classify_input_node(state: ReceiptState):
             except Exception:
                 pass
                 
-        if is_future_date:
+        if is_future_date and skip_if_future_date:
             print(f"[classify_input][skip]   ⏭️  Skipped {state.get('source_ref')}: Receipt date is in the future. (Classified as: {classification})")
-            return {"classification": classification}
+            return {"classification": classification, "status": WorkflowStatus.ALREADY_PROCESSED}
             
         print(f"[classify_input]   Document classified as: {classification}")
         return {"classification": classification}
@@ -637,6 +643,17 @@ async def parse_receipt_node(state: ReceiptState):
             }
             set_parsed(file_path, parsed_dict, meta, prefix=prefix)
         
+        config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+        skip_if_future_date = False
+        classification = state.get("classification", "")
+        if os.path.exists(config_path_class):
+            with open(config_path_class, "r") as f:
+                class_data = json.load(f)
+                for cls_name, cls_config in class_data.items():
+                    if cls_name == classification.strip():
+                        skip_if_future_date = cls_config.get("skip_if_future_date", False)
+                        break
+
         if parsed_dict.get("date"):
             try:
                 parsed_date = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d").date()
@@ -645,11 +662,9 @@ async def parse_receipt_node(state: ReceiptState):
                     if get_receipt_type(state.get("source")) == "email" and state.get("email_date"):
                         print(f"[parse_receipt][error]   ⚠️ Parsed date {parsed_date} is in the future. Falling back to email date {state['email_date']}.")
                         parsed_dict["date"] = state["email_date"]
-                        for pt in proposed_list:
-                            pt["date"] = state["email_date"]
-                    else:
-                        print(f"[parse_receipt][error]   ❌ Parsed date {parsed_date} is in the future. Failing with error state.")
-                        return {"status": WorkflowStatus.ERROR, "error": f"Parsed date {parsed_date} is in the future (saved to cache)"}
+                    elif skip_if_future_date:
+                        print(f"[parse_receipt][skip]   ⏭️  Parsed date {parsed_date} is in the future. Skipping.")
+                        return {"status": WorkflowStatus.ALREADY_PROCESSED, "parsed_data": parsed_dict, "agent_attempts": agent_attempts}
             except Exception:
                 pass
             
@@ -731,24 +746,56 @@ def router_check_error(state: ReceiptState):
 def router_after_classify(state: ReceiptState):
     if state.get("status") == WorkflowStatus.ERROR:
         return "error"
+    if state.get("status") == WorkflowStatus.ALREADY_PROCESSED:
+        return "skip"
+        
     classification = state.get("classification", "")
     config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
-    skip_classes = ["NOT_RECEIPT", "INVOICE", "SHIPPING_CONFIRMATION"]
+    should_parse = True
+    
     if os.path.exists(config_path_class):
         with open(config_path_class, "r") as f:
             class_data = json.load(f)
-            skip_classes = class_data.get("skip_classifications", skip_classes)
+            for cls_name, cls_config in class_data.items():
+                if cls_name == classification.strip():
+                    should_parse = cls_config.get("parse", True)
+                    break
             
-    if any(skip_cls in classification for skip_cls in skip_classes):
+    if not should_parse:
         return "skip"
     return "continue"
 
 def router_after_parse(state: ReceiptState):
     if state.get("status") == WorkflowStatus.ERROR:
         return "error"
+    if state.get("status") == WorkflowStatus.ALREADY_PROCESSED:
+        return "skip"
+        
     attempts = [a for a in state.get("agent_attempts", []) if a.get("node") == "receipt_parse"]
     if attempts and not attempts[-1].get("success", False):
         return "human_approval"
+        
+    classification = state.get("classification", "")
+    config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+    skip_if_no_amount = False
+    
+    if os.path.exists(config_path_class):
+        with open(config_path_class, "r") as f:
+            class_data = json.load(f)
+            for cls_name, cls_config in class_data.items():
+                if cls_name == classification.strip():
+                    skip_if_no_amount = cls_config.get("skip_if_no_amount", False)
+                    break
+                    
+    if skip_if_no_amount:
+        parsed_data = state.get("parsed_data", {})
+        total = parsed_data.get("total", 0)
+        if not total and total != 0.0:
+            total = 0
+        if float(total) == 0.0:
+            print(f"[router_after_parse][skip]   ⏭️  Skipped {state.get('source_ref')}: Total amount is 0. (Classified as: {classification})")
+            return "skip"
+            
     return "continue"
 
 def router_after_search_deterministic(state: ReceiptState):
@@ -797,7 +844,7 @@ workflow.set_entry_point("skip_if_processed")
 workflow.add_conditional_edges("skip_if_processed", router_after_dedup, {"skip": END, "continue": "extract_ocr"})
 workflow.add_conditional_edges("extract_ocr", router_check_error, {"error": END, "continue": "classify_input"})
 workflow.add_conditional_edges("classify_input", router_after_classify, {"error": END, "human_approval": "human_approval", "continue": "parse_receipt", "skip": END})
-workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_deterministic"})
+workflow.add_conditional_edges("parse_receipt", router_after_parse, {"error": END, "human_approval": "human_approval", "continue": "search_deterministic", "skip": END})
 workflow.add_conditional_edges("search_deterministic", router_after_search_deterministic, {
     "error": END, 
     "fallback_to_agent": "search_agent", 
