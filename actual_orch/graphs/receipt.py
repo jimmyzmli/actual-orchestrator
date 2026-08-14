@@ -381,7 +381,8 @@ async def parse_receipt_node(state: ReceiptState):
                 model=model_name, 
                 api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
                 base_url="https://api.deepseek.com/v1",
-                max_tokens=1024
+                max_tokens=1024,
+                model_kwargs={"response_format": {"type": "json_object"}}
             )
             
             from actual_orch.shared.peak_hours import pause_if_peak_hours

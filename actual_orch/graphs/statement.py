@@ -105,7 +105,8 @@ def parse_statement_node(state: StatementState):
             model=model_name, # API identifier for DeepSeek-V4-Pro
             api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
             base_url="https://api.deepseek.com/v1",
-            max_tokens=8000
+            max_tokens=8000,
+            model_kwargs={"response_format": {"type": "json_object"}}
         )
         
         prompt = ChatPromptTemplate.from_messages([

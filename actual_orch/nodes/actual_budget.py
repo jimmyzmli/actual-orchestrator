@@ -587,7 +587,8 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
         llm = ChatOpenAI(
             model=model_name, 
             api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-            base_url="https://api.deepseek.com/v1"
+            base_url="https://api.deepseek.com/v1",
+            model_kwargs={"response_format": {"type": "json_object"}}
         )
         
         structured_llm = llm.with_structured_output(TransactionMatchResult, method="json_mode", include_raw=True)
