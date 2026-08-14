@@ -1015,7 +1015,16 @@ async def update_actual_transaction_node(state: dict):
         if tx_data and not tx_data.get("cleared") and not tx_data.get("reconciled"):
             if "amount" in update_transaction:
                 update_amount = update_transaction["amount"]
-                update_cents = int(round(-update_amount * 100))
+                original_cents = tx_data.get("amount", 0)
+                
+                # Maintain the same polarity as the original transaction
+                if original_cents < 0:
+                    update_cents = -int(round(abs(update_amount) * 100))
+                elif original_cents > 0:
+                    update_cents = int(round(abs(update_amount) * 100))
+                else:
+                    update_cents = int(round(-update_amount * 100))
+                    
                 update_payload["amount"] = update_cents
                 print(f"[update_actual_transaction] Agent requested amount update to: {update_cents}")
             
@@ -1028,50 +1037,71 @@ async def update_actual_transaction_node(state: dict):
 
             target_payee_name = update_transaction.get("payee") or parsed_payee
 
-            if target_transfer_account:
-                transfer_acc_name = target_transfer_account
+            if target_payee_name or target_transfer_account:
                 try:
-                    acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
                     payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
-                    all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
                     all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
                     
-                    def clean_acct_name(s):
-                        return re.sub(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF\u2B00-\u2BFF\uFE00-\uFE0F]+', '', s).strip()
+                    if target_transfer_account:
+                        transfer_acc_name = target_transfer_account
+                        acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                        all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
                         
-                    clean_transfer = clean_acct_name(transfer_acc_name)
-                    transfer_payee_id = None
-                    for acc in all_accounts:
-                        if clean_acct_name(acc.get("name", "")) == clean_transfer:
-                            acc_id = acc.get("id")
-                            for p in all_payees:
-                                if p.get("transfer_acct") == acc_id:
-                                    transfer_payee_id = p.get("id")
-                                    break
-                            break
+                        def clean_acct_name(s):
+                            return re.sub(r'[\u2600-\u27BF\U0001F1E6-\U0001F1FF\U0001F300-\U0001FAFF\u2300-\u23FF\u2B00-\u2BFF\uFE00-\uFE0F]+', '', s).strip()
                             
-                    if transfer_payee_id:
-                        update_payload["payee"] = transfer_payee_id
-                        if "payee_name" in update_payload:
-                            del update_payload["payee_name"]
-                        print(f"[update_actual_transaction] Agent requested transfer update to: {transfer_acc_name} ({transfer_payee_id})")
-                    elif target_payee_name:
-                        update_payload["payee_name"] = target_payee_name
-                        if "payee" in update_payload:
-                            del update_payload["payee"]
-                        print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
+                        clean_transfer = clean_acct_name(transfer_acc_name)
+                        transfer_payee_id = None
+                        for acc in all_accounts:
+                            if clean_acct_name(acc.get("name", "")) == clean_transfer:
+                                acc_id = acc.get("id")
+                                for p in all_payees:
+                                    if p.get("transfer_acct") == acc_id:
+                                        transfer_payee_id = p.get("id")
+                                        break
+                                break
+                                
+                        if transfer_payee_id:
+                            update_payload["payee"] = transfer_payee_id
+                            if "payee_name" in update_payload:
+                                del update_payload["payee_name"]
+                            print(f"[update_actual_transaction] Agent requested transfer update to: {transfer_acc_name} ({transfer_payee_id})")
+                            target_payee_name = None
+                            
+                    if target_payee_name:
+                        payee_id = None
+                        for p in all_payees:
+                            if p.get("name", "").lower() == target_payee_name.lower():
+                                payee_id = p.get("id")
+                                break
+                                
+                        if not payee_id:
+                            create_res = await session.call_tool("actual_payees", {"args": ["create", "--name", target_payee_name]})
+                            if create_res and create_res.content:
+                                try:
+                                    created = json.loads(create_res.content[0].text)
+                                    payee_id = created.get("id")
+                                except:
+                                    pass
+                        
+                        if payee_id:
+                            update_payload["payee"] = payee_id
+                            if "payee_name" in update_payload:
+                                del update_payload["payee_name"]
+                            print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} ({payee_id})")
+                        else:
+                            update_payload["payee_name"] = target_payee_name
+                            if "payee" in update_payload:
+                                del update_payload["payee"]
+                            print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} (unresolved)")
+                            
                 except Exception as e:
-                    print(f"[update_actual_transaction][error] ⚠️ Failed to resolve transfer account {transfer_acc_name}: {e}")
+                    print(f"[update_actual_transaction][error] ⚠️ Failed to resolve payee/transfer: {e}")
                     if target_payee_name:
                         update_payload["payee_name"] = target_payee_name
                         if "payee" in update_payload:
                             del update_payload["payee"]
-                        print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} (Transfer account fallback)")
-            elif target_payee_name:
-                update_payload["payee_name"] = target_payee_name
-                if "payee" in update_payload:
-                    del update_payload["payee"]
-                print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name}")
+                        print(f"[update_actual_transaction] Agent requested payee update to: {target_payee_name} (fallback)")
 
         proposed_txs = state.get("parsed_data", {}).get("proposed_transactions", [])
         if tx_data and not tx_data.get("cleared") and not tx_data.get("reconciled") and not tx_data.get("is_child") and len(proposed_txs) > 1:
@@ -1190,10 +1220,16 @@ async def update_actual_transaction_node(state: dict):
         mcp_tools = await load_mcp_tools(session)
         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
         if tx_tool:
-            await tx_tool.ainvoke({"args": [
+            print(f"[update_actual_transaction] Update payload: {json.dumps(update_payload)}")
+            res = await tx_tool.ainvoke({"args": [
                 "update", tx_id,
+                "-vv",
                 "--data", json.dumps(update_payload)
             ]})
+            if res and hasattr(res, "content") and res.content:
+                print(f"[update_actual_transaction] API response: {res.content[0].text}")
+            elif res:
+                print(f"[update_actual_transaction] API response: {res}")
             print(f"[update_actual_transaction] ✅ Successfully updated transaction {tx_id} (Tagged with #receipt)")
             
     except Exception as e:
