@@ -82,7 +82,7 @@ class ParsedReceipt(BaseModel):
     date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
     currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. Default to CAD unless there is definitive proof otherwise.")
     payee: str = Field(description="Name of the store or payee")
-    notes: str = Field(default="", description="A concise ~50 character human-readable summary of what was purchased (e.g. 'Groceries - milk, eggs, bread' or 'Uber ride downtown'). Do NOT include the payee name, date, or amount — just describe the purchase.")
+    notes: str = Field(default="", description="A concise ~50 char summary. For in-person/ride-share/delivery, prefix with time (e.g. '8:00 PM - Uber ride downtown'). For online shopping, omit time. Do NOT include payee, date, or amount.")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
     account_key: Optional[str] = Field(default=None, description="If a list of valid account keys is provided, the most likely account key for this receipt based on the OCR text. Otherwise null.")
     proposed_transactions: List[ParsedProposedTransaction] = Field(description="List of proposed transactions to create. The sum of amounts across all proposed transactions equals the receipt total.")
@@ -402,7 +402,7 @@ async def parse_receipt_node(state: ReceiptState):
                 "- 'date': YYYY-MM-DD format. Today's date is {todays_date}. If missing, use the current date or guess from context. The date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and email context is available, use the email date instead.\n"
                 "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
                 "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
-                "- 'notes': A concise ~50 character summary of the purchase (e.g. 'Groceries - milk, eggs, bread'). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'. For e-transfers, include the reference number if available (e.g., 'e-Transfer Ref: CA4ABCD123').\n"
+                "- 'notes': A concise ~50 character summary of the purchase (e.g. '8:00 PM - Groceries - milk, eggs, bread' or '9:30 AM - Uber ride downtown'). Include the time of the transaction ONLY if it is an in-person transaction, ride-share, or food delivery (do not include time for online shopping). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'. For e-transfers, include the reference number if available (e.g., 'e-Transfer Ref: CA4ABCD123').\n"
                 "- 'items': Array of line items with 'description' and 'amount'. Include taxes (HST/GST/PST/VAT) as separate items. Points/rewards redemptions should be negative amounts. Items can be empty for ATM/transfers.\n"
                 "  - 'description': casual, human-readable — include useful info (brand, type) but avoid weird characters or abbreviations.\n\n"
                 "PROPOSED TRANSACTIONS (most important):\n"
@@ -410,6 +410,7 @@ async def parse_receipt_node(state: ReceiptState):
                 "- Most receipts have ONE proposed transaction with the receipt total as the amount.\n"
                 "- If the receipt is for a deposit, refund, or credit (money coming INTO the account), the proposed_transaction 'amount' MUST be negative.\n"
                 "- If the receipt includes a points redemption or refund (negative amount on the receipt), create a SEPARATE proposed transaction for it with a negative amount and an Income category.\n"
+                "- If the receipt shows payment split across multiple methods (e.g. Uber Cash + credit card), create SEPARATE proposed_transactions for each payment method. Stored-value/credits portions (e.g. Uber Cash, gift card balance) should use 'transfer_account' pointing to the credits/stored-value account. The credit card portion gets a normal 'category'. Sum all Uber Cash (or similar) payments into a single transfer proposed_transaction.\n"
                 "- The sum of all proposed_transaction amounts must equal the receipt total.\n"
                 "- Amounts are in the receipt's currency (the 'currency' field).\n"
             )

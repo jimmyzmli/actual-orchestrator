@@ -63,6 +63,11 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     Returns the list of raw/reconstructed candidates, without filtering for #receipt.
     """
     try:
+        await session.call_tool("actual_sync", {})
+    except Exception:
+        pass
+
+    try:
         rd = datetime.strptime(receipt_date, "%Y-%m-%d")
     except ValueError:
         return []
@@ -136,13 +141,9 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                 
         for parent_tx in parent_map.values():
             children = parent_tx.pop("children")
-            if parent_tx["amount"] == 0:
-                # Do not reconstruct; keep children as separate candidates
-                candidates.extend(children)
-            else:
-                # Include the reconstructed parent AND individual children
-                candidates.append(parent_tx)
-                candidates.extend(children)
+            # Include the reconstructed parent AND individual children
+            candidates.append(parent_tx)
+            candidates.extend(children)
         
         # Try to fetch real parent data to replace reconstructed approximations
         if parent_map:
@@ -564,25 +565,29 @@ async def search_agent_node(state: dict):
         except Exception as e:
             print(f"[search_agent][error]   ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
 
-        prompt_text = f"""You are a financial matching assistant.
+        prompt_text = f"""Match this receipt to a bank transaction. Respond in JSON.
 
-Receipt details:
+Receipt:
 {json.dumps(parsed_prompt, indent=2)}
 
-Candidate transactions from the bank:
+Candidates:
 {json.dumps(structured_candidates, indent=2)}
 
-Task: Identify the transaction that matches this receipt. You must respond in JSON.
-Rules:
-- Amounts may differ due to tip, currency difference, etc. Make sure there is a good reason for the difference.
-- Split transactions (type='split') contain 'subtransactions'. Match on the individual subtransaction 'id' (not the parent 'id') if the receipt corresponds to a specific portion of the split.
-- Transfers (type='transfer') represent money moving between accounts and contain a 'transactions' array with both sides of the transfer. Match on the specific transaction 'id' within the array that corresponds to the account the receipt is for.
-- Payee names might differ but should be conceptually similar, but transfers will often have completely different payee names. Sometimes the notes might contain payee name too (often in a # tag)
-- Date should be within 1 day. However, often rent income and bill payments are shifted to the start of the next month.
-- Candidates have an 'already_attached_receipts' array. If it is not empty, it contains details (payee, amount, date) of the receipt(s) already attached to this candidate. Only select such a candidate if you are absolutely sure the current receipt is a different version or additional document for the exact same transaction.
-- Each candidate has an 'allowed_to_update' flag. If 'allowed_to_update' is true, you can match the transaction and update the payee, transfer_account, notes, or amount, but ONLY if you are absolutely sure it's the same transaction and the current receipt has new info (such as tip amount, or transfer account which often happens with self e-transfers). Use the updated_* fields in your JSON response for this. If updating the amount, the polarity must match the receipt (positive for expense, negative for deposit). If 'allowed_to_update' is false, you MUST NOT provide any updated_* fields.
+Matching rules:
+- Amounts may differ (tip, FX, etc.) but there must be a plausible reason.
+- Split (type='split'): match on the subtransaction 'id', not the parent.
+- Transfer (type='transfer'): match on the 'id' within 'transactions' for the receipt's account side.
+- Payee names may differ but should be conceptually similar. Notes may also contain the payee (often as a #tag).
+- Date within ±1 day, except rent/bills which may shift to the 1st of the next month.
+- If 'already_attached_receipts' is non-empty, only match if this receipt is clearly a newer version of the same transaction (e.g. a ride-share sends a no-tip receipt first, then an updated receipt with tip). When updating such a transaction, the new amount should typically be >= the existing amount.
 
-Respond in JSON format with the 'matched_id' of the matching transaction, or null if no match exists."""
+Update rules (only when 'allowed_to_update' is true):
+- Use updated_amount, updated_payee, updated_notes, updated_transfer_account ONLY when the receipt provides new info (tip, transfer account, etc.).
+- If the receipt has a time (e.g. '8:00 PM'), include it in updated_notes.
+- updated_amount polarity must match the receipt (positive=expense, negative=deposit).
+- If 'allowed_to_update' is false, do NOT provide any updated_* fields.
+
+Respond with 'matched_id' (UUID or null)."""
             
         llm = ChatOpenAI(
             model=model_name, 
@@ -636,7 +641,15 @@ Respond in JSON format with the 'matched_id' of the matching transaction, or nul
                     min_allowed = receipt_cents * 0.90
                     max_allowed = receipt_cents * 1.30
                     if getattr(result, "updated_amount", None) is not None:
+                        updated_cents = abs(int(result.updated_amount * 100))
                         print(f"[search_agent]   Agent updating amount to ${result.updated_amount:.2f} (original: ${actual_amt/100:.2f})")
+                        
+                        # Hard guard: reject amount decreases on already-receipted transactions
+                        existing_receipts = previously_attached_receipts_map.get(final_id, [])
+                        if existing_receipts and updated_cents < actual_amt:
+                            print(f"❌ VALIDATION FAILED: Cannot decrease amount on already-receipted transaction "
+                                  f"(${actual_amt/100:.2f} → ${result.updated_amount:.2f}). Rejecting.")
+                            final_id = "unknown_id"
                     elif not (min_allowed <= actual_amt <= max_allowed):
                         print(f"❌ VALIDATION FAILED: Agent amount ${actual_amt/100:.2f} "
                               f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
@@ -1181,16 +1194,30 @@ async def update_actual_transaction_node(state: dict):
                 
                 try:
                     if add_res.content:
-                        added_ids = json.loads(add_res.content[0].text)
-                        if isinstance(added_ids, list) and len(added_ids) > 0:
-                            new_tx_id = added_ids[0]
+                        resp_text = add_res.content[0].text
+                        # Handle both list-of-IDs and "ok" string responses
+                        if resp_text.strip().startswith("["):
+                            added_ids = json.loads(resp_text)
+                            if isinstance(added_ids, list) and len(added_ids) > 0:
+                                new_tx_id = added_ids[0]
+                        elif resp_text.strip('"').strip() == "ok":
+                            print(f"[update_actual_transaction] Add returned 'ok' — querying for new transaction...")
+                        else:
+                            print(f"[update_actual_transaction][error] ⚠️ Unexpected add response: {resp_text}")
                     if not new_tx_id:
-                        print(f"[update_actual_transaction][error] ⚠️ Response from add was not a non-empty list: {add_res.content[0].text if add_res.content else 'Empty'}")
+                        print(f"[update_actual_transaction][error] ⚠️ Could not extract ID from add response: {add_res.content[0].text if add_res.content else 'Empty'}")
                 except Exception as e:
                     print(f"[update_actual_transaction][error] ⚠️ Failed to parse new split transaction ID: {e}")
                     
                 if not new_tx_id:
                     print(f"[update_actual_transaction] 🔄 Falling back to querying the new split transaction ID...")
+                    
+                    # Sync first so the newly added transaction is visible
+                    try:
+                        await session.call_tool("actual_sync", {})
+                    except Exception:
+                        pass
+                    
                     # Fallback to query
                     filter_obj = {
                         "account": tx_data["account"],
@@ -1204,10 +1231,23 @@ async def update_actual_transaction_node(state: dict):
                     ]})
                     if q_res.content and len(q_res.content) > 0:
                         txs = json.loads(q_res.content[0].text)
+                        
+                        # Strategy 1: Find a child with #receipt in notes
                         for t in txs:
                             if t.get("is_child") and t.get("parent_id") and t.get("notes") and "#receipt" in t["notes"]:
                                 new_tx_id = t["parent_id"]
                                 break
+                        
+                        # Strategy 2: Find a child whose parent_id doesn't match
+                        # the old tx_id (i.e. it's a new parent we just created)
+                        if not new_tx_id:
+                            parent_ids = set()
+                            for t in txs:
+                                if t.get("is_child") and t.get("parent_id") and t["parent_id"] != tx_id:
+                                    parent_ids.add(t["parent_id"])
+                            # If there's exactly one new parent, that's our target
+                            if len(parent_ids) == 1:
+                                new_tx_id = parent_ids.pop()
                                 
                 if new_tx_id:
                     print(f"[update_actual_transaction] ✅ Successfully converted transaction into a split (Old ID: {tx_id}, New ID: {new_tx_id})")
@@ -1220,16 +1260,19 @@ async def update_actual_transaction_node(state: dict):
         mcp_tools = await load_mcp_tools(session)
         tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
         if tx_tool:
-            print(f"[update_actual_transaction] Update payload: {json.dumps(update_payload)}")
-            res = await tx_tool.ainvoke({"args": [
-                "update", tx_id,
-                "-vv",
-                "--data", json.dumps(update_payload)
-            ]})
-            if res and hasattr(res, "content") and res.content:
-                print(f"[update_actual_transaction] API response: {res.content[0].text}")
-            elif res:
-                print(f"[update_actual_transaction] API response: {res}")
+            args = ["update", tx_id, "--data", json.dumps(update_payload)]
+            if state.get("flag_log_agent"):
+                args.insert(2, "-vv")
+                print(f"[update_actual_transaction] Update payload: {json.dumps(update_payload)}")
+                
+            res = await tx_tool.ainvoke({"args": args})
+            
+            if state.get("flag_log_agent"):
+                if res and hasattr(res, "content") and res.content:
+                    print(f"[update_actual_transaction] API response: {res.content[0].text}")
+                elif res:
+                    print(f"[update_actual_transaction] API response: {res}")
+            
             print(f"[update_actual_transaction] ✅ Successfully updated transaction {tx_id} (Tagged with #receipt)")
             
     except Exception as e:
