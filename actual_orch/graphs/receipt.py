@@ -82,7 +82,8 @@ class ParsedReceipt(BaseModel):
     date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
     currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. Default to CAD unless there is definitive proof otherwise.")
     payee: str = Field(description="Name of the store or payee")
-    notes: str = Field(default="", description="A concise ~50 char summary. For in-person/ride-share/delivery, prefix with time (e.g. '8:00 PM - Uber ride downtown'). For online shopping, omit time. Do NOT include payee, date, or amount.")
+    order_id: Optional[str] = Field(default=None, description="The order number, receipt number, invoice number, or reference ID (e.g., e-transfer reference number). Leave null if not present.")
+    notes: str = Field(default="", description="A concise ~50 char summary. For in-person/ride-share/delivery, prefix with time (e.g. '8:00 PM - Uber ride downtown'). For online shopping, omit time. Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'.")
     items: List[ReceiptItem] = Field(description="List of individual items on the receipt")
     account_key: Optional[str] = Field(default=None, description="If a list of valid account keys is provided, the most likely account key for this receipt based on the OCR text. Otherwise null.")
     proposed_transactions: List[ParsedProposedTransaction] = Field(description="List of proposed transactions to create. The sum of amounts across all proposed transactions equals the receipt total.")
@@ -397,12 +398,13 @@ async def parse_receipt_node(state: ReceiptState):
                 
             system_prompt = (
                 "You are an expert at extracting structured data from {source_desc}. "
-                "Respond with a JSON object using these top-level keys: 'date', 'currency', 'payee', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
+                "Respond with a JSON object using these top-level keys: 'date', 'currency', 'payee', 'order_id', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
                 "RULES:\n"
                 "- 'date': YYYY-MM-DD format. Today's date is {todays_date}. If missing, use the current date or guess from context. The date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and email context is available, use the email date instead.\n"
                 "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
                 "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
-                "- 'notes': A concise ~50 character summary of the purchase (e.g. '8:00 PM - Groceries - milk, eggs, bread' or '9:30 AM - Uber ride downtown'). Include the time of the transaction ONLY if it is an in-person transaction, ride-share, or food delivery (do not include time for online shopping). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'. For e-transfers, include the reference number if available (e.g., 'e-Transfer Ref: CA4ABCD123').\n"
+                "- 'order_id': The order number, receipt number, invoice number, or reference ID (e.g., e-transfer reference number). Leave null if not present.\n"
+                "- 'notes': A concise ~50 character summary of the purchase (e.g. '8:00 PM - Groceries - milk, eggs, bread' or '9:30 AM - Uber ride downtown'). Include the time of the transaction ONLY if it is an in-person transaction, ride-share, or food delivery (do not include time for online shopping). Do NOT include payee, date, or amount. For ATM use 'ATM withdrawal'.\n"
                 "- 'items': Array of line items with 'description' and 'amount'. Include taxes (HST/GST/PST/VAT) as separate items. Points/rewards redemptions should be negative amounts. Items can be empty for ATM/transfers.\n"
                 "  - 'description': casual, human-readable — include useful info (brand, type) but avoid weird characters or abbreviations.\n\n"
                 "PROPOSED TRANSACTIONS (most important):\n"

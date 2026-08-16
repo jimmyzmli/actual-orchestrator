@@ -272,20 +272,43 @@ async def search_deterministic_node(state: dict):
         if final_id != "unknown_id":
             matched_candidate = next((c for c in scored if c["id"] == final_id), None)
             if matched_candidate:
-                actual_amt = abs(matched_candidate.get("amount", 0))
-                
-                from actual_orch.shared.utils import get_receipt_type
-                if get_receipt_type(state.get("source")) == "email" and actual_amt != receipt_cents:
-                    print(f"❌ VALIDATION FAILED: Email receipt amount ${amount:.2f} "
-                          f"must exactly match bank amount ${actual_amt/100:.2f}. Rejecting.")
-                    final_id = "unknown_id"
-                else:
-                    min_allowed = receipt_cents * 0.90
-                    max_allowed = receipt_cents * 1.30
-                    if not (min_allowed <= actual_amt <= max_allowed):
-                        print(f"❌ VALIDATION FAILED: Bank amount ${actual_amt/100:.2f} "
-                              f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
+                if "#receipt" in (matched_candidate.get("notes") or "") and parsed.get("order_id"):
+                    try:
+                        from actual_orch.clients.pocketbase import get_pb_client
+                        pb_client = get_pb_client()
+                        records = pb_client.collection("receipts").get_list(1, 10, query_params={
+                            "filter": f"tx_id='{final_id}'",
+                            "fields": "parsed"
+                        })
+                        for r in records.items:
+                            if hasattr(r, "parsed") and r.parsed:
+                                try:
+                                    r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
+                                    existing_order_id = r_parsed.get("order_id")
+                                    if existing_order_id and str(existing_order_id).strip() != str(parsed["order_id"]).strip():
+                                        print(f"❌ VALIDATION FAILED: Deterministic candidate has different order_id ({existing_order_id} vs {parsed['order_id']}). Rejecting auto-match.")
+                                        final_id = "unknown_id"
+                                        break
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        print(f"⚠️ Warning: Could not fetch pocketbase to validate order_id: {e}")
+
+                if final_id != "unknown_id":
+                    actual_amt = abs(matched_candidate.get("amount", 0))
+                    
+                    from actual_orch.shared.utils import get_receipt_type
+                    if get_receipt_type(state.get("source")) == "email" and actual_amt != receipt_cents:
+                        print(f"❌ VALIDATION FAILED: Email receipt amount ${amount:.2f} "
+                              f"must exactly match bank amount ${actual_amt/100:.2f}. Rejecting.")
                         final_id = "unknown_id"
+                    else:
+                        min_allowed = receipt_cents * 0.90
+                        max_allowed = receipt_cents * 1.30
+                        if not (min_allowed <= actual_amt <= max_allowed):
+                            print(f"❌ VALIDATION FAILED: Bank amount ${actual_amt/100:.2f} "
+                                  f"outside 0.90x–1.30x of receipt ${amount:.2f}. Rejecting.")
+                            final_id = "unknown_id"
         if final_id == "unknown_id":
             return {"actual_tx_id": "unknown_id", "status": "fallback_to_agent"}
             
@@ -333,9 +356,22 @@ async def search_agent_node(state: dict):
                     try:
                         records = pb_client.collection("receipts").get_list(1, 10, query_params={
                             "filter": f"tx_id='{cid}'",
-                            "fields": "payee,amount,date"
+                            "fields": "payee,amount,date,parsed"
                         })
-                        receipts = [{"payee": getattr(r, "payee", ""), "amount": getattr(r, "amount", 0.0), "date": str(getattr(r, "date", ""))[:10]} for r in records.items]
+                        receipts = []
+                        for r in records.items:
+                            r_parsed = {}
+                            if hasattr(r, "parsed") and r.parsed:
+                                try:
+                                    r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
+                                except Exception:
+                                    pass
+                            receipts.append({
+                                "payee": getattr(r, "payee", ""), 
+                                "amount": getattr(r, "amount", 0.0), 
+                                "date": str(getattr(r, "date", ""))[:10],
+                                "order_id": r_parsed.get("order_id")
+                            })
                         if receipts:
                             previously_attached_receipts_map[cid] = receipts
                     except Exception as e:
@@ -580,6 +616,8 @@ Matching rules:
 - Payee names may differ but should be conceptually similar. Notes may also contain the payee (often as a #tag).
 - Date within ±1 day, except rent/bills which may shift to the 1st of the next month.
 - If 'already_attached_receipts' is non-empty, only match if this receipt is clearly a newer version of the same transaction (e.g. a ride-share sends a no-tip receipt first, then an updated receipt with tip). When updating such a transaction, the new amount should typically be >= the existing amount.
+- If the current receipt has an 'order_id' and an attached receipt has a DIFFERENT 'order_id', DO NOT match it. It is a separate transaction.
+- If either the current receipt or the attached receipt is missing an 'order_id', rely on date and amount heuristics, but be cautious.
 
 Update rules (only when 'allowed_to_update' is true):
 - Use updated_amount, updated_payee, updated_notes, updated_transfer_account ONLY when the receipt provides new info (tip, transfer account, etc.).
