@@ -79,7 +79,7 @@ class ParsedProposedTransaction(BaseModel):
     transfer_account: Optional[str] = Field(default=None, description="The name of the account to transfer to, if this transaction is a transfer to another account")
 
 class ParsedReceipt(BaseModel):
-    date: str = Field(description="Date of the receipt in YYYY-MM-DD format")
+    order_date: str = Field(description="Date of the receipt in YYYY-MM-DD format. This is the date the order was placed or the transaction occurred.")
     currency: str = Field(description="Currency code (e.g. CAD, USD, EUR, JPY, GBP). Infer from symbols (e.g. € or ¥), text/language, or addresses. Default to CAD unless there is definitive proof otherwise.")
     payee: str = Field(description="Name of the store or payee")
     order_id: Optional[str] = Field(default=None, description="The order number, receipt number, invoice number, or reference ID (e.g., e-transfer reference number). Leave null if not present.")
@@ -398,9 +398,9 @@ async def parse_receipt_node(state: ReceiptState):
                 
             system_prompt = (
                 "You are an expert at extracting structured data from {source_desc}. "
-                "Respond with a JSON object using these top-level keys: 'date', 'currency', 'payee', 'order_id', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
+                "Respond with a JSON object using these top-level keys: 'order_date', 'currency', 'payee', 'order_id', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
                 "RULES:\n"
-                "- 'date': YYYY-MM-DD format. Today's date is {todays_date}. If missing, use the current date or guess from context. The date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and email context is available, use the email date instead.\n"
+                "- 'order_date': The date the order was placed or the transaction occurred, in YYYY-MM-DD format. This is NOT today's date — extract it from the receipt/email content. For reference, today's date is {todays_date}. If the receipt does not show a date, default to {todays_date}. The order_date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and email context is available, use the email date instead.\n"
                 "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
                 "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
                 "- 'order_id': The order number, receipt number, invoice number, or reference ID (e.g., e-transfer reference number). Leave null if not present.\n"
@@ -522,6 +522,10 @@ async def parse_receipt_node(state: ReceiptState):
                     print(f"[parse_receipt] {json.dumps(parsed_dict, indent=2)}")
                     print(f"[parse_receipt] [Metrics] Time: {response_time_ms}ms, Input Tokens: {prompt_tokens}, Output Tokens: {completion_tokens}")
                     print("[parse_receipt] " + "---------------------------------------\n")
+                
+                # Remap agent's "order_date" field to "date" for downstream consistency
+                if "order_date" in parsed_dict:
+                    parsed_dict["date"] = parsed_dict.pop("order_date")
             except Exception as e:
                 error_msg = str(e)
                 try:
