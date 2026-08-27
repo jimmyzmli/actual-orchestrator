@@ -6,7 +6,9 @@ def check_peak_hours(model_name: str = "deepseek") -> bool:
     if os.environ.get("ALLOW_PEAK_HOURS") == "1":
         return False
         
-    config_path = os.path.join(os.path.dirname(__file__), "config", "peak_hours.json")
+    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/peak_hours.json"))
+    if not os.path.exists(config_path):
+        config_path = os.path.join(os.path.dirname(__file__), "config", "peak_hours.json")
     if not os.path.exists(config_path):
         return False
         
@@ -64,9 +66,16 @@ def print_peak_hours_warning(model_name: str = "deepseek"):
 
 def pause_if_peak_hours(model_name: str = "deepseek"):
     if check_peak_hours(model_name):
+        import sys
+        if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+            print(f"\n⚠️  Currently in peak hours for {model_name} (non-interactive session; proceeding automatically).")
+            return
         try:
             input(f"\n⚠️  Currently in peak hours for {model_name}! Press Enter to run agent/LLM, or Ctrl+C to abort...")
-        except KeyboardInterrupt:
-            import sys
-            print("\nAborted by user.")
-            sys.exit(1)
+        except (KeyboardInterrupt, EOFError, OSError, IOError) as e:
+            if isinstance(e, KeyboardInterrupt):
+                import sys
+                print("\nAborted by user.")
+                sys.exit(1)
+            else:
+                print(f"\n⚠️  Currently in peak hours for {model_name} (stdin unavailable; proceeding).")
