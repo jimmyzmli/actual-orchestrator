@@ -445,7 +445,7 @@ async def parse_receipt_node(state: ReceiptState):
                             mapping = json.load(f)
                     
                     session = await ActualMCPClient.get_session()
-                    res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                    res = await session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
                     if res.content:
                         try:
                             accounts = json.loads(res.content[0].text)
@@ -702,7 +702,7 @@ async def parse_receipt_node(state: ReceiptState):
                     if account_id:
                         from actual_orch.clients.mcp import ActualMCPClient
                         acct_session = await ActualMCPClient.get_session()
-                        acct_res = await acct_session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                        acct_res = await acct_session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
                         if acct_res.content:
                             accts = json.loads(acct_res.content[0].text)
                             acct_match = next((a for a in accts if a.get("id") == account_id), None)

@@ -45,8 +45,8 @@ async def remove_transaction_tag(tx_id: str, tag: str = "#receipt") -> bool:
                 acc = tx_data.get("account")
                 dt = tx_data.get("date")
                 if acc and dt:
-                    list_res = await session.call_tool("actual_transactions", {"args": [
-                        "list", "--account", acc,
+                    list_res = await session.call_tool("actual_list_transactions", {"args": [
+                        "--account", acc,
                         "--start", dt, "--end", dt,
                         "--format", "json"
                     ]})
@@ -62,11 +62,11 @@ async def remove_transaction_tag(tx_id: str, tag: str = "#receipt") -> bool:
         if tag in existing_notes:
             new_notes = existing_notes.replace(tag, "").replace("  ", " ").strip()
             mcp_tools = await load_mcp_tools(session)
-            tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+            tx_tool = next((t for t in mcp_tools if t.name in ("actual_update_transaction", "actual_transactions")), None)
             
             if tx_tool:
                 await tx_tool.ainvoke({"args": [
-                    "update", target_tx_id,
+                    target_tx_id,
                     "--data", json.dumps({"notes": new_notes})
                 ]})
                 print(f"Removed {tag} tag from Actual Budget transaction {target_tx_id}.")

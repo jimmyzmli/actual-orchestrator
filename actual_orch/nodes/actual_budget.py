@@ -63,7 +63,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
     Returns the list of raw/reconstructed candidates, without filtering for #receipt.
     """
     try:
-        await session.call_tool("actual_sync", {})
+        await session.call_tool("actual_sync_budget", {})
     except Exception:
         pass
 
@@ -153,7 +153,7 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                 acc = sample_parent.get("account.name")
                 if acc:
                     # Resolve account name to ID for list API
-                    acc_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                    acc_res = await session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
                     acc_id = None
                     if acc_res.content:
                         accts = json.loads(acc_res.content[0].text)
@@ -161,8 +161,8 @@ async def get_actual_candidates(session, receipt_date: str) -> list[dict]:
                         if acc_match:
                             acc_id = acc_match.get("id")
                     if acc_id:
-                        list_res = await session.call_tool("actual_transactions", {"args": [
-                            "list", "--account", acc_id,
+                        list_res = await session.call_tool("actual_list_transactions", {"args": [
+                            "--account", acc_id,
                             "--start", start_date, "--end", end_date,
                             "--format", "json"
                         ]})
@@ -571,7 +571,7 @@ async def search_agent_node(state: dict):
                         mapping = json.load(f)
                     acc_id = mapping.get(account_key)
                     if acc_id:
-                        res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                        res = await session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
                         if res.content:
                             accounts = json.loads(res.content[0].text)
                             acc_match = next((a for a in accounts if a.get("id") == acc_id), None)
@@ -846,8 +846,8 @@ async def save_actual_transaction_node(state: dict):
             
         # Fetch accounts and payees for transfer resolution
         try:
-            acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
-            payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
+            acct_res = await session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
+            payee_res = await session.call_tool("actual_list_payees", {"args": ["--format", "json"]})
             all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
             all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
         except Exception as e:
@@ -928,10 +928,10 @@ async def save_actual_transaction_node(state: dict):
         
         # Save using Actual MCP
         mcp_tools = await load_mcp_tools(session)
-        tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+        tx_tool = next((t for t in mcp_tools if t.name in ("actual_add_transactions", "actual_transactions")), None)
         if tx_tool:
             await tx_tool.ainvoke({"args": [
-                "add", "--account", account_id,
+                "--account", account_id,
                 "--run-transfers",
                 "--data", json.dumps([new_tx])
             ]})
@@ -1090,12 +1090,12 @@ async def update_actual_transaction_node(state: dict):
 
             if target_payee_name or target_transfer_account:
                 try:
-                    payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
+                    payee_res = await session.call_tool("actual_list_payees", {"args": ["--format", "json"]})
                     all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
                     
                     if target_transfer_account:
                         transfer_acc_name = target_transfer_account
-                        acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
+                        acct_res = await session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
                         all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
                         
                         def clean_acct_name(s):
@@ -1127,7 +1127,7 @@ async def update_actual_transaction_node(state: dict):
                                 break
                                 
                         if not payee_id:
-                            create_res = await session.call_tool("actual_payees", {"args": ["create", "--name", target_payee_name]})
+                            create_res = await session.call_tool("actual_create_payee", {"args": ["--name", target_payee_name]})
                             if create_res and create_res.content:
                                 try:
                                     created = json.loads(create_res.content[0].text)
@@ -1172,8 +1172,8 @@ async def update_actual_transaction_node(state: dict):
                 pass
 
             try:
-                acct_res = await session.call_tool("actual_accounts", {"args": ["list", "--format", "json"]})
-                payee_res = await session.call_tool("actual_payees", {"args": ["list", "--format", "json"]})
+                acct_res = await session.call_tool("actual_list_accounts", {"args": ["--format", "json"]})
+                payee_res = await session.call_tool("actual_list_payees", {"args": ["--format", "json"]})
                 all_accounts = json.loads(acct_res.content[0].text) if acct_res.content else []
                 all_payees = json.loads(payee_res.content[0].text) if payee_res.content else []
             except Exception as e:
@@ -1219,11 +1219,11 @@ async def update_actual_transaction_node(state: dict):
 
             try:
                 # Delete old standalone transaction
-                await session.call_tool("actual_transactions", {"args": ["delete", tx_id]})
+                await session.call_tool("actual_delete_transaction", {"args": [tx_id]})
                 
                 # Add new split transaction
-                add_res = await session.call_tool("actual_transactions", {"args": [
-                    "add", "--account", tx_data["account"],
+                add_res = await session.call_tool("actual_add_transactions", {"args": [
+                    "--account", tx_data["account"],
                     "--format", "json",
                     "--data", json.dumps([update_payload])
                 ]})
@@ -1252,7 +1252,7 @@ async def update_actual_transaction_node(state: dict):
                     
                     # Sync first so the newly added transaction is visible
                     try:
-                        await session.call_tool("actual_sync", {})
+                        await session.call_tool("actual_sync_budget", {})
                     except Exception:
                         pass
                     
@@ -1296,11 +1296,11 @@ async def update_actual_transaction_node(state: dict):
                 print(f"[update_actual_transaction][error] ⚠️ Failed to recreate split transaction: {e}")
             return {}
         mcp_tools = await load_mcp_tools(session)
-        tx_tool = next((t for t in mcp_tools if t.name == "actual_transactions"), None)
+        tx_tool = next((t for t in mcp_tools if t.name in ("actual_update_transaction", "actual_transactions")), None)
         if tx_tool:
-            args = ["update", tx_id, "--data", json.dumps(update_payload)]
+            args = [tx_id, "--data", json.dumps(update_payload)]
             if state.get("flag_log_agent"):
-                args.insert(2, "-vv")
+                args.insert(1, "-vv")
                 print(f"[update_actual_transaction] Update payload: {json.dumps(update_payload)}")
                 
             res = await tx_tool.ainvoke({"args": args})
