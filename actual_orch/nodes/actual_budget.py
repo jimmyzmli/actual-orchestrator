@@ -278,9 +278,12 @@ async def search_deterministic_node(state: dict):
                         pb_client = get_pb_client()
                         records = pb_client.collection("receipts").get_list(1, 10, query_params={
                             "filter": f"tx_id='{final_id}'",
-                            "fields": "parsed"
+                            "fields": "parsed,flag"
                         })
                         for r in records.items:
+                            flag = getattr(r, "flag", None)
+                            if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                                continue
                             if hasattr(r, "parsed") and r.parsed:
                                 try:
                                     r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
@@ -356,10 +359,13 @@ async def search_agent_node(state: dict):
                     try:
                         records = pb_client.collection("receipts").get_list(1, 10, query_params={
                             "filter": f"tx_id='{cid}'",
-                            "fields": "payee,amount,date,parsed"
+                            "fields": "payee,amount,date,parsed,flag"
                         })
                         receipts = []
                         for r in records.items:
+                            flag = getattr(r, "flag", None)
+                            if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                                continue
                             r_parsed = {}
                             if hasattr(r, "parsed") and r.parsed:
                                 try:

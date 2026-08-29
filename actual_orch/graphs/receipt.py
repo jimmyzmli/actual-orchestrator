@@ -810,7 +810,7 @@ def router_after_search_deterministic(state: ReceiptState):
         return "error"
     if state.get("status") == WorkflowStatus.FALLBACK_TO_AGENT:
         return "fallback_to_agent"
-    if state.get("actual_tx_id") != "unknown_id":
+    if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
         return "update_actual"
     return "error"
 
@@ -819,7 +819,7 @@ def router_after_search_agent(state: ReceiptState):
         return "error"
     if state.get("status") == WorkflowStatus.RETRY_PARSE:
         return "retry_parse"
-    if state.get("status") == WorkflowStatus.HUMAN_APPROVAL or state.get("actual_tx_id") == "unknown_id":
+    if state.get("status") == WorkflowStatus.HUMAN_APPROVAL or not state.get("actual_tx_id") or state.get("actual_tx_id") == "unknown_id":
         if state.get("flag_create_missing"):
             return "save_actual"
         return "human_approval"
@@ -831,7 +831,7 @@ def router_after_save_actual(state: ReceiptState):
     return "update_actual"
 
 def router_after_human(state: ReceiptState):
-    if state.get("flag_create_missing") and state.get("actual_tx_id") == "unknown_id":
+    if state.get("flag_create_missing") and (not state.get("actual_tx_id") or state.get("actual_tx_id") == "unknown_id"):
         return "save_actual"
     if state.get("actual_tx_id") and state.get("actual_tx_id") != "unknown_id":
         return "update_actual"

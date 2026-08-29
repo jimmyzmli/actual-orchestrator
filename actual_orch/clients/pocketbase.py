@@ -13,7 +13,7 @@ def get_pb_client():
     client.collection("users").auth_with_password(pb_user, pb_pass)
     return client
 
-def fetch_all_field_values(field: str):
+def fetch_all_field_values(field: str, filter_expr: str = None):
     """
     Fetch all values for a specific field from PocketBase in a single paginated sweep.
     Uses `fields=field` and `skipTotal=true` to minimise payload.
@@ -25,10 +25,13 @@ def fetch_all_field_values(field: str):
     per_page = 500
     while True:
         try:
-            records = client.collection("receipts").get_list(page, per_page, query_params={
+            query_params = {
                 "fields": field,
                 "skipTotal": "true",
-            })
+            }
+            if filter_expr:
+                query_params["filter"] = filter_expr
+            records = client.collection("receipts").get_list(page, per_page, query_params=query_params)
             for r in records.items:
                 v = getattr(r, field, None)
                 if v:
@@ -41,7 +44,7 @@ def fetch_all_field_values(field: str):
             break
     return values
 
-def fetch_all_receipts():
+def fetch_all_receipts(filter_expr: str = None):
     """
     Fetch all receipts from PocketBase in a single paginated sweep.
     Returns a list of dictionaries with datetime objects converted to strings
@@ -53,9 +56,12 @@ def fetch_all_receipts():
     per_page = 500
     while True:
         try:
-            records = client.collection("receipts").get_list(page, per_page, query_params={
+            query_params = {
                 "skipTotal": "true",
-            })
+            }
+            if filter_expr:
+                query_params["filter"] = filter_expr
+            records = client.collection("receipts").get_list(page, per_page, query_params=query_params)
             for r in records.items:
                 d = dict(r.__dict__)
                 # Remove image field

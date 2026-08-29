@@ -71,7 +71,7 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
     except Exception as e:
         raise Exception(f"Failed to upsert to pocketbase: {e}")
 
-def check_receipt_exists(source_hash, _cached_hashes=None):
+def check_receipt_exists(source_hash, _cached_hashes=None, active_only=False):
     """
     Returns True if a receipt with the given source_hash already exists in PocketBase.
     If _cached_hashes (a set) is provided, does an O(1) in-memory lookup instead
@@ -82,8 +82,11 @@ def check_receipt_exists(source_hash, _cached_hashes=None):
 
     client = get_pb_client()
     try:
+        filter_str = f"source_hash='{source_hash}'"
+        if active_only:
+            filter_str += " && flag !~ 'ignore'"
         records = client.collection("receipts").get_list(1, 1, query_params={
-            "filter": f"source_hash='{source_hash}'",
+            "filter": filter_str,
             "fields": "id",
             "skipTotal": "true",
         })
@@ -110,38 +113,116 @@ def delete_receipt_by_hash(source_hash):
         print(f"Error deleting from pocketbase: {e}")
     return False
 
-def skip_if_processed(state: dict):
-    """Check PocketBase source_hash or source_ref to skip already-processed files."""
-    source = state.get("source", "file")
-    
-    # 1. Check source_ref
-    source_ref = state.get("source_ref", "")
+def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", known_refs: set = None, known_hashes: set = None) -> tuple[bool, str]:
+    """
+    Consolidated check for whether a receipt should be skipped before processing.
+    Checks PocketBase (source_ref, file_hash), Classification Cache, and Parsed Cache.
+    Returns (should_skip, reason_string).
+    """
     from actual_orch.shared.utils import get_receipt_type
     receipt_type = get_receipt_type(source)
-    if receipt_type != "email" and source_ref:
-        source_ref = source_ref.split("/")[-1]
+    
+    # 1. Check PocketBase by source_ref
+    clean_ref = source_ref
+    if receipt_type != "email" and clean_ref:
+        clean_ref = clean_ref.split("/")[-1]
         
-    if source_ref:
-        client = get_pb_client()
-        try:
-            records = client.collection("receipts").get_list(1, 1, query_params={
-                "filter": f"source_ref='{source_ref}'",
-                "fields": "id",
-                "skipTotal": "true",
-            })
-            if len(records.items) > 0:
-                print(f"⏭️  Already processed in PocketBase (ref {source_ref})")
-                return {"status": "already_processed"}
-        except Exception:
-            pass
+    if clean_ref:
+        if known_refs is not None and clean_ref in known_refs:
+            return True, f"already processed in PocketBase (ref {clean_ref})"
+        elif known_refs is None:
+            client = get_pb_client()
+            try:
+                records = client.collection("receipts").get_list(1, 1, query_params={
+                    "filter": f"source_ref='{clean_ref}'",
+                    "fields": "id,flag",
+                    "skipTotal": "true",
+                })
+                if len(records.items) > 0:
+                    flag = getattr(records.items[0], "flag", None)
+                    if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                        return True, "flagged as ignore in PocketBase"
+                    return True, f"already processed in PocketBase (ref {clean_ref})"
+            except Exception as e:
+                pass
 
-    # 2. Check source_hash
-    file_path = state.get("file_path", "")
+    # 2. Check PocketBase by source_hash
     if file_path:
         file_hash = _file_hash(file_path)
-        if check_receipt_exists(file_hash):
-            print(f"⏭️  Already processed in PocketBase (hash {file_hash[:12]}...): {file_path}")
-            return {"status": "already_processed"}
+        if known_hashes is not None and file_hash in known_hashes:
+            return True, f"already processed in PocketBase (hash {file_hash[:12]}...)"
+        elif known_hashes is None:
+            client = get_pb_client()
+            try:
+                records = client.collection("receipts").get_list(1, 1, query_params={
+                    "filter": f"source_hash='{file_hash}'",
+                    "fields": "id,flag",
+                    "skipTotal": "true",
+                })
+                if len(records.items) > 0:
+                    flag = getattr(records.items[0], "flag", None)
+                    if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                        return True, "flagged as ignore in PocketBase"
+                    return True, f"already processed in PocketBase (hash {file_hash[:12]}...)"
+            except Exception:
+                pass
+
+    # 3. Check Redis Caches (Classification and Parsed data)
+    if file_path:
+        from actual_orch.clients.cache import get_classify, get_parsed
+        import datetime
+        import os
+        import json
+        
+        prefix = f"receipt_{source}_" if source else "receipt_"
+        
+        # Check classification
+        cached_class = get_classify(file_path, prefix=prefix)
+        config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+        skip_classes = ["NOT_RECEIPT", "SHIPPING_CONFIRMATION", "INVOICE"]
+        if os.path.exists(config_path_class):
+            try:
+                with open(config_path_class, "r") as f:
+                    class_data = json.load(f)
+                    skip_classes = class_data.get("skip_classifications", skip_classes)
+            except Exception:
+                pass
+                
+        if cached_class and any(skip_cls in cached_class for skip_cls in skip_classes):
+            return True, f"classified as {cached_class.split('|')[0]}"
+            
+        # Check parsed data (0 amount or future date)
+        cached_parsed = get_parsed(file_path, prefix=prefix)
+        if not cached_parsed and prefix != "receipt_":
+            cached_parsed = get_parsed(file_path, prefix="receipt_")
+            
+        if cached_parsed:
+            is_zero = cached_parsed.get("total") is None or cached_parsed.get("total") == 0.0
+            if is_zero:
+                class_str = cached_class if cached_class else "UNKNOWN"
+                return True, f"Total amount is 0. (Classified as: {class_str.split('|')[0]})"
+                
+            if cached_parsed.get("date"):
+                try:
+                    parsed_date = datetime.datetime.strptime(cached_parsed["date"], "%Y-%m-%d").date()
+                    if datetime.date.today() < parsed_date:
+                        class_str = cached_class if cached_class else "UNKNOWN"
+                        return True, f"classified as {class_str.split('|')[0]} (future date)"
+                except Exception:
+                    pass
+
+    return False, ""
+
+def skip_if_processed(state: dict):
+    """Check PocketBase and caches to skip already-processed files."""
+    source = state.get("source", "file")
+    source_ref = state.get("source_ref", "")
+    file_path = state.get("file_path", "")
+    
+    skip, reason = should_skip_receipt(file_path, source_ref, source)
+    if skip:
+        print(f"⏭️  Skipped {source_ref or file_path}: {reason}")
+        return {"status": "already_processed"}
             
     return {}
 
