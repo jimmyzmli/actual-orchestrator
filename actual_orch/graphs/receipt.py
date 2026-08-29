@@ -825,6 +825,11 @@ def router_after_search_agent(state: ReceiptState):
         return "human_approval"
     return "update_actual"
 
+def router_after_save_actual(state: ReceiptState):
+    if state.get("status") == WorkflowStatus.HUMAN_APPROVAL or not state.get("actual_tx_id") or state.get("actual_tx_id") == "unknown_id":
+        return "human_approval"
+    return "update_actual"
+
 def router_after_human(state: ReceiptState):
     if state.get("flag_create_missing") and state.get("actual_tx_id") == "unknown_id":
         return "save_actual"
@@ -865,6 +870,6 @@ workflow.add_conditional_edges("search_agent", router_after_search_agent, {
     "retry_parse": "parse_receipt"
 })
 workflow.add_conditional_edges("human_approval", router_after_human, {"save_actual": "save_actual", "update_actual": "update_actual", "skip": END})
-workflow.add_edge("save_actual", "update_actual")
+workflow.add_conditional_edges("save_actual", router_after_save_actual, {"human_approval": "human_approval", "update_actual": "update_actual"})
 workflow.add_edge("update_actual", "save_pocketbase")
 workflow.add_edge("save_pocketbase", END)

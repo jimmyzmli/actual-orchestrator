@@ -818,8 +818,15 @@ async def save_actual_transaction_node(state: dict):
             
         selected_key = parsed.get("account_key")
         if not selected_key or selected_key not in mapping:
-            print(f"[save_actual_transaction][error]   ⚠️ Parsed account key '{selected_key}' is invalid or missing. Falling back to human approval.")
-            return {"status": "human_approval"}
+            if "DEFAULT-CC" in mapping:
+                selected_key = "DEFAULT-CC"
+                print(f"[save_actual_transaction]   ℹ️ Missing or invalid account key '{parsed.get('account_key')}', falling back to 'DEFAULT-CC' -> {mapping['DEFAULT-CC']}")
+            elif mapping:
+                selected_key = next(iter(mapping.keys()))
+                print(f"[save_actual_transaction]   ℹ️ Missing account key, falling back to first account key '{selected_key}' -> {mapping[selected_key]}")
+            else:
+                print(f"[save_actual_transaction][error]   ⚠️ Parsed account key '{selected_key}' is invalid or missing. Falling back to human approval.")
+                return {"status": "human_approval"}
             
         account_id = mapping[selected_key]
         print(f"[save_actual_transaction]   ✅ Extracted account key '{selected_key}' -> {account_id}")
