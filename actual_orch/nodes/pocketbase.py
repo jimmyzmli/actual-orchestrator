@@ -113,7 +113,7 @@ def delete_receipt_by_hash(source_hash):
         print(f"Error deleting from pocketbase: {e}")
     return False
 
-def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", known_refs: set = None, known_hashes: set = None) -> tuple[bool, str]:
+def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", known_refs: set = None, known_hashes: set = None, override_classification: str = None, skip_cache_types: list = None) -> tuple[bool, str]:
     """
     Consolidated check for whether a receipt should be skipped before processing.
     Checks PocketBase (source_ref, file_hash), Classification Cache, and Parsed Cache.
@@ -175,51 +175,66 @@ def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", k
         import json
         
         prefix = f"receipt_{source}_" if source else "receipt_"
+        skip_cache_types = skip_cache_types or []
         
         # Check classification
-        cached_class = get_classify(file_path, prefix=prefix)
-        config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
-        skip_classes = ["NOT_RECEIPT", "SHIPPING_CONFIRMATION", "INVOICE"]
-        if os.path.exists(config_path_class):
-            try:
-                with open(config_path_class, "r") as f:
-                    class_data = json.load(f)
-                    skip_classes = class_data.get("skip_classifications", skip_classes)
-            except Exception:
-                pass
-                
-        if cached_class and any(skip_cls in cached_class for skip_cls in skip_classes):
-            return True, f"classified as {cached_class.split('|')[0]}"
-            
-        # Check parsed data (0 amount or future date)
-        cached_parsed = get_parsed(file_path, prefix=prefix)
-        if not cached_parsed and prefix != "receipt_":
-            cached_parsed = get_parsed(file_path, prefix="receipt_")
-            
-        if cached_parsed:
-            is_zero = cached_parsed.get("total") is None or cached_parsed.get("total") == 0.0
-            if is_zero:
-                class_str = cached_class if cached_class else "UNKNOWN"
-                return True, f"Total amount is 0. (Classified as: {class_str.split('|')[0]})"
-                
-            if cached_parsed.get("date"):
+        if "classify" not in skip_cache_types:
+            check_class = override_classification if override_classification else get_classify(file_path, prefix=prefix)
+            config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
+            skip_classes = ["NOT_RECEIPT", "SHIPPING_CONFIRMATION", "INVOICE"]
+            if os.path.exists(config_path_class):
                 try:
-                    parsed_date = datetime.datetime.strptime(cached_parsed["date"], "%Y-%m-%d").date()
-                    if datetime.date.today() < parsed_date:
-                        class_str = cached_class if cached_class else "UNKNOWN"
-                        return True, f"classified as {class_str.split('|')[0]} (future date)"
+                    with open(config_path_class, "r") as f:
+                        class_data = json.load(f)
+                        skip_classes = class_data.get("skip_classifications", skip_classes)
                 except Exception:
                     pass
+                    
+            if check_class and any(skip_cls in check_class for skip_cls in skip_classes):
+                return True, f"classified as {check_class.split('|')[0]}"
+            
+        # Check parsed data (0 amount or future date)
+        if "parsed" not in skip_cache_types:
+            cached_parsed = get_parsed(file_path, prefix=prefix)
+            if not cached_parsed and prefix != "receipt_":
+                cached_parsed = get_parsed(file_path, prefix="receipt_")
+                
+            if cached_parsed:
+                cached_class = override_classification if override_classification else get_classify(file_path, prefix=prefix)
+                is_zero = cached_parsed.get("total") is None or cached_parsed.get("total") == 0.0
+                if is_zero:
+                    class_str = cached_class if cached_class else "UNKNOWN"
+                    return True, f"Total amount is 0. (Classified as: {class_str.split('|')[0]})"
+                    
+                if cached_parsed.get("date"):
+                    try:
+                        parsed_date = datetime.datetime.strptime(cached_parsed["date"], "%Y-%m-%d").date()
+                        if datetime.date.today() < parsed_date:
+                            class_str = cached_class if cached_class else "UNKNOWN"
+                            return True, f"classified as {class_str.split('|')[0]} (future date)"
+                    except Exception:
+                        pass
 
     return False, ""
 
 def skip_if_processed(state: dict):
     """Check PocketBase and caches to skip already-processed files."""
+    if state.get("force_rerun"):
+        return {}
+
     source = state.get("source", "file")
     source_ref = state.get("source_ref", "")
     file_path = state.get("file_path", "")
+    override_classification = state.get("override_classification")
+    skip_cache_types = state.get("flag_skip_cache_types", [])
     
-    skip, reason = should_skip_receipt(file_path, source_ref, source)
+    skip, reason = should_skip_receipt(
+        file_path,
+        source_ref,
+        source,
+        override_classification=override_classification,
+        skip_cache_types=skip_cache_types
+    )
     if skip:
         print(f"⏭️  Skipped {source_ref or file_path}: {reason}")
         return {"status": "already_processed"}

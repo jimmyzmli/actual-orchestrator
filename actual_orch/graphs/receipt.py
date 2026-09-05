@@ -66,6 +66,7 @@ class ReceiptState(TypedDict, total=False):
     classification: str   # The result of the LLM classification (e.g. RECEIPT, INVOICE)
     override_classification: str # Explicit override for classification
     flag_skip_cache_types: List[str] # Cache types to bypass (e.g. 'ocr', 'classify', 'parsed')
+    force_rerun: bool     # True if skipping checks should be bypassed
     
 # Pydantic model for Deepseek parsing
 class ReceiptItem(BaseModel):
@@ -209,6 +210,12 @@ def classify_input_node(state: ReceiptState):
         
         if classification:
             print(f"[classify_input] Using override classification: [{classification}]")
+            meta = {
+                "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "model": "manual-override",
+                "schema_version": "1.0.0"
+            }
+            set_classify(file_path, classification, meta, prefix=prefix)
         else:
             if "classify" not in state.get("flag_skip_cache_types", []):
                 classification = get_classify(file_path, prefix=prefix)
