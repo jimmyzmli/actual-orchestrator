@@ -11,12 +11,26 @@ def get_receipt_type(source: str) -> str:
         return "email"
     return "file"
 
+def get_config_path(filename: str) -> str:
+    """
+    Finds a config file in the project config directory or fallback locations.
+    """
+    candidates = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config", filename)),
+        os.path.abspath(os.path.join(os.getcwd(), "config", filename)),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../config", filename)),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
+
 def get_agent_config(node_name: str) -> dict:
     """
     Loads agents.json and returns the configuration for the specified node.
     Returns an empty dict if the config file or node doesn't exist.
     """
-    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../config/agents.json"))
+    config_path = get_config_path("agents.json")
     if not os.path.exists(config_path):
         return {}
         

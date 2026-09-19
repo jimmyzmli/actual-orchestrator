@@ -1,0 +1,52 @@
+{
+  "default_ollama_base_url": "http://localhost:11434",
+  "models": {
+    "qwen2.5:7b": {
+      "provider": "ollama",
+      "model": "qwen2.5:7b-32k",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "temperature": 0.0
+    },
+    "qwen2.5:7b-32k": {
+      "provider": "ollama",
+      "model": "qwen2.5:7b-32k",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "temperature": 0.0
+    },
+    "deepseek-v4-flash": {
+      "provider": "openai",
+      "model": "deepseek-chat",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "peak_hours": "deepseek"
+    },
+    "deepseek-v4-pro": {
+      "provider": "openai",
+      "model": "deepseek-chat",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "peak_hours": "deepseek"
+    },
+    "deepseek-chat": {
+      "provider": "openai",
+      "model": "deepseek-chat",
+      "base_url": "https://api.deepseek.com/v1",
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "peak_hours": "deepseek"
+    },
+    "gemini-3.1-flash-lite": {
+      "provider": "google",
+      "model": "gemini-3.1-flash-lite",
+      "api_key_env": "GEMINI_API_KEY",
+      "temperature": 0.0
+    },
+    "gemini-3.1-pro": {
+      "provider": "google",
+      "model": "gemini-3.1-pro",
+      "api_key_env": "GEMINI_API_KEY",
+      "temperature": 0.0
+    }
+  }
+}

@@ -4,6 +4,7 @@ from typing import TypedDict, Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
+from actual_orch.shared.models import get_chat_model
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
@@ -101,10 +102,8 @@ def parse_statement_node(state: StatementState):
         attempts = get_agent_config("statement_parse").get("attempts", [])
         model_name = attempts[0].get("model", "deepseek-chat") if attempts else "deepseek-chat"
 
-        llm = ChatOpenAI(
-            model=model_name, # API identifier for DeepSeek-V4-Pro
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-            base_url="https://api.deepseek.com/v1",
+        llm = get_chat_model(
+            model_name,
             max_tokens=8000,
             model_kwargs={"response_format": {"type": "json_object"}}
         )
@@ -130,10 +129,10 @@ def parse_statement_node(state: StatementState):
         meta = {
             "source_file": f"file://{os.path.abspath(file_path)}",
             "parse_generation_date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "parse_model_used": "deepseek-chat",
+            "parse_model_used": model_name,
             "schema_version": "1.0.0",
             "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "model": "deepseek-chat"
+            "model": model_name
         }
         set_parsed(file_path, parsed_dict, meta, prefix="statement_")
             
@@ -176,11 +175,7 @@ def extract_and_parse_statement_node(state: StatementState):
         attempts = get_agent_config("statement_holistic").get("attempts", [])
         model_name = attempts[0].get("model", "gemini-3.1-pro") if attempts else "gemini-3.1-pro"
 
-        llm = ChatGoogleGenerativeAI(
-            model=model_name, # Use the pro model for complex extraction
-            api_key=os.environ.get("GEMINI_API_KEY", ""),
-            temperature=0
-        )
+        llm = get_chat_model(model_name, temperature=0)
         
         structured_llm = llm.with_structured_output(ParsedStatement)
         
@@ -203,7 +198,7 @@ def extract_and_parse_statement_node(state: StatementState):
         parsed_dict = result.dict()
         meta = {
             "response_ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "model": "gemini-3.1-pro",
+            "model": model_name,
             "schema_version": "1.0.0"
         }
         set_parsed(file_path, parsed_dict, meta)

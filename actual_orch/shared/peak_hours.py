@@ -59,6 +59,29 @@ def check_peak_hours(model_name: str = "deepseek") -> bool:
     return False
 
 def print_peak_hours_warning(model_name: str = "deepseek"):
+    # Check if any configured agent uses a model with this peak hours schedule
+    try:
+        from actual_orch.shared.utils import get_config_path
+        from actual_orch.shared.models import get_model_config
+        agents_path = get_config_path("agents.json")
+        if os.path.exists(agents_path):
+            with open(agents_path, "r") as f:
+                agents_cfg = json.load(f)
+            uses_schedule = False
+            for task, task_cfg in agents_cfg.items():
+                if isinstance(task_cfg, dict):
+                    for att in task_cfg.get("attempts", []):
+                        m = att.get("model")
+                        if m and get_model_config(m).get("peak_hours") == model_name:
+                            uses_schedule = True
+                            break
+                if uses_schedule:
+                    break
+            if not uses_schedule:
+                return
+    except Exception:
+        pass
+
     if check_peak_hours(model_name):
         print(f"\n⚠️  WARNING: Currently in Peak Hours for {model_name}.")
         print(f"Processing with {model_name} during this time may experience API limits or rate throttling.")

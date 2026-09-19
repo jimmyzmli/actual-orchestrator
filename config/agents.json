@@ -9,7 +9,7 @@
   "receipt_classify": {
     "attempts": [
       {
-        "model": "deepseek-v4-flash"
+        "model": "qwen2.5:7b"
       }
     ]
   },
@@ -17,28 +17,30 @@
     "attempts": [
       {
         "model": "deepseek-v4-pro"
-      },
-      {
-        "model": "deepseek-v4-pro",
-        "append_prompt": "\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction.",
-        "skip_for_create": true
       }
     ]
   },
   "budget_search": {
     "attempts": [
       {
-        "model": "deepseek-v4-flash"
+        "model": "qwen2.5:7b",
+        "structured_candidates": 40,
+        "reparse_on_fail": {
+          "model": "deepseek-v4-pro",
+          "append_prompt": "\n\nCRITICAL: Double check the transaction date is correct! You previously extracted {prev_date} but we couldn't find a matching transaction in the bank records around that date. Ensure you aren't using the print date or statement date instead of the actual purchase date. Look closely for the date of the actual transaction.",
+          "skip_for_create": true
+        }
       },
       {
-        "model": "deepseek-v4-pro"
+        "model": "deepseek-v4-flash",
+        "skip_for_create": true
       }
     ]
   },
   "statement_parse": {
     "attempts": [
       {
-        "model": "deepseek-chat"
+        "model": "qwen2.5:7b"
       }
     ]
   },

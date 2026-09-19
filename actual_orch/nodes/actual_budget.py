@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 from langchain_mcp_adapters.tools import load_mcp_tools
+from actual_orch.shared.models import get_chat_model
 
 from actual_orch.shared.scoring import score_candidate
 from actual_orch.clients.mcp import ActualMCPClient
@@ -261,12 +262,15 @@ async def search_deterministic_node(state: dict):
         top_score = top["match_score"]
         final_id = "unknown_id"
         
-        if top_score >= SCORE_AUTO_ACCEPT:
+        if not state.get("flag_skip_auto_match") and top_score >= SCORE_AUTO_ACCEPT:
             final_id = top["id"]
             print(f"[search_deterministic] ✅ Auto-matched (score {top_score:.3f}): {final_id}")
             print_matched_transaction(top)
         else:
-            print(f"[search_deterministic]   No candidate scored ≥ {SCORE_AUTO_ACCEPT}, falling through to agent...")
+            if state.get("flag_skip_auto_match"):
+                print(f"[search_deterministic] ⏭️ Skipping deterministic auto-match due to flag_skip_auto_match, falling through to agent...")
+            else:
+                print(f"[search_deterministic]   No candidate scored ≥ {SCORE_AUTO_ACCEPT}, falling through to agent...")
             
         # Validate deterministic match
         if final_id != "unknown_id":
@@ -520,49 +524,75 @@ async def search_agent_node(state: dict):
             return (dd, min_a_diff)
                 
         structured_candidates.sort(key=get_sort_key)
-        structured_candidates = structured_candidates[:50]
         
         agent_attempts = state.get("agent_attempts", [])
         search_attempts = [a for a in agent_attempts if a.get("node") == "search_agent"]
-        already_retried = len(search_attempts) > 0
+        attempt_idx = len(search_attempts)
         
         from actual_orch.shared.utils import get_agent_config
-                
-        def should_retry_parse():
-            if state.get("flag_create_missing"):
-                parse_attempts_cfg = get_agent_config("receipt_parse").get("attempts", [])
-                parse_retries = len([a for a in agent_attempts if a.get("node") == "receipt_parse"])
-                if parse_retries < len(parse_attempts_cfg):
-                    if parse_attempts_cfg[parse_retries].get("skip_for_create"):
-                        return False
-            return True
+        search_attempts_cfg = get_agent_config("budget_search").get("attempts", [])
+        max_search_attempts = len(search_attempts_cfg) if search_attempts_cfg else 1
+        
+        if attempt_idx >= max_search_attempts:
+            print(f"[search_agent][error]   ❌ All search attempts exhausted ({attempt_idx}/{max_search_attempts}). Routing to human approval.")
+            return {
+                "status": "human_approval",
+                "actual_tx_id": "unknown_id"
+            }
+            
+        current_attempt = search_attempts_cfg[attempt_idx] if search_attempts_cfg else {}
+        model_name = current_attempt.get("model", "deepseek-v4-pro")
+        
+        cand_limit = current_attempt.get("structured_candidates")
+        if cand_limit is None:
+            cand_limit = current_attempt.get("max_candidates")
+        if cand_limit is not None and isinstance(cand_limit, int) and cand_limit > 0:
+            print(f"[search_agent]   Limiting structured candidates to top {cand_limit} (attempt config)")
+            structured_candidates = structured_candidates[:cand_limit]
+        else:
+            print(f"[search_agent]   Using all {len(structured_candidates)} structured candidates")
+        
+        print(f"[search_agent]   🔄 Search attempt {attempt_idx + 1}/{max_search_attempts} with model ({model_name})...")
 
         if not structured_candidates:
-            print("[search_agent][error] " + "  ❌ No candidates available for agent to search. Failing immediately.")
-            if not already_retried and should_retry_parse():
-                print(f"[search_agent][error]   ❌ Matching failed completely. Triggering parse_receipt retry...")
+            print("[search_agent][error] " + "  ❌ No candidates available for agent to search.")
+            attempt_log = {
+                "node": "search_agent",
+                "model": model_name,
+                "success": False,
+                "error": "No candidates"
+            }
+            reparse_on_fail = current_attempt.get("reparse_on_fail")
+            if reparse_on_fail:
+                if state.get("flag_create_missing") and reparse_on_fail.get("skip_for_create"):
+                    print("[search_agent]   Skipping reparse_on_fail due to skip_for_create. Routing to human approval.")
+                    return {
+                        "agent_attempts": agent_attempts + [attempt_log],
+                        "status": "human_approval",
+                        "actual_tx_id": "unknown_id"
+                    }
+                else:
+                    print(f"[search_agent]   Triggering parse_receipt retry (reparse_on_fail)...")
+                    return {
+                        "agent_attempts": agent_attempts + [attempt_log],
+                        "status": "retry_parse",
+                        "reparse_config": reparse_on_fail,
+                        "actual_tx_id": "unknown_id"
+                    }
+            elif attempt_idx + 1 < max_search_attempts:
+                print(f"[search_agent]   Advancing to next search attempt ({attempt_idx + 2}/{max_search_attempts})...")
                 return {
-                    "agent_attempts": agent_attempts + [{"node": "search_agent", "model": "search_agent", "success": False, "error": "No candidates"}],
-                    "status": "retry_parse",
+                    "agent_attempts": agent_attempts + [attempt_log],
+                    "status": "retry_search",
                     "actual_tx_id": "unknown_id"
                 }
             else:
-                if not already_retried:
-                    print(f"[search_agent][error]   ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
-                else:
-                    print(f"[search_agent][error]   ❌ Matching failed completely after retry. Routing to human approval.")
+                print(f"[search_agent][error]   ❌ Search failed completely (no candidates, no further retries). Routing to human approval.")
                 return {
-                    "agent_attempts": agent_attempts + [{"node": "search_agent", "model": "search_agent", "success": False, "error": "No candidates"}],
-                    "status": "human_approval", 
+                    "agent_attempts": agent_attempts + [attempt_log],
+                    "status": "human_approval",
                     "actual_tx_id": "unknown_id"
                 }
-        
-        search_attempts_cfg = get_agent_config("budget_search").get("attempts", [])
-        
-        current_attempt = search_attempts_cfg[min(len(search_attempts), len(search_attempts_cfg) - 1)] if search_attempts_cfg else {}
-        model_name = current_attempt.get("model", "deepseek-v4-pro" if already_retried else "deepseek-v4-flash")
-        
-        print(f"[search_agent]   🔄 Retrying match with model ({model_name})...")
         
         # Prepare receipt details for the prompt
         parsed_prompt = dict(parsed)
@@ -633,10 +663,11 @@ Update rules (only when 'allowed_to_update' is true):
 
 Respond with 'matched_id' (UUID or null)."""
             
-        llm = ChatOpenAI(
-            model=model_name, 
-            api_key=os.environ.get("DEEPSEEK_API_KEY", ""), 
-            base_url="https://api.deepseek.com/v1",
+        if current_attempt.get("append_prompt"):
+            prompt_text += "\n\n" + current_attempt["append_prompt"]
+            
+        llm = get_chat_model(
+            model_name,
             model_kwargs={"response_format": {"type": "json_object"}}
         )
         
@@ -731,18 +762,32 @@ Respond with 'matched_id' (UUID or null)."""
                 "completion_tokens": completion_tokens,
                 "response_time_ms": response_time_ms
             }
-            if not already_retried and should_retry_parse():
-                print(f"[search_agent][error]   ❌ Triggering parse_receipt retry...")
+            reparse_on_fail = current_attempt.get("reparse_on_fail")
+            if reparse_on_fail:
+                if state.get("flag_create_missing") and reparse_on_fail.get("skip_for_create"):
+                    print(f"[search_agent]   Skipping reparse_on_fail due to skip_for_create. Routing to human approval.")
+                    return {
+                        "agent_attempts": agent_attempts + [attempt_log],
+                        "status": "human_approval", 
+                        "actual_tx_id": "unknown_id"
+                    }
+                else:
+                    print(f"[search_agent]   Triggering parse_receipt retry (reparse_on_fail)...")
+                    return {
+                        "agent_attempts": agent_attempts + [attempt_log],
+                        "status": "retry_parse",
+                        "reparse_config": reparse_on_fail,
+                        "actual_tx_id": "unknown_id"
+                    }
+            elif attempt_idx + 1 < max_search_attempts:
+                print(f"[search_agent]   Advancing to next search attempt ({attempt_idx + 2}/{max_search_attempts})...")
                 return {
                     "agent_attempts": agent_attempts + [attempt_log],
-                    "status": "retry_parse",
+                    "status": "retry_search",
                     "actual_tx_id": "unknown_id"
                 }
             else:
-                if not already_retried:
-                    print(f"[search_agent][error]   ❌ Matching failed completely. Skipping parse retry due to skip_for_create. Routing to human approval.")
-                else:
-                    print(f"[search_agent][error]   ❌ Matching failed completely after retry. Routing to human approval.")
+                print(f"[search_agent][error]   ❌ Search failed completely after {attempt_idx + 1} attempt(s). Routing to human approval.")
                 return {
                     "agent_attempts": agent_attempts + [attempt_log],
                     "status": "human_approval", 
