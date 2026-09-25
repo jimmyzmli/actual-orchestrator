@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist for benign documentation and example templates"
+paths = [
+  '''^\.env\.example$''',
+  '''^README\.md$'''
+]
