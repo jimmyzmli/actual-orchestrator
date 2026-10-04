@@ -9,7 +9,7 @@
   "receipt_classify": {
     "attempts": [
       {
-        "model": "qwen2.5:7b"
+        "model": "deepseek-v4-flash"
       }
     ]
   },
