@@ -23,7 +23,7 @@
   "budget_search": {
     "attempts": [
       {
-        "model": "qwen2.5:7b",
+        "model": "deepseek-v4-flash",
         "structured_candidates": 40,
         "reparse_on_fail": {
           "model": "deepseek-v4-pro",
