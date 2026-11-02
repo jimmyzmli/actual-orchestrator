@@ -113,7 +113,7 @@ def delete_receipt_by_hash(source_hash):
         print(f"Error deleting from pocketbase: {e}")
     return False
 
-def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", known_refs: set = None, known_hashes: set = None, override_classification: str = None, skip_cache_types: list = None) -> tuple[bool, str]:
+def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", known_refs: set = None, known_hashes: set = None, override_classification: str = None, skip_cache_types: list = None, document_date: str = None) -> tuple[bool, str]:
     """
     Consolidated check for whether a receipt should be skipped before processing.
     Checks PocketBase (source_ref, file_hash), Classification Cache, and Parsed Cache.
@@ -210,8 +210,18 @@ def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", k
                     try:
                         parsed_date = datetime.datetime.strptime(cached_parsed["date"], "%Y-%m-%d").date()
                         if datetime.date.today() < parsed_date:
-                            class_str = cached_class if cached_class else "UNKNOWN"
-                            return True, f"classified as {class_str.split('|')[0]} (future date)"
+                            # If a reference document date is known and not in the future, don't skip;
+                            # it will be corrected by parse_receipt during processing.
+                            if document_date:
+                                ref_date = datetime.datetime.strptime(document_date, "%Y-%m-%d").date()
+                                if ref_date <= datetime.date.today():
+                                    pass
+                                else:
+                                    class_str = cached_class if cached_class else "UNKNOWN"
+                                    return True, f"classified as {class_str.split('|')[0]} (future date)"
+                            else:
+                                class_str = cached_class if cached_class else "UNKNOWN"
+                                return True, f"classified as {class_str.split('|')[0]} (future date)"
                     except Exception:
                         pass
 
@@ -227,13 +237,15 @@ def skip_if_processed(state: dict):
     file_path = state.get("file_path", "")
     override_classification = state.get("override_classification")
     skip_cache_types = state.get("flag_skip_cache_types", [])
+    document_date = state.get("document_date")
     
     skip, reason = should_skip_receipt(
         file_path,
         source_ref,
         source,
         override_classification=override_classification,
-        skip_cache_types=skip_cache_types
+        skip_cache_types=skip_cache_types,
+        document_date=document_date
     )
     if skip:
         print(f"⏭️  Skipped {source_ref or file_path}: {reason}")

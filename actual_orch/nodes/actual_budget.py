@@ -623,9 +623,9 @@ async def search_agent_node(state: dict):
                 print(f"[search_agent][error]   ⚠️ Failed to translate account_key: {e}")
                 parsed_prompt["account"] = strip_emojis(account_key)
 
-        from actual_orch.shared.utils import get_receipt_type
-        if get_receipt_type(state.get("source")) == "email" and state.get("email_context"):
-            parsed_prompt["email_context"] = state.get("email_context")
+        source_ctx = state.get("source_context")
+        if source_ctx:
+            parsed_prompt["source_context"] = source_ctx
             
         try:
             config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))

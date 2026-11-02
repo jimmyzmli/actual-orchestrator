@@ -58,8 +58,9 @@ class ReceiptState(TypedDict, total=False):
     update_transaction: ProposedTransaction # Agent proposed updates
     status: str
     error: str
-    email_date: str
-    email_context: str    # Context string containing sender, subject, folder, etc.
+    document_date: str    # Reference date from source metadata (email date, paperless created date, etc.)
+    source_context: str   # Formatted context block for LLM prompts (email headers, paperless tags/metadata, etc.)
+    source_metadata: Dict[str, Any] # Structured source-specific metadata
     image_paths: List[str] # Paths to extracted JPEG images
     proposed_transactions: List[ProposedTransaction] 
     agent_attempts: List[AgentAttempt] # History of all agent attempts (node, model, success, error)
@@ -98,9 +99,17 @@ def extract_ocr_node(state: ReceiptState):
     try:
         file_path = state["file_path"]
 
-        # If it's a PDF, we need page images for PocketBase upload and Gemini
+        # Check if file is a PDF (by extension or magic bytes)
+        is_pdf = file_path.lower().endswith(".pdf")
+        if not is_pdf and os.path.exists(file_path):
+            try:
+                with open(file_path, "rb") as f:
+                    is_pdf = f.read(5).startswith(b"%PDF")
+            except Exception:
+                pass
+
         image_paths = []
-        if file_path.lower().endswith(".pdf"):
+        if is_pdf:
             gen_dir = os.path.join(os.getcwd(), "cache", "generated_image")
             os.makedirs(gen_dir, exist_ok=True)
             images = convert_from_path(file_path)
@@ -256,12 +265,13 @@ def classify_input_node(state: ReceiptState):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
             except Exception as e:
                 print(f"[classify_input][error]   ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
-            from actual_orch.shared.utils import get_receipt_type
-            if get_receipt_type(state.get("source")) == "email":
-                email_ctx = state.get("email_context", "")
-                if state.get('email_date'):
-                    email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
-                system_prompt += f"\n\nEMAIL CONTEXT:\n{email_ctx}" + client_ctx
+            source_ctx = state.get("source_context") or ""
+            doc_date = state.get("document_date")
+            if doc_date and "- Date:" not in source_ctx and "- Created Date:" not in source_ctx:
+                source_ctx = f"- Date: {doc_date}\n" + source_ctx
+
+            if source_ctx.strip():
+                system_prompt += f"\n\nSOURCE CONTEXT:\n{source_ctx.strip()}" + client_ctx
             else:
                 system_prompt += client_ctx
                 
@@ -329,7 +339,15 @@ def classify_input_node(state: ReceiptState):
             try:
                 parsed_date = datetime.datetime.strptime(parsed_data["date"], "%Y-%m-%d").date()
                 if datetime.date.today() < parsed_date:
-                    is_future_date = True
+                    ref_date_str = state.get("document_date")
+                    if ref_date_str:
+                        ref_d = datetime.datetime.strptime(ref_date_str, "%Y-%m-%d").date()
+                        if ref_d <= datetime.date.today():
+                            is_future_date = False
+                        else:
+                            is_future_date = True
+                    else:
+                        is_future_date = True
             except Exception:
                 pass
                 
@@ -400,6 +418,8 @@ async def parse_receipt_node(state: ReceiptState):
             source_type = get_receipt_type(state.get("source"))
             if source_type == "email":
                 source_desc = "raw text from an email receipt"
+            elif source_type == "paperless":
+                source_desc = "OCR text and metadata from a Paperless document receipt"
             else:
                 source_desc = "OCR text from a paper receipt or file"
                 
@@ -407,7 +427,7 @@ async def parse_receipt_node(state: ReceiptState):
                 "You are an expert at extracting structured data from {source_desc}. "
                 "Respond with a JSON object using these top-level keys: 'order_date', 'currency', 'payee', 'order_id', 'notes', 'items', 'account_key', 'proposed_transactions'.\n\n"
                 "RULES:\n"
-                "- 'order_date': The date the order was placed or the transaction occurred, in YYYY-MM-DD format. This is NOT today's date — extract it from the receipt/email content. For reference, today's date is {todays_date}. If the receipt does not show a date, default to {todays_date}. The order_date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and email context is available, use the email date instead.\n"
+                "- 'order_date': The date the order was placed or the transaction occurred, in YYYY-MM-DD format. This is NOT today's date — extract it from the receipt/email/document content. For reference, today's date is {todays_date}. If the receipt does not show a date, default to {todays_date}. The order_date MUST NOT be in the future (after {todays_date}). If the parsed date would be in the future and document/email context is available, use the document/email date instead.\n"
                 "- 'currency': The 3-letter currency code (e.g. CAD, USD, EUR, JPY). Default to CAD unless there is definitive proof otherwise (explicit USD symbol, foreign currency text). Payees with foreign addresses (Uber Amsterdam, Apple California) often charge in CAD — do NOT assume USD from an address alone.\n"
                 "- 'payee': Name of the store or payee. For ATM receipts use the bank name or 'ATM'.\n"
                 "- 'order_id': The order number, receipt number, invoice number, or reference ID (e.g., e-transfer reference number). Leave null if not present.\n"
@@ -434,11 +454,13 @@ async def parse_receipt_node(state: ReceiptState):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
             except Exception as e:
                 print(f"[parse_receipt][error]   ⚠️ Failed to load AGENT_USER_CONTEXT: {e}")
-            if source_type == "email":
-                email_ctx = state.get("email_context", "")
-                if state.get('email_date'):
-                    email_ctx = f"- Date: {state.get('email_date')}\n" + email_ctx
-                system_prompt += f"\n\nEMAIL CONTEXT:\n{email_ctx}" + client_ctx
+            source_ctx = state.get("source_context") or ""
+            doc_date = state.get("document_date")
+            if doc_date and "- Date:" not in source_ctx and "- Created Date:" not in source_ctx:
+                source_ctx = f"- Date: {doc_date}\n" + source_ctx
+
+            if source_ctx.strip():
+                system_prompt += f"\n\nSOURCE CONTEXT:\n{source_ctx.strip()}" + client_ctx
             else:
                 system_prompt += client_ctx
 
@@ -584,19 +606,23 @@ async def parse_receipt_node(state: ReceiptState):
                 })
                 return {"agent_attempts": agent_attempts, "reparse_config": None}
         
-        # Email date override logic
-        from actual_orch.shared.utils import get_receipt_type
-        if get_receipt_type(state.get("source")) == "email" and state.get("email_date"):
+        # Document date override logic
+        ref_date = state.get("document_date")
+
+        if ref_date:
             if parse_retries == 0:
                 try:
-                    email_dt = datetime.datetime.strptime(state["email_date"], "%Y-%m-%d")
+                    ref_dt = datetime.datetime.strptime(ref_date, "%Y-%m-%d")
                     if parsed_dict.get("date"):
                         parsed_dt = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d")
-                        if (email_dt - parsed_dt).days > 3:
-                            print(f"[parse_receipt]  Overriding parsed date {parsed_dict['date']} with email date {state['email_date']} (>3 days older)")
-                            parsed_dict["date"] = state["email_date"]
+                        if parsed_dt.date() > datetime.date.today():
+                            print(f"[parse_receipt]  Overriding future parsed date {parsed_dict['date']} with reference date {ref_date}")
+                            parsed_dict["date"] = ref_date
+                        elif (ref_dt - parsed_dt).days > 3:
+                            print(f"[parse_receipt]  Overriding parsed date {parsed_dict['date']} with reference date {ref_date} (>3 days older)")
+                            parsed_dict["date"] = ref_date
                     else:
-                        parsed_dict["date"] = state["email_date"]
+                        parsed_dict["date"] = ref_date
                 except Exception as e:
                     print(f"[parse_receipt][error]   ⚠️ Could not compare dates for override: {e}")
         
@@ -673,10 +699,10 @@ async def parse_receipt_node(state: ReceiptState):
             try:
                 parsed_date = datetime.datetime.strptime(parsed_dict["date"], "%Y-%m-%d").date()
                 if datetime.date.today() < parsed_date:
-                    from actual_orch.shared.utils import get_receipt_type
-                    if get_receipt_type(state.get("source")) == "email" and state.get("email_date"):
-                        print(f"[parse_receipt][error]   ⚠️ Parsed date {parsed_date} is in the future. Falling back to email date {state['email_date']}.")
-                        parsed_dict["date"] = state["email_date"]
+                    ref_date = state.get("document_date")
+                    if ref_date:
+                        print(f"[parse_receipt][error]   ⚠️ Parsed date {parsed_date} is in the future. Falling back to reference date {ref_date}.")
+                        parsed_dict["date"] = ref_date
                     elif skip_if_future_date:
                         print(f"[parse_receipt][skip]   ⏭️  Parsed date {parsed_date} is in the future. Skipping.")
                         return {"status": WorkflowStatus.ALREADY_PROCESSED, "parsed_data": parsed_dict, "agent_attempts": agent_attempts}
