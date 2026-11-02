@@ -38,9 +38,11 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
     if image_paths:
         uploads = []
         for idx, path in enumerate(image_paths):
-            with open(path, "rb") as f:
-                uploads.append((f"page_{idx}.jpg", f.read()))
-        data["image"] = FileUpload(*uploads)
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    uploads.append((f"page_{idx}.jpg", f.read()))
+        if uploads:
+            data["image"] = FileUpload(*uploads)
     
     try:
         # Try to find existing record by source_hash or source_ref
@@ -294,6 +296,34 @@ def save_pocketbase_node(state: dict):
             
         image_paths = state.get("image_paths", [])
         file_path = state.get("file_path", "")
+        # Ensure image paths exist on disk; regenerate if missing
+        valid_images = [p for p in image_paths if os.path.exists(p)]
+        if not valid_images and file_path and os.path.exists(file_path):
+            is_pdf = file_path.lower().endswith(".pdf")
+            if not is_pdf:
+                try:
+                    with open(file_path, "rb") as f:
+                        is_pdf = f.read(5).startswith(b"%PDF")
+                except Exception:
+                    pass
+            if is_pdf:
+                try:
+                    from pdf2image import convert_from_path
+                    gen_dir = os.path.join(os.getcwd(), "cache", "generated_image")
+                    os.makedirs(gen_dir, exist_ok=True)
+                    images = convert_from_path(file_path)
+                    for idx, img in enumerate(images):
+                        safe_name = os.path.basename(file_path) + f"_page_{idx}.jpg"
+                        img_path = os.path.join(gen_dir, safe_name)
+                        if not os.path.exists(img_path):
+                            img.save(img_path, format="JPEG")
+                        valid_images.append(img_path)
+                except Exception as e:
+                    print(f"[save_pocketbase][warning] Failed to generate page images: {e}")
+            elif file_path.lower().endswith((".jpg", ".jpeg", ".png", ".webp", ".heic")):
+                valid_images = [file_path]
+        image_paths = valid_images
+
         if source == "email":
             source_hash = ""
         else:
@@ -317,4 +347,5 @@ def save_pocketbase_node(state: dict):
                         
         return {"status": "success"}
     except Exception as e:
+        print(f"[save_pocketbase][error] ❌ PocketBase save failed: {e}")
         return {"status": "error", "error": f"PocketBase save failed: {str(e)}"}
