@@ -1,3 +1,4 @@
+import os
 import json
 from pocketbase.models.file_upload import FileUpload
 from actual_orch.clients.pocketbase import get_pb_client
@@ -173,7 +174,6 @@ def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", k
     if file_path:
         from actual_orch.clients.cache import get_classify, get_parsed
         import datetime
-        import os
         import json
         
         prefix = f"receipt_{source}_" if source else "receipt_"
@@ -337,7 +337,6 @@ def save_pocketbase_node(state: dict):
         
         # Clean up generated images
         if image_paths:
-            import os
             for path in image_paths:
                 if "cache/generated_image" in path and os.path.exists(path):
                     try:
