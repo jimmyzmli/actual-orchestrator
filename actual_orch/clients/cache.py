@@ -15,7 +15,57 @@ try:
 except ImportError:
     redis = None
 
-_client: Optional['redis.Redis'] = None
+import sqlite3
+
+class _SQLiteCacheFallback:
+    def __init__(self, db_path=None):
+        if not db_path:
+            db_path = os.getenv("SQLITE_CACHE_PATH", os.path.join(os.getcwd(), "data", "cache.sqlite"))
+        self.db_path = os.path.abspath(db_path)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, val TEXT)")
+
+    def get(self, key):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT val FROM cache WHERE key = ?", (key,))
+                row = cur.fetchone()
+                return row[0] if row else None
+        except Exception:
+            return None
+
+    def set(self, key, val):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("INSERT OR REPLACE INTO cache (key, val) VALUES (?, ?)", (key, val))
+        except Exception:
+            pass
+
+    def delete(self, *keys):
+        if not keys:
+            return 0
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                q = f"DELETE FROM cache WHERE key IN ({','.join(['?']*len(keys))})"
+                cur = conn.execute(q, keys)
+                return cur.rowcount
+        except Exception:
+            return 0
+
+    def keys(self, pattern="*"):
+        try:
+            sql_pattern = pattern.replace("*", "%").replace("?", "_")
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT key FROM cache WHERE key LIKE ?", (sql_pattern,))
+                return [r[0] for r in cur.fetchall()]
+        except Exception:
+            return []
+
+
+_client: Optional[any] = None
 
 CACHE_PREFIX = "receipt:"
 
@@ -25,15 +75,16 @@ def _init_cache():
         return
         
     url = os.environ.get("REDIS_URL", "")
-    if not url or not redis:
-        raise ValueError("REDIS_URL environment variable is not set or redis python package is missing.")
-        
-    try:
-        _client = redis.from_url(url, decode_responses=True)
-        # test connection
-        _client.ping()
-    except Exception as e:
-        raise ConnectionError(f"Failed to connect to Redis at {url}: {e}")
+    if url and redis:
+        try:
+            c = redis.from_url(url, decode_responses=True)
+            c.ping()
+            _client = c
+            return
+        except Exception as e:
+            print(f"[cache][warn] Redis at {url} unreachable ({e}), falling back to SQLite cache.")
+
+    _client = _SQLiteCacheFallback()
 
 
 def _file_hash(file_path: str) -> str:
