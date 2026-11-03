@@ -84,7 +84,10 @@ class ReceiptsCollectionShim:
             raise ValueError(f"Receipt record not found: {record_id}")
         return ReceiptRecord(row)
 
-    def _extract_image_paths(self, data: dict) -> list:
+    def _extract_images_and_paths(self, data: dict) -> tuple[list, list]:
+        import base64
+        import mimetypes
+        images = list(data.get("images") or [])
         image_paths = list(data.get("image_paths") or [])
         raw_image = data.get("image")
         if raw_image:
@@ -98,16 +101,40 @@ class ReceiptsCollectionShim:
                 if isinstance(item, tuple) and len(item) >= 2:
                     name, content = item[0], item[1]
                     if isinstance(content, (bytes, bytearray)):
+                        mime, _ = mimetypes.guess_type(name)
+                        images.append({
+                            "filename": name,
+                            "mime_type": mime or "image/jpeg",
+                            "data_base64": base64.b64encode(content).decode("ascii")
+                        })
                         suffix = os.path.splitext(name)[1] or ".jpg"
                         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
                         tmp.write(content)
                         tmp.close()
                         image_paths.append(tmp.name)
-        return image_paths
+
+        # Also encode any local image_paths as base64 for remote MCP transport
+        for p in image_paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                    mime, _ = mimetypes.guess_type(p)
+                    images.append({
+                        "filename": os.path.basename(p),
+                        "mime_type": mime or "image/jpeg",
+                        "data_base64": b64
+                    })
+                except Exception:
+                    pass
+
+        return images, image_paths
 
     def create(self, data: dict):
         payload = dict(data)
-        image_paths = self._extract_image_paths(payload)
+        images, image_paths = self._extract_images_and_paths(payload)
+        if images:
+            payload["images"] = images
         if image_paths:
             payload["image_paths"] = image_paths
         payload.pop("image", None)
@@ -120,7 +147,9 @@ class ReceiptsCollectionShim:
     def update(self, record_id: str, data: dict):
         payload = dict(data)
         payload["id"] = record_id
-        image_paths = self._extract_image_paths(payload)
+        images, image_paths = self._extract_images_and_paths(payload)
+        if images:
+            payload["images"] = images
         if image_paths:
             payload["image_paths"] = image_paths
         payload.pop("image", None)

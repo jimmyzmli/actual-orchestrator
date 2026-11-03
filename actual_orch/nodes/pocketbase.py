@@ -26,7 +26,27 @@ def save_receipt(transaction_id, lines, tx_date, source_ref, amount, payee, sour
         payload["parsed"] = parsed
 
     if image_paths:
-        payload["image_paths"] = [p for p in image_paths if os.path.exists(p)]
+        valid_paths = [p for p in image_paths if os.path.exists(p)]
+        payload["image_paths"] = valid_paths
+        
+        # Also encode as base64 images so saving receipts works seamlessly from remote clients
+        import base64
+        import mimetypes
+        encoded_images = []
+        for p in valid_paths:
+            try:
+                with open(p, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                mime, _ = mimetypes.guess_type(p)
+                encoded_images.append({
+                    "filename": os.path.basename(p),
+                    "mime_type": mime or "image/jpeg",
+                    "data_base64": b64
+                })
+            except Exception as img_err:
+                print(f"[save_receipt][warn] Failed to encode {p} for remote transfer: {img_err}")
+        if encoded_images:
+            payload["images"] = encoded_images
 
     try:
         res = ActualMCPClient.save_receipt_sync(payload)
