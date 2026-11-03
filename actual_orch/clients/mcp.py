@@ -122,18 +122,23 @@ class ActualMCPClient:
 
     @classmethod
     async def get_session(cls):
+        loop = asyncio.get_running_loop()
         async with cls._lock:
             if cls._instance is not None:
-                # Health-check: verify the cached session is still alive
-                try:
-                    await cls._instance.session.list_tools()
-                except Exception:
-                    # Session is stale — tear down and reconnect
-                    print("⚠️ MCP session health-check failed, reconnecting...")
-                    await cls._force_close()
+                if getattr(cls._instance, "_loop", None) != loop:
+                    cls._instance = None
+                else:
+                    # Health-check: verify the cached session is still alive
+                    try:
+                        await cls._instance.session.list_tools()
+                    except Exception:
+                        # Session is stale — tear down and reconnect
+                        print("⚠️ MCP session health-check failed, reconnecting...")
+                        await cls._force_close()
 
             if cls._instance is None:
                 cls._instance = ActualMCPClient()
+                cls._instance._loop = loop
                 await cls._instance._connect()
             return cls._instance.session
 
@@ -299,16 +304,21 @@ class EmailMCPClient:
 
     @classmethod
     async def get_session(cls):
+        loop = asyncio.get_running_loop()
         async with cls._lock:
             if cls._instance is not None:
-                try:
-                    await cls._instance.session.list_tools()
-                except Exception:
-                    print("⚠️ Email MCP session health-check failed, reconnecting...")
-                    await cls._force_close()
+                if getattr(cls._instance, "_loop", None) != loop:
+                    cls._instance = None
+                else:
+                    try:
+                        await cls._instance.session.list_tools()
+                    except Exception:
+                        print("⚠️ Email MCP session health-check failed, reconnecting...")
+                        await cls._force_close()
 
             if cls._instance is None:
                 cls._instance = EmailMCPClient()
+                cls._instance._loop = loop
                 await cls._instance._connect()
             return cls._instance.session
 
