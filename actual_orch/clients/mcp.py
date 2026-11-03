@@ -16,6 +16,15 @@ def _get_actual_mcp_endpoint():
     return f"{mcp_endpoint.rstrip('/')}/mcp"
 
 
+def _get_email_mcp_endpoint():
+    mcp_endpoint = os.getenv("EMAIL_MCP_ENDPOINT") or "http://localhost:9993"
+    for suffix in ["/api/mcp/execute", "/messages", "/message", "/sse", "/mcp"]:
+        if mcp_endpoint.endswith(suffix):
+            mcp_endpoint = mcp_endpoint[:-len(suffix)]
+            break
+    return f"{mcp_endpoint.rstrip('/')}/mcp"
+
+
 class _SyncMCPWorker:
     """Dedicated background loop worker for reliable synchronous MCP tool execution."""
     def __init__(self, endpoint_getter):
@@ -294,6 +303,7 @@ class EmailMCPClient:
     """Client for the Email MCP Server (Apple Mail fast querying & rendering)."""
     _instance = None
     _lock = asyncio.Lock()
+    _sync_worker = None
 
     MAX_RETRIES = 3
     RETRY_BASE_DELAY = 1.0
@@ -301,6 +311,12 @@ class EmailMCPClient:
     def __init__(self):
         self.stack = AsyncExitStack()
         self.session = None
+
+    @classmethod
+    def _get_sync_worker(cls):
+        if cls._sync_worker is None:
+            cls._sync_worker = _SyncMCPWorker(_get_email_mcp_endpoint)
+        return cls._sync_worker
 
     @classmethod
     async def get_session(cls):
@@ -385,6 +401,10 @@ class EmailMCPClient:
                     except Exception:
                         return item.text
         return result
+
+    @classmethod
+    def call_tool_sync(cls, name: str, arguments: dict = None, timeout: float = 60.0):
+        return cls._get_sync_worker().call_tool(name, arguments, timeout=timeout)
 
     @classmethod
     async def list_recent_emails(cls, limit: int = 25, since: str = None, mailbox: str = None, account: str = "Outlook"):
