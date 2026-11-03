@@ -278,26 +278,44 @@ async def search_deterministic_node(state: dict):
             if matched_candidate:
                 if "#receipt" in (matched_candidate.get("notes") or "") and parsed.get("order_id"):
                     try:
-                        from actual_orch.clients.pocketbase import get_pb_client
-                        pb_client = get_pb_client()
-                        records = pb_client.collection("receipts").get_list(1, 10, query_params={
-                            "filter": f"tx_id='{final_id}'",
-                            "fields": "parsed,flag"
-                        })
-                        for r in records.items:
-                            flag = getattr(r, "flag", None)
-                            if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
-                                continue
-                            if hasattr(r, "parsed") and r.parsed:
-                                try:
-                                    r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
-                                    existing_order_id = r_parsed.get("order_id")
-                                    if existing_order_id and str(existing_order_id).strip() != str(parsed["order_id"]).strip():
-                                        print(f"❌ VALIDATION FAILED: Deterministic candidate has different order_id ({existing_order_id} vs {parsed['order_id']}). Rejecting auto-match.")
-                                        final_id = "unknown_id"
-                                        break
-                                except Exception:
-                                    pass
+                        from actual_orch.clients.pocketbase import get_pb_client, fetch_receipts_by_tx_ids
+                        cached = fetch_receipts_by_tx_ids([final_id]).get(final_id)
+                        if cached is not None:
+                            for r in cached:
+                                flag = r.get("flag")
+                                if flag and "ignore" in str(flag).lower():
+                                    continue
+                                r_parsed = r.get("parsed")
+                                if r_parsed:
+                                    try:
+                                        r_parsed = json.loads(r_parsed) if isinstance(r_parsed, str) else r_parsed
+                                        existing_order_id = r_parsed.get("order_id")
+                                        if existing_order_id and str(existing_order_id).strip() != str(parsed["order_id"]).strip():
+                                            print(f"❌ VALIDATION FAILED: Deterministic candidate has different order_id ({existing_order_id} vs {parsed['order_id']}). Rejecting auto-match.")
+                                            final_id = "unknown_id"
+                                            break
+                                    except Exception:
+                                        pass
+                        else:
+                            pb_client = get_pb_client()
+                            records = pb_client.collection("receipts").get_list(1, 10, query_params={
+                                "filter": f"tx_id='{final_id}'",
+                                "fields": "parsed,flag"
+                            })
+                            for r in records.items:
+                                flag = getattr(r, "flag", None)
+                                if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                                    continue
+                                if hasattr(r, "parsed") and r.parsed:
+                                    try:
+                                        r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
+                                        existing_order_id = r_parsed.get("order_id")
+                                        if existing_order_id and str(existing_order_id).strip() != str(parsed["order_id"]).strip():
+                                            print(f"❌ VALIDATION FAILED: Deterministic candidate has different order_id ({existing_order_id} vs {parsed['order_id']}). Rejecting auto-match.")
+                                            final_id = "unknown_id"
+                                            break
+                                    except Exception:
+                                        pass
                     except Exception as e:
                         print(f"⚠️ Warning: Could not fetch pocketbase to validate order_id: {e}")
 
@@ -357,37 +375,57 @@ async def search_agent_node(state: dict):
         previously_attached_receipts_map = {}
         if candidate_ids_with_receipts:
             try:
-                from actual_orch.clients.pocketbase import get_pb_client
-                pb_client = get_pb_client()
+                from actual_orch.clients.pocketbase import get_pb_client, fetch_receipts_by_tx_ids
+                by_tx = fetch_receipts_by_tx_ids(candidate_ids_with_receipts)
                 for cid in candidate_ids_with_receipts:
-                    try:
-                        records = pb_client.collection("receipts").get_list(1, 10, query_params={
-                            "filter": f"tx_id='{cid}'",
-                            "fields": "payee,amount,date,parsed,flag"
-                        })
+                    if cid in by_tx:
                         receipts = []
-                        for r in records.items:
-                            flag = getattr(r, "flag", None)
-                            if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                        for r in by_tx[cid]:
+                            flag = r.get("flag")
+                            if flag and "ignore" in str(flag).lower():
                                 continue
-                            r_parsed = {}
-                            if hasattr(r, "parsed") and r.parsed:
-                                try:
-                                    r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
-                                except Exception:
-                                    pass
+                            r_parsed = r.get("parsed")
+                            if isinstance(r_parsed, str):
+                                try: r_parsed = json.loads(r_parsed)
+                                except Exception: r_parsed = {}
                             receipts.append({
-                                "payee": getattr(r, "payee", ""), 
-                                "amount": getattr(r, "amount", 0.0), 
-                                "date": str(getattr(r, "date", ""))[:10],
-                                "order_id": r_parsed.get("order_id")
+                                "payee": r.get("payee", ""),
+                                "amount": r.get("amount", 0.0),
+                                "date": str(r.get("date", ""))[:10],
+                                "order_id": (r_parsed or {}).get("order_id")
                             })
                         if receipts:
                             previously_attached_receipts_map[cid] = receipts
-                    except Exception as e:
-                        print(f"[search_agent][error]   ⚠️ Warning: Failed to fetch receipts for candidate {cid}: {e}")
+                    else:
+                        try:
+                            pb_client = get_pb_client()
+                            records = pb_client.collection("receipts").get_list(1, 10, query_params={
+                                "filter": f"tx_id='{cid}'",
+                                "fields": "payee,amount,date,parsed,flag"
+                            })
+                            receipts = []
+                            for r in records.items:
+                                flag = getattr(r, "flag", None)
+                                if flag and ("ignore" in str(flag).lower() or (isinstance(flag, list) and any("ignore" in str(f).lower() for f in flag))):
+                                    continue
+                                r_parsed = {}
+                                if hasattr(r, "parsed") and r.parsed:
+                                    try:
+                                        r_parsed = json.loads(r.parsed) if isinstance(r.parsed, str) else r.parsed
+                                    except Exception:
+                                        pass
+                                receipts.append({
+                                    "payee": getattr(r, "payee", ""), 
+                                    "amount": getattr(r, "amount", 0.0), 
+                                    "date": str(getattr(r, "date", ""))[:10],
+                                    "order_id": r_parsed.get("order_id")
+                                })
+                            if receipts:
+                                previously_attached_receipts_map[cid] = receipts
+                        except Exception:
+                            pass
             except Exception as e:
-                print(f"[search_agent][error]   ⚠️ Warning: Could not import or use pocketbase client: {e}")
+                print(f"[search_agent][error]   ⚠️ Warning: Could not fetch receipts for candidates: {e}")
         
         narrowed_candidates = []
         entries_by_id = {}
