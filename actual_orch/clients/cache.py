@@ -124,15 +124,21 @@ def _init_cache():
     if _client is not None:
         return
         
-    url = os.environ.get("REDIS_URL", "")
-    if url and redis:
-        try:
-            c = redis.from_url(url, decode_responses=True)
-            c.ping()
-            _client = c
-            return
-        except Exception as e:
-            print(f"[cache][warn] Redis at {url} unreachable ({e}), falling back to SQLite cache.")
+    skip_redis = os.environ.get("SKIP_REDIS", "").strip().lower() in ("1", "true", "yes", "on")
+    use_redis = os.environ.get("USE_REDIS", "").strip().lower()
+    if use_redis in ("0", "false", "no", "off"):
+        skip_redis = True
+
+    if not skip_redis:
+        url = os.environ.get("REDIS_URL", "")
+        if url and redis:
+            try:
+                c = redis.from_url(url, decode_responses=True)
+                c.ping()
+                _client = c
+                return
+            except Exception as e:
+                print(f"[cache][warn] Redis at {url} unreachable ({e}), falling back to SQLite cache.")
 
     _client = _SQLiteCacheFallback()
 
