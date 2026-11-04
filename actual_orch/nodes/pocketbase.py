@@ -142,7 +142,7 @@ def should_skip_receipt(file_path: str, source_ref: str, source: str = "file", k
             skip_classes = ["NOT_RECEIPT", "SHIPPING_CONFIRMATION", "INVOICE"]
             if os.path.exists(config_path_class):
                 try:
-                    with open(config_path_class, "r") as f:
+                    with open(config_path_class, "r", encoding="utf-8") as f:
                         class_data = json.load(f)
                         skip_classes = class_data.get("skip_classifications", skip_classes)
                 except Exception:

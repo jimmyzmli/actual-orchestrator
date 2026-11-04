@@ -241,7 +241,7 @@ def classify_input_node(state: ReceiptState):
             config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
             classifications = {}
             if os.path.exists(config_path_class):
-                with open(config_path_class, "r") as f:
+                with open(config_path_class, "r", encoding="utf-8") as f:
                     class_data = json.load(f)
                     classifications = {k: v.get("prompt_description", "") for k, v in class_data.items() if isinstance(v, dict)}
             else:
@@ -259,7 +259,7 @@ def classify_input_node(state: ReceiptState):
             try:
                 config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))
                 if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
+                    with open(config_path, "r", encoding="utf-8") as f:
                         config_data = json.load(f)
                     if config_data.get("AGENT_USER_CONTEXT"):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
@@ -312,7 +312,7 @@ def classify_input_node(state: ReceiptState):
         skip_if_future_date = False
         
         if os.path.exists(config_path_class):
-            with open(config_path_class, "r") as f:
+            with open(config_path_class, "r", encoding="utf-8") as f:
                 class_data = json.load(f)
                 for cls_name, cls_config in class_data.items():
                     if cls_name == classification.strip():
@@ -448,7 +448,7 @@ async def parse_receipt_node(state: ReceiptState):
             try:
                 config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))
                 if os.path.exists(config_path):
-                    with open(config_path, "r") as f:
+                    with open(config_path, "r", encoding="utf-8") as f:
                         config_data = json.load(f)
                     if config_data.get("AGENT_USER_CONTEXT"):
                         client_ctx += f"\n{config_data['AGENT_USER_CONTEXT']}"
@@ -470,7 +470,7 @@ async def parse_receipt_node(state: ReceiptState):
                     mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
                     mapping = {}
                     if os.path.exists(mapping_path):
-                        with open(mapping_path, "r") as f:
+                        with open(mapping_path, "r", encoding="utf-8") as f:
                             mapping = json.load(f)
                     
                     session = await ActualMCPClient.get_session()
@@ -496,7 +496,7 @@ async def parse_receipt_node(state: ReceiptState):
                     
                     categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
                     if os.path.exists(categories_path):
-                        with open(categories_path, "r") as f:
+                        with open(categories_path, "r", encoding="utf-8") as f:
                             categories = json.load(f)
                         if isinstance(categories, list):
                             expense_categories = [c.get("name") for c in categories if isinstance(c, dict) and not c.get("hidden") and not c.get("is_income") and c.get("name")]
@@ -688,7 +688,7 @@ async def parse_receipt_node(state: ReceiptState):
         skip_if_future_date = False
         classification = state.get("classification", "")
         if os.path.exists(config_path_class):
-            with open(config_path_class, "r") as f:
+            with open(config_path_class, "r", encoding="utf-8") as f:
                 class_data = json.load(f)
                 for cls_name, cls_config in class_data.items():
                     if cls_name == classification.strip():
@@ -731,7 +731,7 @@ async def parse_receipt_node(state: ReceiptState):
             try:
                 mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
                 if os.path.exists(mapping_path):
-                    with open(mapping_path, "r") as f:
+                    with open(mapping_path, "r", encoding="utf-8") as f:
                         acct_mapping = json.load(f)
                     account_id = acct_mapping.get(account_key)
                     if account_id:
@@ -796,7 +796,7 @@ def router_after_classify(state: ReceiptState):
     should_parse = True
     
     if os.path.exists(config_path_class):
-        with open(config_path_class, "r") as f:
+        with open(config_path_class, "r", encoding="utf-8") as f:
             class_data = json.load(f)
             for cls_name, cls_config in class_data.items():
                 if cls_name == classification.strip():
@@ -822,7 +822,7 @@ def router_after_parse(state: ReceiptState):
     skip_if_no_amount = False
     
     if os.path.exists(config_path_class):
-        with open(config_path_class, "r") as f:
+        with open(config_path_class, "r", encoding="utf-8") as f:
             class_data = json.load(f)
             for cls_name, cls_config in class_data.items():
                 if cls_name == classification.strip():

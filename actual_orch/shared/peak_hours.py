@@ -13,7 +13,7 @@ def check_peak_hours(model_name: str = "deepseek") -> bool:
         return False
         
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
             
         tz_name = config.get("timezone", "America/New_York")
@@ -65,7 +65,7 @@ def print_peak_hours_warning(model_name: str = "deepseek"):
         from actual_orch.shared.models import get_model_config
         agents_path = get_config_path("agents.json")
         if os.path.exists(agents_path):
-            with open(agents_path, "r") as f:
+            with open(agents_path, "r", encoding="utf-8") as f:
                 agents_cfg = json.load(f)
             uses_schedule = False
             for task, task_cfg in agents_cfg.items():

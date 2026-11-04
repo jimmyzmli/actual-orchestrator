@@ -16,7 +16,7 @@ def load_models_config() -> Dict[str, Any]:
         return {"models": {}, "default_ollama_base_url": "http://localhost:11434"}
         
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             _MODELS_CACHE = json.load(f)
         return _MODELS_CACHE or {}
     except Exception as e:

@@ -227,7 +227,7 @@ async def search_deterministic_node(state: dict):
             mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
             if os.path.exists(mapping_path):
                 try:
-                    with open(mapping_path, "r") as f:
+                    with open(mapping_path, "r", encoding="utf-8") as f:
                         mapping = json.load(f)
                     receipt_account_id = mapping.get(account_key)
                 except Exception:
@@ -641,7 +641,7 @@ async def search_agent_node(state: dict):
             try:
                 mapping_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/account-mapping.json"))
                 if os.path.exists(mapping_path):
-                    with open(mapping_path, "r") as f:
+                    with open(mapping_path, "r", encoding="utf-8") as f:
                         mapping = json.load(f)
                     acc_id = mapping.get(account_key)
                     if acc_id:
@@ -668,7 +668,7 @@ async def search_agent_node(state: dict):
         try:
             config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/config.json"))
             if os.path.exists(config_path):
-                with open(config_path, "r") as f:
+                with open(config_path, "r", encoding="utf-8") as f:
                     config_data = json.load(f)
                 if config_data.get("AGENT_USER_CONTEXT"):
                     parsed_prompt["AGENT_USER_CONTEXT"] = config_data["AGENT_USER_CONTEXT"]
@@ -898,7 +898,7 @@ async def save_actual_transaction_node(state: dict):
         
         mapping = {}
         if os.path.exists(mapping_path):
-            with open(mapping_path, "r") as f:
+            with open(mapping_path, "r", encoding="utf-8") as f:
                 mapping = json.load(f)
                 
         if not mapping:
@@ -933,7 +933,7 @@ async def save_actual_transaction_node(state: dict):
         try:
             categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
             if os.path.exists(categories_path):
-                with open(categories_path, "r") as f:
+                with open(categories_path, "r", encoding="utf-8") as f:
                     loaded_cats = json.load(f)
                     if isinstance(loaded_cats, list):
                         cats = loaded_cats
@@ -1260,7 +1260,7 @@ async def update_actual_transaction_node(state: dict):
                 import os
                 categories_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../actual-utils/cache/categories.json"))
                 if os.path.exists(categories_path):
-                    with open(categories_path, "r") as f:
+                    with open(categories_path, "r", encoding="utf-8") as f:
                         loaded_cats = json.load(f)
                         if isinstance(loaded_cats, list):
                             cats = loaded_cats
