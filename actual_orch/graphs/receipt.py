@@ -134,7 +134,7 @@ def extract_ocr_node(state: ReceiptState):
             set_ocr(file_path, state["ocr_text"], meta, prefix=prefix)
             return {"ocr_text": state["ocr_text"], "image_paths": image_paths}
 
-        # Check Redis cache
+        # Check cache
         cached = None
         if "ocr" not in state.get("flag_skip_cache_types", []):
             cached = get_ocr(file_path, prefix=prefix)
@@ -142,7 +142,7 @@ def extract_ocr_node(state: ReceiptState):
                 cached = get_ocr(file_path, prefix="receipt_")
         
         if cached is not None:
-            print("[extract_ocr][cache] " + "Using cached OCR text (Redis)...")
+            print("[extract_ocr][cache] " + "Using cached OCR text...")
             return {"ocr_text": cached, "image_paths": image_paths}
 
         print(f"[extract_ocr] Extracting OCR with Gemini Vision for {file_path}...")
@@ -305,7 +305,7 @@ def classify_input_node(state: ReceiptState):
             set_classify(file_path, classification, meta, prefix=prefix)
         else:
             if not state.get("override_classification"):
-                print(f"[classify_input][cache] Using cached classification data (Redis): [{classification.strip()}]")
+                print(f"[classify_input][cache] Using cached classification data: [{classification.strip()}]")
         
         config_path_class = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/classification.json"))
         should_parse = True
@@ -396,9 +396,9 @@ async def parse_receipt_node(state: ReceiptState):
                         
                 if cached is not None:
                     if all_models_exhausted:
-                        print("[parse_receipt][cache] " + "All models exhausted, using cached parsed data (Redis) as fallback...")
+                        print("[parse_receipt][cache] " + "All models exhausted, using cached parsed data as fallback...")
                     else:
-                        print("[parse_receipt][cache] " + "Using cached parsed data (Redis)...")
+                        print("[parse_receipt][cache] " + "Using cached parsed data...")
                     parsed_dict = cached
                     model_name = "cache"
 

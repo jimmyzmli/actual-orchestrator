@@ -20,15 +20,31 @@ import sqlite3
 class _SQLiteCacheFallback:
     def __init__(self, db_path=None):
         if not db_path:
-            db_path = os.getenv("SQLITE_CACHE_PATH", os.path.join(os.getcwd(), "data", "cache.sqlite"))
+            env_path = os.getenv("SQLITE_CACHE_PATH")
+            if env_path:
+                db_path = env_path
+            else:
+                candidate = os.path.join(os.getcwd(), "data", "cache.sqlite")
+                if os.path.exists(os.path.dirname(candidate)):
+                    db_path = candidate
+                else:
+                    curr = os.path.abspath(os.getcwd())
+                    found = None
+                    while curr and curr != os.path.dirname(curr):
+                        if os.path.isdir(os.path.join(curr, "data")):
+                            found = os.path.join(curr, "data", "cache.sqlite")
+                            break
+                        curr = os.path.dirname(curr)
+                    db_path = found or candidate
         self.db_path = os.path.abspath(db_path)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        with sqlite3.connect(self.db_path) as conn:
+        with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, val TEXT)")
 
     def get(self, key):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT val FROM cache WHERE key = ?", (key,))
                 row = cur.fetchone()
@@ -38,31 +54,65 @@ class _SQLiteCacheFallback:
 
     def set(self, key, val):
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 conn.execute("INSERT OR REPLACE INTO cache (key, val) VALUES (?, ?)", (key, val))
         except Exception:
             pass
 
-    def delete(self, *keys):
+    def exists(self, *keys):
         if not keys:
             return 0
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                q = f"DELETE FROM cache WHERE key IN ({','.join(['?']*len(keys))})"
-                cur = conn.execute(q, keys)
-                return cur.rowcount
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cur = conn.cursor()
+                q = f"SELECT COUNT(*) FROM cache WHERE key IN ({','.join(['?']*len(keys))})"
+                cur.execute(q, keys)
+                row = cur.fetchone()
+                return row[0] if row else 0
         except Exception:
             return 0
+
+    def delete(self, *keys):
+        if not keys:
+            return 0
+        total_deleted = 0
+        chunk_size = 500
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                for i in range(0, len(keys), chunk_size):
+                    chunk = keys[i:i + chunk_size]
+                    q = f"DELETE FROM cache WHERE key IN ({','.join(['?']*len(chunk))})"
+                    cur = conn.execute(q, chunk)
+                    total_deleted += cur.rowcount
+            return total_deleted
+        except Exception:
+            return total_deleted
 
     def keys(self, pattern="*"):
         try:
             sql_pattern = pattern.replace("*", "%").replace("?", "_")
-            with sqlite3.connect(self.db_path) as conn:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
                 cur = conn.cursor()
                 cur.execute("SELECT key FROM cache WHERE key LIKE ?", (sql_pattern,))
                 return [r[0] for r in cur.fetchall()]
         except Exception:
             return []
+
+    def scan_iter(self, match="*", count=None):
+        return iter(self.keys(match))
+
+    def dbsize(self):
+        try:
+            with sqlite3.connect(self.db_path, timeout=30.0) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM cache")
+                row = cur.fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def ping(self):
+        return True
 
 
 _client: Optional[any] = None
