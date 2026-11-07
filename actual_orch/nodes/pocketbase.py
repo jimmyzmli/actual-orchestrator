@@ -215,12 +215,17 @@ def skip_if_processed(state: dict):
 
 def update_replaced_tx_id(replaced_tx_id, new_tx_id):
     """Update all receipts in Actual MCP that referenced the old transaction ID to the new one"""
+    if not replaced_tx_id or not new_tx_id or replaced_tx_id == new_tx_id:
+        return
     try:
         records = ActualMCPClient.list_receipts_sync(tx_id=replaced_tx_id)
         if isinstance(records, list):
             for r in records:
                 if isinstance(r, dict) and r.get("id"):
-                    ActualMCPClient.save_receipt_sync({"id": r["id"], "tx_id": new_tx_id})
+                    if r.get("tx_id") == replaced_tx_id:
+                        ActualMCPClient.save_receipt_sync({"id": r["id"], "tx_id": new_tx_id})
+                    elif r.get("tx_id_transfer") == replaced_tx_id:
+                        ActualMCPClient.save_receipt_sync({"id": r["id"], "tx_id_transfer": new_tx_id})
     except Exception as e:
         print(f"Warning: Failed to update replaced_tx_id {replaced_tx_id} via Actual MCP: {e}")
 
